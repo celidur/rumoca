@@ -1,5 +1,6 @@
 mod jax_compact_stencils;
 mod jax_lazy_conditionals;
+mod lane_target_renderer;
 mod selected_regions;
 
 use rumoca::Compiler;
