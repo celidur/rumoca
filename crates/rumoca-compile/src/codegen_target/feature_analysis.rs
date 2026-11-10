@@ -166,6 +166,7 @@ pub(super) fn solve_requires_residual_equations(
     pure_calls: Option<&solve::SolvePureCallTable>,
     exact_algebraic_assignments: Option<bool>,
     algebraic_projection: Option<bool>,
+    per_lane: bool,
 ) -> bool {
     let continuous = &problem.continuous;
     let algebraic_count = problem.solve_layout.algebraic_scalar_count();
@@ -176,8 +177,12 @@ pub(super) fn solve_requires_residual_equations(
         && rumoca_phase_codegen::explicit_algebraic_assignment_complete_with_calls(
             problem, pure_calls,
         );
-    let projected =
-        algebraic_projection == Some(true) && rumoca_phase_codegen::me_refresh_admissible(problem);
+    let projected = algebraic_projection == Some(true)
+        && if per_lane {
+            rumoca_phase_codegen::lane_refresh_admissible(problem)
+        } else {
+            rumoca_phase_codegen::me_refresh_admissible(problem)
+        };
     has_algebraic_system && !explicit && !projected
 }
 

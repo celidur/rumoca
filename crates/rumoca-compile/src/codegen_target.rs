@@ -157,9 +157,10 @@ pub struct TargetCapabilities {
     /// assignment schedules when no residual projection remains.
     pub exact_algebraic_assignments: Option<bool>,
     /// The target executes construction-issued algebraic projection stages
-    /// (singleton, affine, torn, and dense block solves) with the shared
-    /// Model-Exchange projection kernel, so a staged refresh plan with coupled
-    /// blocks renders without residual export.
+    /// (singleton, affine, torn, and dense block solves), so a staged refresh
+    /// plan with coupled blocks renders without residual export. FMI targets
+    /// run them with the shared Model-Exchange projection kernel; a Solve
+    /// target runs them per lane from `solve_blocks.lanes.refresh`.
     pub algebraic_projection: Option<bool>,
     /// The target consumes compact DAE `structured_equations` as the
     /// authoritative body instead of blindly iterating placeholder scalar rows.
@@ -937,6 +938,7 @@ pub fn validate_solve_target_capabilities_with_calls(
             pure_calls,
             capabilities.exact_algebraic_assignments,
             capabilities.algebraic_projection,
+            manifest.ir == TargetTemplateIr::Solve,
         )
     {
         unsupported_feature(
@@ -1458,8 +1460,10 @@ fn validate_target_capabilities(
     {
         bail!("exact_algebraic_assignments capability is only valid for Solve-derived targets");
     }
-    if capabilities.algebraic_projection.is_some() && manifest.ir != TargetTemplateIr::Fmi {
-        bail!("algebraic_projection capability is only valid for FMI targets");
+    if capabilities.algebraic_projection.is_some()
+        && !matches!(manifest.ir, TargetTemplateIr::Solve | TargetTemplateIr::Fmi)
+    {
+        bail!("algebraic_projection capability is only valid for Solve-derived targets");
     }
     if capabilities.tensor.is_some()
         && !matches!(manifest.ir, TargetTemplateIr::Solve | TargetTemplateIr::Fmi)
