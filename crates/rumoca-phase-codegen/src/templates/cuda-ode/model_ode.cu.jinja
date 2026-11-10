@@ -659,6 +659,19 @@ extern "C" __global__ void {{ name }}_refresh_batch(
 // Start values of every y and p slot, as the compiler evaluated them.
 __device__ const double {{ name }}_start_y[{{ [y_len, 1] | max }}] = { {% for value in starts.y %}{{ value }}{{ ", " if not loop.last else "" }}{% else %}0.0{% endfor %} };
 __device__ const double {{ name }}_start_p[{{ [p_len, 1] | max }}] = { {% for value in starts.p %}{{ value }}{{ ", " if not loop.last else "" }}{% else %}0.0{% endfor %} };
+{%- if starts.y_names %}
+
+#ifndef __CUDACC_RTC__
+// Solver name of every y slot (host memory), for reporting.
+extern "C" {
+extern const char *const {{ name }}_y_names[{{ [starts.y_names | length, 1] | max }}] = {
+{%- for y_name in starts.y_names %}
+    "{{ y_name | replace("\\", "\\\\") | replace('"', '\\"') }}",
+{%- endfor %}
+};
+}
+#endif
+{%- endif %}
 
 // Copy the start values into every lane; launch first, then change any
 // parameter, then launch `{{ name }}_initialize_batch`.
