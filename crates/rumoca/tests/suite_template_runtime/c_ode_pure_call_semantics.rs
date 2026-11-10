@@ -129,7 +129,6 @@ end Probe;
         "rust-fixed-ode",
         "jax-ode",
         "casadi-ode",
-        "cuda-ode",
     ] {
         let error = rumoca::render_target_files(&compiled, "Probe", target, None)
             .expect_err("scalar expansion cannot erase the active out-of-range write");
@@ -138,6 +137,7 @@ end Probe;
             "{target}: {error:#}"
         );
     }
+    assert_cuda_keeps_checked_call(&compiled);
 }
 
 #[test]
@@ -173,7 +173,6 @@ end Probe;
         "rust-fixed-ode",
         "jax-ode",
         "casadi-ode",
-        "cuda-ode",
     ] {
         let error = rumoca::render_target_files(&compiled, "Probe", target, None)
             .expect_err("a scalar target cannot turn a checked conversion into an unbounded Real");
@@ -182,6 +181,7 @@ end Probe;
             "{target}: {error:#}"
         );
     }
+    assert_cuda_keeps_checked_call(&compiled);
 }
 
 #[test]
@@ -351,5 +351,17 @@ y[0] = 0.0;
 if (Probe_derivative_rhs(0.0, y, NULL, out) != 0) return 5;
 return out[0] == -6.0 ? 0 : 6;
 "#,
+    );
+}
+
+/// cuda-ode keeps the checked body as a typed device function: the failing
+/// call reports through the lane status instead of being expanded away.
+fn assert_cuda_keeps_checked_call(compiled: &rumoca::CompilationResult) {
+    let files = rumoca::render_target_files(compiled, "Probe", "cuda-ode", None)
+        .expect("cuda-ode renders the checked body as a device function");
+    let kernel = &files[0].content;
+    assert!(
+        kernel.contains("Probe_pure_scalar_") && kernel.contains("failures += !isfinite("),
+        "cuda-ode must call the checked device function and report its failure"
     );
 }

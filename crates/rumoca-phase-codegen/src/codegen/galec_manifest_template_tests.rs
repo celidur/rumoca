@@ -831,6 +831,7 @@ fn support_partials_are_shared_and_are_not_artifacts() {
     assert_eq!(
         partials,
         vec![
+            "cuda-ode/typed_functions.jinja".to_string(),
             "embedded-c-galec/solve_c.jinja".to_string(),
             "embedded-c-galec/symbols.jinja".to_string(),
             "fmi3/me_projection.jinja".to_string(),

@@ -165,6 +165,7 @@ fn builtin_template_targets_render_or_are_explicit_readiness_zero_manifests() {
     assert_eq!(
         coverage.support_partials,
         vec![
+            "cuda-ode:typed_functions.jinja".to_string(),
             "embedded-c-galec:solve_c.jinja".to_string(),
             "embedded-c-galec:symbols.jinja".to_string(),
             "fmi3:me_projection.jinja".to_string(),
@@ -651,6 +652,7 @@ fn shared_template_names_are_globally_unique_and_target_owned() {
         vec![
             "algorithm-code-manifest.jinja <- galec/manifest.xml.jinja".to_string(),
             "algorithm-code-source.jinja <- galec/model.alg.jinja".to_string(),
+            "cuda-typed-functions.jinja <- cuda-ode/typed_functions.jinja".to_string(),
             "fmi-c-kernel.jinja <- fmi3/scalar_kernel.jinja".to_string(),
             "fmi-me-projection.jinja <- fmi3/me_projection.jinja".to_string(),
             "fmi-scalar-events.jinja <- fmi3/scalar_events.jinja".to_string(),

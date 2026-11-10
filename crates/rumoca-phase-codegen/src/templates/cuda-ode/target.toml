@@ -1,11 +1,11 @@
 version = 1
 ir = "solve"
 name = "cuda-ode"
-description = "Batched CUDA C explicit-ODE right-hand-side evaluator from checked Solve IR"
+description = "Batched CUDA C hybrid-ODE model kernels (algebraic loops, events, delays, initialization) from checked Solve IR"
 execution_mode = "compiled"
 deployment_class = "gpu"
 readiness_level = 1
-completion_message = """CUDA ODE right-hand-side source written to: {{ out_dir }}
+completion_message = """CUDA model kernels written to: {{ out_dir }}
 Compile: nvcc -c {{ out_dir }}/{{ model_name }}_ode.cu"""
 
 [capabilities]
@@ -14,15 +14,22 @@ residual_equations = false
 # Algebraic slots are filled in-kernel from the issued exact assignments
 # (`solve_blocks.continuous.algebraic_assignments`) before the derivative rows.
 exact_algebraic_assignments = true
+# Coupled algebraic blocks of the staged refresh (torn or dense, solved per
+# thread by Newton over the tear unknowns) from `solve_blocks.lanes.refresh`.
+algebraic_projection = true
 # Parameter-only initialization renders as `<model>_init_params_batch`.
 parameter_initialization = true
 scalar_fallback = true
 external_functions = false
 external_tables = false
 random = false
-initialization = false
-events = false
-runtime_events = false
+# `<model>_initialize_batch`: bindings, initial equations, initial event.
+initialization = true
+# Relation memories, event indicators and event iteration per lane; the host
+# integrator locates events and stops at the static time events.
+events = true
+# `delay()` through per-lane history ring buffers.
+runtime_events = true
 clocks = false
 dynamic_ranges = false
 dynamic_derivative_subscripts = false
@@ -45,3 +52,7 @@ dtypes = ["f64"]
 [[files]]
 path = "{{ model_name }}_ode.cu"
 template = "model_ode.cu.jinja"
+
+[[partials]]
+template = "typed_functions.jinja"
+name = "cuda-typed-functions.jinja"

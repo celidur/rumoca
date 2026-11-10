@@ -1,0 +1,224 @@
+{#- Typed pure-function bodies as per-lane CUDA device functions.
+
+    The scalar arithmetic and tensor operations are the FMI C partials, which
+    are valid C++ device code. What differs from `fmi-typed-functions.jinja`:
+    calls pass their argument tables through named local arrays (C++ has no
+    compound literals), `void*` arguments are cast explicitly, and there is no
+    assertion observer: a failed error-level assertion returns a nonzero
+    status, which the calling scalar op turns into NaN results for the lane,
+    and a failed warning-level assertion is ignored.
+
+    Follows the whitespace convention stated in `typed_arithmetic.jinja`. -#}
+{%- from "fmi-typed-arithmetic.jinja" import integer, declaration, copy, import_scalars, arithmetic %}
+{%- from "fmi-typed-tensors.jinja" import tensor %}
+
+{%- macro trip_count(binder) -%}
+{% set directed = (binder.upper - binder.lower) * binder.step -%}
+{{ 0 if directed < 0 else directed // (binder.step * binder.step) + 1 }}
+{%- endmacro %}
+
+{%- macro ctype(ty) -%}{% if ty.scalar.kind == "real" %}double{% elif ty.scalar.kind == "integer" %}int64_t{% else %}bool{% endif %}{%- endmacro %}
+
+{%- macro call(name, inputs, outputs, obs="obs") -%}
+{ const void* ci[]={ {% for input in inputs %}r{{ input }},{% else %}NULL{% endfor %} }; void* co[]={ {% for output in outputs %}r{{ output }},{% else %}NULL{% endfor %} }; int status={{ name }}(ci, co, {{ obs }}); if (status) return status; }
+{% endmacro %}
+
+{%- macro operation(op, program, region_name, prefix, assertion_outputs) -%}
+{% if op.operation == "check_assertion" -%}
+{% for destination in op.destinations -%}
+{{ arithmetic({"operation": "constant", "destination": destination, "value": inactive_assertion_message(program.register_types[destination].scalar)}, program) -}}
+{% endfor -%}
+if (!r{{ op.condition }}[0] && obs) { obs[{{ op.predicate_output }}]=0.0;{% if assertion_outputs[op.predicate_output].role.level == "error" %} return 2;{% endif %} }
+
+{% elif op.operation in ["constant", "unary", "binary", "broadcast_binary", "compare", "convert"] -%}
+{{ arithmetic(op, program) -}}
+{% elif op.operation == "load" -%}
+{{ copy("r" ~ op.destination, "s" ~ op.slot) -}}
+{% elif op.operation == "store" -%}
+{{ copy("s" ~ op.slot, "r" ~ op.source) -}}
+{% elif op.operation == "select" -%}
+{{ copy("r" ~ op.destination, "(r" ~ op.condition ~ "[0] ? r" ~ op.if_true ~ " : r" ~ op.if_false ~ ")") -}}
+{% elif op.operation == "conditional" -%}
+if (r{{ op.condition }}[0]) { {{ call(region_name ~ "_true", op.captures, op.destinations)|trim }} }
+else { {{ call(region_name ~ "_false", op.captures, op.destinations)|trim }} }
+{% elif op.operation == "call" -%}
+{% if op.assertion_forwarding|length > 0 -%}
+{% set observed = (op.assertion_forwarding|map(attribute="child_predicate")|max) + 1 -%}
+{ double child_obs[{{ observed }}]; for (size_t k=0; k<{{ observed }}; ++k) child_obs[k]=1.0;
+const void* ci[]={ {% for input in op.arguments %}r{{ input }},{% else %}NULL{% endfor %} }; void* co[]={ {% for output in op.destinations %}r{{ output }},{% else %}NULL{% endfor %} };
+int status={{ prefix }}{{ op.owner }}(ci, co, obs ? child_obs : NULL);
+if (obs) { {% for binding in op.assertion_forwarding %}if (child_obs[{{ binding.child_predicate }}]==0.0) obs[{{ binding.parent_predicate }}]=0.0; {% endfor %}}
+if (status) return status; }
+{% else -%}
+{{ call(prefix ~ op.owner, op.arguments, op.destinations, "NULL") -}}
+{% endif -%}
+{% elif op.operation == "fold" -%}
+{
+{% for dst in op.destinations %}{{ copy("r" ~ dst, "r" ~ op.initial[loop.index0]) }}{% endfor -%}
+int fold_done=0; (void)fold_done;
+{% for binder in op.domain.binders -%}
+{% set count = trip_count(binder) -%}
+int64_t b{{ loop.index0 }}[1]={ {{ integer(binder.lower) }} };
+for (size_t i{{ loop.index0 }}=0; i{{ loop.index0 }}<{{ count }} && !fold_done; ++i{{ loop.index0 }}) {
+if (i{{ loop.index0 }}) b{{ loop.index0 }}[0]+={{ integer(binder.step) }};
+{% endfor -%}
+{% if op.continuation -%}
+{ bool fold_continue[1]; const void* ci[]={ {% for input in op.destinations + op.captures %}r{{ input }},{% endfor %}{% for binder in op.domain.binders %}b{{ loop.index0 }},{% endfor %}{% if not op.destinations and not op.captures and not op.domain.binders %}NULL{% endif %} }; void* co[]={ fold_continue }; int status={{ region_name }}_continue(ci, co, obs); if (status) return status; fold_done = !fold_continue[0]; }
+if (!fold_done)
+{% endif -%}
+{ const void* ci[]={ {% for input in op.destinations + op.captures %}r{{ input }},{% endfor %}{% for binder in op.domain.binders %}b{{ loop.index0 }},{% endfor %}{% if not op.destinations and not op.captures and not op.domain.binders %}NULL{% endif %} }; void* co[]={ {% for output in op.destinations %}r{{ output }},{% else %}NULL{% endfor %} }; int status={{ region_name }}_fold(ci, co, obs); if (status) return status; }
+{% for binder in op.domain.binders %} } {% endfor %}
+}
+{% elif op.operation == "map" -%}
+{
+size_t map_point=0;
+{% for binder in op.domain.binders -%}
+{% set count = trip_count(binder) -%}
+int64_t b{{ loop.index0 }}[1]={ {{ integer(binder.lower) }} };
+for (size_t i{{ loop.index0 }}=0; i{{ loop.index0 }}<{{ count }}; ++i{{ loop.index0 }}) {
+if (i{{ loop.index0 }}) b{{ loop.index0 }}[0]+={{ integer(binder.step) }};
+{% endfor -%}
+{ const void* ci[]={ {% for input in op.captures %}r{{ input }},{% endfor %}{% for binder in op.domain.binders %}b{{ loop.index0 }},{% endfor %}{% if not op.captures and not op.domain.binders %}NULL{% endif %} }; void* co[]={ r{{ op.destination }} + map_point*{{ op.body.outputs[0].scalar_count }} }; int status={{ region_name }}_map(ci, co, obs); if (status) return status; }
+++map_point;
+{% for binder in op.domain.binders %} } {% endfor %}
+}
+{% else -%}
+{{ tensor(op, program) -}}
+{% endif -%}
+{% endmacro %}
+
+{%- macro definition(program, name, prefix, assertion_outputs) -%}
+{% for issued in program.operations -%}
+{% set op = issued.operation -%}
+{% set child = name ~ "_region_" ~ loop.index0 -%}
+{% if op.operation == "conditional" -%}
+{{ definition(op.if_true.body, child ~ "_true", prefix, assertion_outputs) -}}
+{{ definition(op.if_false.body, child ~ "_false", prefix, assertion_outputs) -}}
+{% elif op.operation == "map" -%}
+{{ definition(op.body.body, child ~ "_map", prefix, assertion_outputs) -}}
+{% elif op.operation == "fold" -%}
+{{ definition(op.transition.body, child ~ "_fold", prefix, assertion_outputs) -}}
+{% if op.continuation -%}
+{{ definition(op.continuation.body, child ~ "_continue", prefix, assertion_outputs) -}}
+{% endif -%}
+{% endif -%}
+{% endfor -%}
+RUMOCA_CUDA_PURE int {{ name }}(const void* const in[], void* const out[], double* obs) {
+(void)in; (void)out; (void)obs;
+{% set input = namespace(index=0, pointers=[]) -%}
+{% for slot in program.slots -%}
+{% set stored = namespace(value=false) -%}
+{% for issued in program.operations %}{% if issued.operation.operation == "store" and issued.operation.slot == slot.id %}{% set stored.value = true %}{% endif %}{% endfor -%}
+{% if slot.storage == "input" and not stored.value and slot.value_type.scalar_count > 0 -%}
+const {{ ctype(slot.value_type) }}* s{{ slot.id }} = (const {{ ctype(slot.value_type) }}*)in[{{ input.index }}]; (void)s{{ slot.id }};
+{% set input.index = input.index + 1 -%}
+{% set input.pointers = input.pointers + [slot.id] -%}
+{% else -%}
+{{ declaration("s" ~ slot.id, slot.value_type) }}
+{% if slot.storage == "input" -%}
+memcpy(s{{ slot.id }}, in[{{ input.index }}], sizeof(s{{ slot.id }}));
+{% set input.index = input.index + 1 -%}
+{% endif -%}
+{% endif -%}
+{% endfor -%}
+{% set written = namespace(ids=[]) -%}
+{% for issued in program.operations -%}
+{% if issued.operation.destination is defined %}{% set written.ids = written.ids + [issued.operation.destination] %}{% endif -%}
+{% if issued.operation.destinations is defined %}{% set written.ids = written.ids + issued.operation.destinations|list %}{% endif -%}
+{% endfor -%}
+{% set alias = namespace(ids=[]) -%}
+{% for issued in program.operations -%}
+{% set op = issued.operation -%}
+{% if op.operation == "load" and op.slot in input.pointers and written.ids|select("equalto", op.destination)|list|length == 1 %}{% set alias.ids = alias.ids + [op.destination] %}{% endif -%}
+{% endfor -%}
+{% for ty in program.register_types %}{% if loop.index0 not in alias.ids %}{{ declaration("r" ~ loop.index0, ty) }}{% endif %}{% endfor %}
+{% for issued in program.operations %}{% set op = issued.operation %}{% if op.operation == "load" and op.destination in alias.ids %}const {{ ctype(program.register_types[op.destination]) }}* r{{ op.destination }} = s{{ op.slot }}; (void)r{{ op.destination }};
+{% else %}{{ operation(op, program, name ~ "_region_" ~ loop.index0, prefix, assertion_outputs) }}{% endif %}{% endfor -%}
+{% set output = namespace(index=0) -%}
+{% for slot in program.slots -%}
+{% if slot.storage == "output" -%}
+if (out[{{ output.index }}]) memcpy(out[{{ output.index }}], s{{ slot.id }}, sizeof(s{{ slot.id }}));
+{% set output.index = output.index + 1 -%}
+{% endif -%}
+{% endfor -%}
+return 0;
+}
+{% endmacro %}
+
+{%- macro direct(ty) -%}{% if ty.scalar.kind == "real" and ty.scalar.profile.format == "binary64" and ty.scalar_count > 0 %}1{% endif %}{%- endmacro %}
+
+{#- The Real-array interface every scalar program calls: binary64 inputs and
+    outputs pass straight through, other types convert through locals. -#}
+{%- macro wrapper(owner, prefix) -%}
+RUMOCA_CUDA_PURE int {{ prefix }}scalar_{{ owner.id }}(const double* const in[], double* out) {
+(void)in;
+{% for ty in owner.inputs -%}
+{% if not direct(ty) -%}
+{{ declaration("a" ~ loop.index0, ty) }}
+{{ import_scalars("a" ~ loop.index0, "in[" ~ loop.index0 ~ "]", ty) -}}
+{% endif -%}
+{% endfor -%}
+{% set offset = namespace(value=0, args="", conversions="") -%}
+{% for output in owner.outputs -%}
+{% if direct(output.value_type) %}{% set offset.args = offset.args ~ "out+" ~ offset.value ~ "," -%}
+{% else %}{{ declaration("b" ~ loop.index0, output.value_type) }}{% set offset.args = offset.args ~ "b" ~ loop.index0 ~ "," %}{% set offset.conversions = offset.conversions ~ "for (size_t k=0; k<" ~ output.value_type.scalar_count ~ "; ++k) out[" ~ offset.value ~ "+k]=(double)b" ~ loop.index0 ~ "[k];\n" %}{% endif -%}
+{% set offset.value = offset.value + output.value_type.scalar_count -%}
+{% endfor %}
+{ const void* ci[]={ {% for ty in owner.inputs %}{% if direct(ty) %}in[{{ loop.index0 }}]{% else %}a{{ loop.index0 }}{% endif %},{% else %}NULL{% endfor %} }; void* co[]={ {{ offset.args if offset.args else "NULL" }} }; int status={{ prefix }}{{ owner.id }}(ci, co, NULL); if (status) return status; }
+{{ offset.conversions }}return 0;
+}
+{% endmacro %}
+
+{#- The ordered assertion predicates of one call: 1.0 unless that assertion
+    (or a callee assertion forwarded to it) failed. An error-level failure
+    stops the body (status 2), which is still a complete observation. -#}
+{%- macro observation_wrapper(owner, prefix) -%}
+{% set predicates = namespace(indices=[]) -%}
+{% for output in owner.outputs %}{% if output.role.kind == "assertion_predicate" %}{% set predicates.indices = predicates.indices + [loop.index0] %}{% endif %}{% endfor -%}
+{% if predicates.indices|length > 0 -%}
+RUMOCA_CUDA_PURE int {{ prefix }}observe_{{ owner.id }}(const double* const in[], double* out) {
+(void)in;
+{% for ty in owner.inputs -%}
+{% if not direct(ty) -%}
+{{ declaration("a" ~ loop.index0, ty) }}
+{{ import_scalars("a" ~ loop.index0, "in[" ~ loop.index0 ~ "]", ty) -}}
+{% endif -%}
+{% endfor -%}
+double obs[{{ owner.outputs|length }}]; for (size_t k=0; k<{{ owner.outputs|length }}; ++k) obs[k]=1.0;
+{ const void* ci[]={ {% for ty in owner.inputs %}{% if direct(ty) %}in[{{ loop.index0 }}]{% else %}a{{ loop.index0 }}{% endif %},{% else %}NULL{% endfor %} }; void* co[]={ {% for output in owner.outputs %}NULL,{% endfor %} }; int status={{ prefix }}{{ owner.id }}(ci, co, obs); if (status && status!=2) return status; }
+{% for index in predicates.indices %}out[{{ loop.index0 }}]=obs[{{ index }}]; {% endfor %}
+return 0;
+}
+{% endif -%}
+{% endmacro %}
+
+{#- Every emitted function family under `prefix`, then its scalar wrapper. -#}
+{%- macro functions(table, prefix) -%}
+{% if table.owners|length > 0 -%}
+#if defined(__GNUC__) || defined(__clang__)
+#define RUMOCA_CUDA_PURE __device__ static __attribute__((unused))
+#else
+#define RUMOCA_CUDA_PURE __device__ static
+#endif
+#ifndef INT64_C
+#define INT64_C(c) c##LL
+#endif
+#ifndef UINT64_C
+#define UINT64_C(c) c##ULL
+#endif
+#ifndef INT64_MAX
+#define INT64_MAX 9223372036854775807LL
+#endif
+#ifndef INT64_MIN
+#define INT64_MIN (-INT64_MAX - 1)
+#endif
+RUMOCA_CUDA_PURE double rumoca_real64(uint64_t bits) { double value; memcpy(&value, &bits, sizeof(value)); return value; }
+{% for owner in table.owners %}RUMOCA_CUDA_PURE int {{ prefix }}{{ owner.id }}(const void* const in[], void* const out[], double* obs);
+{% endfor -%}
+{% for owner in table.owners -%}
+{{ definition(owner.body, prefix ~ owner.id, prefix, owner.outputs) -}}
+{{ wrapper(owner, prefix) -}}
+{{ observation_wrapper(owner, prefix) -}}
+{% endfor -%}
+{% endif -%}
+{% endmacro %}

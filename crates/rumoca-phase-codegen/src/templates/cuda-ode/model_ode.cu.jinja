@@ -1,3 +1,4 @@
+{%- from "cuda-typed-functions.jinja" import functions as typed_functions %}
 {%- macro scalar_const(op) -%}
 {%- if op.value_class == "finite" -%}{{ op.value }}
 {%- elif op.value_class == "positive_infinity" -%}INFINITY
@@ -56,7 +57,7 @@
 {{ fail("unsupported-feature:scalar.op.TensorLoad.directional") }}
 {%- endif %}
 {%- for offset in range(op.count) %}
-    const double __r{{ op.dst + offset }} = {% if op.input == "Y" %}batch_y{% elif op.input == "P" %}batch_p{% else %}{{ fail("unsupported-feature:scalar.op.TensorLoad.input") }}{% endif %}[{{ op.input_start + offset }}];
+    const double __r{{ op.dst + offset }} = {% if op.input == "Y" %}{{ y }}{% elif op.input == "P" %}batch_p{% else %}{{ fail("unsupported-feature:scalar.op.TensorLoad.input") }}{% endif %}[{{ op.input_start + offset }}]; (void)__r{{ op.dst + offset }};
 {%- endfor %}
 {%- elif op.kind == "MatrixMultiply" %}
 {%- if op.lanes != 1 %}
@@ -64,8 +65,45 @@
 {%- endif %}
 {%- for row in range(op.rows) %}
 {%- for column in range(op.columns) %}
-    const double __r{{ op.dst + row * op.columns + column }} = {% if op.inner == 0 %}0.0{% else %}{% for inner in range(op.inner) %}__r{{ op.lhs_start + row * op.inner + inner }} * __r{{ op.rhs_start + inner * op.columns + column }}{{ " + " if not loop.last else "" }}{% endfor %}{% endif %};
+    const double __r{{ op.dst + row * op.columns + column }} = {% if op.inner == 0 %}0.0{% else %}{% for inner in range(op.inner) %}__r{{ op.lhs_start + row * op.inner + inner }} * __r{{ op.rhs_start + inner * op.columns + column }}{{ " + " if not loop.last else "" }}{% endfor %}{% endif %}; (void)__r{{ op.dst + row * op.columns + column }};
 {%- endfor %}
+{%- endfor %}
+{%- elif op.kind in ["TensorBinary", "TensorTranspose", "TensorFill", "TensorIdentity", "TensorCross", "TensorConcatenate"] and op.lanes != 1 %}
+{{ fail("unsupported-feature:scalar.op." ~ op.kind ~ ".directional") }}
+{%- elif op.kind == "TensorBinary" %}
+{%- for k in range(op.count) %}
+    const double __r{{ op.dst + k }} = {{ binary(op.operator, op.lhs_start + k * op.lhs_stride, op.rhs_start + k * op.rhs_stride) }}; (void)__r{{ op.dst + k }};
+{%- endfor %}
+{%- elif op.kind == "TensorTranspose" %}
+{%- for i in range(op.rows) %}{% for j in range(op.columns) %}{% for k in range(op.element_width) %}
+    const double __r{{ op.dst + (i * op.columns + j) * op.element_width + k }} = __r{{ op.src_start + (j * op.rows + i) * op.element_width + k }}; (void)__r{{ op.dst + (i * op.columns + j) * op.element_width + k }};
+{%- endfor %}{% endfor %}{% endfor %}
+{%- elif op.kind == "TensorFill" %}
+{%- for k in range(op.count) %}
+    const double __r{{ op.dst + k }} = __r{{ op.value_start }}; (void)__r{{ op.dst + k }};
+{%- endfor %}
+{%- elif op.kind == "TensorIdentity" %}
+{%- for i in range(op.size) %}{% for j in range(op.size) %}
+    const double __r{{ op.dst + i * op.size + j }} = {{ "1.0" if i == j else "0.0" }}; (void)__r{{ op.dst + i * op.size + j }};
+{%- endfor %}{% endfor %}
+{%- elif op.kind == "TensorCross" %}
+{%- for i in range(3) %}
+    const double __r{{ op.dst + i }} = __r{{ op.lhs_start + (i+1)%3 }} * __r{{ op.rhs_start + (i+2)%3 }} - __r{{ op.lhs_start + (i+2)%3 }} * __r{{ op.rhs_start + (i+1)%3 }}; (void)__r{{ op.dst + i }};
+{%- endfor %}
+{%- elif op.kind == "TensorConcatenate" %}
+{%- set inner = op.dimensions[op.axis + 1:] | product %}
+{%- set result_axis = op.dimensions[op.axis] %}
+{%- set concat = namespace(offset=0) %}
+{%- for source in op.sources %}
+{%- set block = source.dimensions[op.axis] * inner %}
+{%- for e in range(source.dimensions | product) %}
+    const double __r{{ op.dst + (e // block) * result_axis * inner + concat.offset * inner + e % block }} = __r{{ source.start + e }}; (void)__r{{ op.dst + (e // block) * result_axis * inner + concat.offset * inner + e % block }};
+{%- endfor %}
+{%- set concat.offset = concat.offset + source.dimensions[op.axis] %}
+{%- endfor %}
+{%- elif op.kind == "LoadFunctionConditionalCaptureRange" %}
+{%- for k in range(op.count) %}
+    const double __r{{ op.dst + k }} = __captures[{{ op.index_start + k }}]; (void)__r{{ op.dst + k }};
 {%- endfor %}
 {%- elif op.kind == "LinearSolveComponent" %}
 {{ fail("unsupported-feature:tensor.linsolve: cuda-ode has no device linear-solve ABI") }}
@@ -126,6 +164,32 @@
         (void)__r{{ op.dst + offset }};
 {%- endfor %}
     }
+{%- elif op.kind == "PureCall" or op.kind == "PureCallObservation" %}
+{%- set functions = solve_blocks.lanes.functions %}
+{%- set shape = functions.shapes[op.owner] %}
+{%- set observe = op.kind == "PureCallObservation" %}
+{%- set result_count = op.predicate_outputs | length if observe else shape.outputs %}
+{%- for offset in range(result_count) %}
+    double __r{{ op.dst + offset }};
+{%- endfor %}
+    {
+{%- for width in shape.inputs %}
+{%- set start = op.input_starts[loop.index0] %}
+        const double __in{{ loop.index0 }}[{{ width if width > 0 else 1 }}] = { {% for offset in range(width) %}__r{{ start + offset }}{{ ", " if not loop.last else "" }}{% else %}0.0{% endfor %} };
+{%- endfor %}
+        const double *__inputs[{{ shape.inputs | length if shape.inputs | length > 0 else 1 }}] = { {% for width in shape.inputs %}__in{{ loop.index0 }}{{ ", " if not loop.last else "" }}{% else %}NULL{% endfor %} };
+        double __result[{{ result_count if result_count > 0 else 1 }}];
+        // A failed call (a domain error) makes the lane's results NaN, which
+        // its Newton or status check reports. An observation yields 1.0 per
+        // assertion predicate that holds and 0.0 per one that failed.
+        if ({{ model_name | default("model") | sanitize }}_pure_{{ "observe_" if observe else "scalar_" }}{{ functions.symbols[op.owner] }}(__inputs, __result) != 0) {
+            for (int __k = 0; __k < {{ result_count if result_count > 0 else 1 }}; ++__k) __result[__k] = NAN;
+        }
+{%- for offset in range(result_count) %}
+        __r{{ op.dst + offset }} = __result[{{ offset }}];
+        (void)__r{{ op.dst + offset }};
+{%- endfor %}
+    }
 {%- elif op.kind == "StoreOutput" %}
     {{ out }}[{{ op.output_index }}] = __r{{ op.src }};
 {%- elif op.kind == "StoreOutputRange" %}
@@ -136,20 +200,326 @@
 {{ fail("unsupported-feature:scalar.op." ~ op.kind) }}
 {%- endif %}
 {%- endmacro %}
+{#- Every program of one scalar block, each in its own scope, its registers
+    marked used; outputs go to `out`. -#}
+{%- macro programs(block, y="batch_y", out="batch_out") %}
+{%- for program in block.scalar_plan.programs %}
+    {
+{%- for op in program.ops %}
+{{ scalar_op(op, y=y, out=out) }}
+{%- endfor %}
+{%- for op in program.ops %}{% if op.dst is defined and op.dst is not none %}
+        (void)__r{{ op.dst }};
+{%- endif %}{% endfor %}
+    }
+{%- endfor %}
+{%- endmacro %}
+{%- macro int_list(values) -%}
+{ {% for value in values %}{{ value }}{{ ", " if not loop.last else "" }}{% else %}0{% endfor %} }
+{%- endmacro %}
 // Generated by Rumoca.
 //
-// Readiness level 1: deterministic batched CUDA C ODE RHS using the checked
-// Solve-IR scalar view. Native tensor kernels require their own capability and
-// differential evidence before this target may advertise them.
+// Readiness level 1: deterministic batched CUDA C model kernels using the
+// checked Solve-IR scalar view. Every thread evaluates one independent model
+// instance (lane) with explicit strides. Native tensor kernels require their
+// own capability and differential evidence before this target may advertise
+// them.
 
 // NVRTC (runtime compilation) provides the math builtins but no libc headers.
 #ifndef __CUDACC_RTC__
 #include <math.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
 #endif
-{{ real_extremum_prelude("cuda") }}
+#if !defined(__CUDACC__) && !defined(__noinline__)
+#define __noinline__
+#endif
+{%- set lane_functions = solve_blocks.lanes.functions %}
+{%- set has_functions = lane_functions.table.owners | length > 0 %}
+{{ real_extremum_prelude("cuda", has_functions) }}
+{%- if has_functions %}
+// Typed pure functions the lane programs call (bodies with data-dependent
+// loops, which cannot be inlined into the scalar rows).
+{{ typed_functions(lane_functions.table, (model_name | default("model") | sanitize) ~ "_pure_") }}
+{%- endif %}
 {%- set name = model_name | default("model") | sanitize %}
+{%- set NAME = name | upper %}
 {%- set derivative = (solve_blocks.continuous.derivative_rhs_scalar or solve_blocks.continuous.derivative_rhs) %}
 {%- set nodes = derivative.nodes %}
+{%- set y_len = solve.layout.y_scalars %}
+{%- set p_len = solve.layout.p_scalars %}
+{%- set state_count = solve.solve_layout.state_scalar_count %}
+{%- set alg = solve_blocks.continuous.algebraic_assignments %}
+{%- set alg_plan = alg.scalar_plan if alg else none %}
+{%- set exact_refresh = alg_plan and alg_plan.output_count > 0 %}
+{%- set lanes = solve_blocks.lanes %}
+{%- set staged = (not exact_refresh) and solve.solve_layout.algebraic_scalar_count > 0 %}
+{%- set refresh = lanes.refresh if staged else none %}
+{%- set ev = lanes.events %}
+{%- set delays = lanes.delays %}
+{%- set init = lanes.initialization %}
+{%- set starts = lanes.starts %}
+{%- set nroots = ev.event_roots | length %}
+
+#define {{ NAME }}_Y_LEN {{ y_len }}
+#define {{ NAME }}_P_LEN {{ p_len }}
+#define {{ NAME }}_STATE_COUNT {{ state_count }}
+#define {{ NAME }}_EVENT_INDICATORS {{ nroots }}
+#define {{ NAME }}_TIME_EVENTS {{ ev.time_events | length }}
+#define {{ NAME }}_DELAYS {{ delays.count }}
+// Tolerances of the per-lane algebraic and initialization solves. Override
+// with -D before compiling.
+#ifndef {{ NAME }}_NEWTON_MAX_ITERATIONS
+#define {{ NAME }}_NEWTON_MAX_ITERATIONS 20
+#endif
+#ifndef {{ NAME }}_NEWTON_STEP_TOLERANCE
+#define {{ NAME }}_NEWTON_STEP_TOLERANCE 1e-12
+#endif
+#ifndef {{ NAME }}_EVENT_MAX_PASSES
+#define {{ NAME }}_EVENT_MAX_PASSES 32
+#endif
+
+{%- if ev.time_events | length > 0 %}
+
+#ifndef __CUDACC_RTC__
+// Static time events (host memory): stop the integrator exactly at each
+// instant and launch `{{ name }}_event_update_batch` there.
+extern "C" {
+extern const double {{ name }}_time_events[{{ ev.time_events | length }}];
+const double {{ name }}_time_events[{{ ev.time_events | length }}] = { {% for time in ev.time_events %}{{ time }}{{ ", " if not loop.last else "" }}{% endfor %} };
+}
+#endif
+{%- endif %}
+
+// Solve `a x = b` in place (x overwrites b) by LU with partial pivoting on
+// the row-major n x n matrix `a`. Returns 0, or 1 for a singular matrix.
+__device__ int {{ name }}_lu_solve(double *a, double *b, int n)
+{
+    for (int i = 0; i < n; ++i) {
+        int pivot = i;
+        double best = fabs(a[i * n + i]);
+        for (int row = i + 1; row < n; ++row) {
+            double value = fabs(a[row * n + i]);
+            if (value > best) {
+                best = value;
+                pivot = row;
+            }
+        }
+        if (!(best > 0.0) || !isfinite(best)) {
+            return 1;
+        }
+        if (pivot != i) {
+            for (int column = 0; column < n; ++column) {
+                double swap = a[i * n + column];
+                a[i * n + column] = a[pivot * n + column];
+                a[pivot * n + column] = swap;
+            }
+            double swap = b[i];
+            b[i] = b[pivot];
+            b[pivot] = swap;
+        }
+        for (int row = i + 1; row < n; ++row) {
+            double factor = a[row * n + i] / a[i * n + i];
+            if (factor == 0.0) {
+                continue;
+            }
+            for (int column = i; column < n; ++column) {
+                a[row * n + column] -= factor * a[i * n + column];
+            }
+            b[row] -= factor * b[i];
+        }
+    }
+    for (int i = n - 1; i >= 0; --i) {
+        double sum = b[i];
+        for (int column = i + 1; column < n; ++column) {
+            sum -= a[i * n + column] * b[column];
+        }
+        b[i] = sum / a[i * n + i];
+    }
+    return 0;
+}
+
+{#- One solved block: its residual-row evaluator over `y`/`p` and the row
+    switch. `prefix` names the functions. -#}
+{%- macro residual_rows(prefix, rows, n, y_type="const double") %}
+__device__ void {{ prefix }}_programs(int program, double time, {{ y_type }} *batch_y, const double *batch_p, double *__res)
+{
+    (void)time;
+    (void)batch_y;
+    (void)batch_p;
+    switch (program) {
+{%- for program in rows.rows.scalar_plan.programs %}
+    case {{ loop.index0 }}:
+    {
+{%- for op in program.ops %}
+{{ scalar_op(op, out="__res") }}
+{%- endfor %}
+{%- for op in program.ops %}{% if op.dst is defined and op.dst is not none %}
+        (void)__r{{ op.dst }};
+{%- endif %}{% endfor %}
+    }
+    break;
+{%- endfor %}
+    default:
+        break;
+    }
+}
+
+__device__ double {{ prefix }}_row(int row, double time, {{ y_type }} *batch_y, const double *batch_p)
+{
+    double __res[{{ [rows.output_count, 1] | max }}];
+    switch (row) {
+{%- for index in range(n) %}
+    case {{ index }}:
+        {{ prefix }}_programs({{ rows.row_program[index] }}, time, batch_y, batch_p, __res);
+        return __res[{{ rows.row_output[index] }}];
+{%- endfor %}
+    default:
+        return NAN;
+    }
+}
+{%- endmacro %}
+
+{%- if refresh %}
+
+// ---------------------------------------------------------------------------
+// Algebraic projection blocks of the continuous refresh. A torn block iterates
+// Newton over its tear unknowns, recovering every other unknown by its causal
+// steps; an untorn block iterates Newton over every unknown. Jacobians are
+// forward differences, so an affine block converges in one step.
+{%- for blk in refresh.blocks %}
+{%- set b = name ~ "_block" ~ loop.index0 %}
+{%- set k = blk.iterated | length %}
+// block {{ loop.index0 }} (canonical {{ blk.canonical }}): {{ blk.n }} unknowns, {{ k }} iterated{{ ", torn" if blk.torn else "" }}{{ ", affine" if blk.affine else "" }}
+{{ residual_rows(b, blk.residual_rows, blk.n, y_type="double") }}
+
+// Solve one row for one unknown (a causal step) by a few secant steps.
+__device__ void {{ b }}_isolate(int row, int y_index, double time, double *batch_y, const double *batch_p)
+{
+    double x = batch_y[y_index];
+    double r = {{ b }}_row(row, time, batch_y, batch_p);
+    for (int iteration = 0; iteration < 8 && r != 0.0 && isfinite(r); ++iteration) {
+        double h = 1.4901161193847656e-08 * fmax(1.0, fabs(x));
+        batch_y[y_index] = x + h;
+        double slope = ({{ b }}_row(row, time, batch_y, batch_p) - r) / h;
+        if (!(slope != 0.0) || !isfinite(slope)) {
+            break;
+        }
+        double next = x - r / slope;
+        batch_y[y_index] = next;
+        r = {{ b }}_row(row, time, batch_y, batch_p);
+        double step = fabs(next - x);
+        x = next;
+        if (step <= {{ NAME }}_NEWTON_STEP_TOLERANCE * (1.0 + fabs(x))) {
+            break;
+        }
+    }
+    batch_y[y_index] = x;
+}
+
+__device__ void {{ b }}_sweep(double time, double *batch_y, const double *batch_p)
+{
+    (void)time;
+    (void)batch_y;
+    (void)batch_p;
+{%- for step in blk.causal %}
+    {{ b }}_isolate({{ step.row }}, {{ step.y }}, time, batch_y, batch_p);
+{%- endfor %}
+}
+
+// Returns 0 when converged, nonzero when the Newton iteration failed.
+__device__ int {{ b }}_project(double time, double *batch_y, const double *batch_p)
+{
+    const int iterated[{{ k }}] = {{ int_list(blk.iterated) }};
+    const int residual[{{ k }}] = {{ int_list(blk.residual) }};
+    double f[{{ k }}];
+    double jacobian[{{ k * k }}];
+    int converged = 0;
+    for (int iteration = 0; iteration < {{ NAME }}_NEWTON_MAX_ITERATIONS; ++iteration) {
+        {{ b }}_sweep(time, batch_y, batch_p);
+        int exact = 1;
+        for (int i = 0; i < {{ k }}; ++i) {
+            f[i] = {{ b }}_row(residual[i], time, batch_y, batch_p);
+            if (!isfinite(f[i])) {
+                return 2;
+            }
+            exact &= f[i] == 0.0;
+        }
+        if (exact || converged) {
+            return 0;
+        }
+        for (int column = 0; column < {{ k }}; ++column) {
+            double x = batch_y[iterated[column]];
+            double h = 1.4901161193847656e-08 * fmax(1.0, fabs(x));
+            batch_y[iterated[column]] = x + h;
+            {{ b }}_sweep(time, batch_y, batch_p);
+            for (int i = 0; i < {{ k }}; ++i) {
+                jacobian[i * {{ k }} + column] = ({{ b }}_row(residual[i], time, batch_y, batch_p) - f[i]) / h;
+            }
+            batch_y[iterated[column]] = x;
+        }
+        for (int i = 0; i < {{ k }}; ++i) {
+            f[i] = -f[i];
+        }
+        if ({{ name }}_lu_solve(jacobian, f, {{ k }}) != 0) {
+            {{ b }}_sweep(time, batch_y, batch_p);
+            return 1;
+        }
+        double largest = 0.0;
+        for (int column = 0; column < {{ k }}; ++column) {
+            double x = batch_y[iterated[column]];
+            batch_y[iterated[column]] = x + f[column];
+            largest = fmax(largest, fabs(f[column]) / (1.0 + fabs(x)));
+        }
+        converged = largest <= {{ NAME }}_NEWTON_STEP_TOLERANCE;
+    }
+    {{ b }}_sweep(time, batch_y, batch_p);
+    return 3;
+}
+{%- endfor %}
+{%- endif %}
+
+// Settle every algebraic slot of one lane from its states, parameters and
+// time, in checked order (exact assignments and projection blocks). Returns
+// the number of projection blocks that did not converge.
+__device__ __noinline__ int {{ name }}_refresh(double time, double *batch_y, const double *batch_p)
+{
+    int failures = 0;
+    (void)time;
+    (void)batch_y;
+    (void)batch_p;
+{%- if exact_refresh %}
+{{ programs(alg, out="batch_y") }}
+{%- elif refresh %}
+{%- for step in refresh.steps %}
+{%- if step.kind == "assign" %}
+{{ programs(step.rows, out="batch_y") }}
+{%- else %}
+    failures += {{ name }}_block{{ step.block }}_project(time, batch_y, batch_p) != 0;
+{%- endif %}
+{%- endfor %}
+{%- endif %}
+    return failures;
+}
+
+// The derivative rows over a settled lane.
+__device__ __noinline__ void {{ name }}_derivative_rows(double time, const double *batch_y, const double *batch_p, double *batch_out)
+{
+    (void)time;
+    (void)batch_y;
+    (void)batch_p;
+    for (int i = 0; i < {{ derivative.output_count }}; ++i) {
+        batch_out[i] = 0.0;
+    }
+{%- for program in derivative.scalar_plan.programs %}
+    {
+{%- for op in program.ops %}
+{{ scalar_op(op) }}
+{%- endfor %}
+    }
+{%- endfor %}
+}
 
 // Compute the parameters defined by other parameters in place, for each batch
 // slot of p (stride p_stride), from the base parameters already there. Launch
@@ -167,16 +537,7 @@ extern "C" __global__ void {{ name }}_init_params_batch(
     (void)batch_p;
 {%- set pinit = solve_blocks.parameter_initialization %}
 {%- if pinit and pinit.output_count > 0 %}
-{%- for program in pinit.scalar_plan.programs %}
-    {
-{%- for op in program.ops %}
-{{ scalar_op(op, out="batch_p") }}
-{%- endfor %}
-{%- for op in program.ops %}{% if op.dst is defined and op.dst is not none %}
-        (void)__r{{ op.dst }};
-{%- endif %}{% endfor %}
-    }
-{%- endfor %}
+{{ programs(pinit, out="batch_p") }}
 {%- endif %}
 }
 
@@ -199,19 +560,15 @@ extern "C" __global__ void {{ name }}_init_state_batch(
     (void)batch_y;
 {%- set sinit = solve_blocks.state_initialization %}
 {%- if sinit and sinit.output_count > 0 %}
-{%- for program in sinit.scalar_plan.programs %}
-    {
-{%- for op in program.ops %}
-{{ scalar_op(op, y="batch_y", out="batch_y") }}
-{%- endfor %}
-{%- for op in program.ops %}{% if op.dst is defined and op.dst is not none %}
-        (void)__r{{ op.dst }};
-{%- endif %}{% endfor %}
-    }
-{%- endfor %}
+{{ programs(sinit, y="batch_y", out="batch_y") }}
 {%- endif %}
 }
 
+// The derivative of the states of every lane. Only the state slots of `y`
+// are read: the algebraic slots are settled on a per-thread copy first.
+// A model with many algebraic slots needs a large thread stack for that copy
+// (cudaDeviceSetLimit(cudaLimitStackSize, ...)); `{{ name }}_rhs_batch`
+// settles them in place instead.
 extern "C" __global__ void {{ name }}_derivative_rhs_batch(
     double time,
     const double *y,
@@ -230,46 +587,677 @@ extern "C" __global__ void {{ name }}_derivative_rhs_batch(
     const double *batch_y_in = y + ((long long)batch * (long long)y_stride);
     const double *batch_p = p + ((long long)batch * (long long)p_stride);
     double *batch_out = out + ((long long)batch * (long long)out_stride);
-
-{%- set alg = solve_blocks.continuous.algebraic_assignments %}
-{%- set alg_plan = alg.scalar_plan if alg else none %}
-{%- if alg_plan and alg_plan.output_count > 0 %}
-    // Algebraic refresh: the derivative rows read algebraic slots of y. Only
-    // the state slots of the input are read; every algebraic slot is assigned
-    // here first (per thread), in checked exact-assignment order.
-    double batch_y[{{ solve.layout.y_scalars }}];
-    for (int i = 0; i < {{ solve.layout.y_scalars }}; ++i) {
+{%- if exact_refresh or refresh %}
+    double batch_y[{{ y_len }}];
+    for (int i = 0; i < {{ y_len }}; ++i) {
         batch_y[i] = batch_y_in[i];
     }
-{%- for program in alg_plan.programs %}
-    {
-{%- for op in program.ops %}
-{{ scalar_op(op, y="batch_y", out="batch_y") }}
-{%- endfor %}
-{%- for op in program.ops %}{% if op.dst is defined and op.dst is not none %}
-        (void)__r{{ op.dst }};
-{%- endif %}{% endfor %}
-    }
-{%- endfor %}
+    (void){{ name }}_refresh(time, batch_y, batch_p);
 {%- else %}
     const double *batch_y = batch_y_in;
 {%- endif %}
+    {{ name }}_derivative_rows(time, batch_y, batch_p, batch_out);
+}
+
+// The derivative of every lane after settling its algebraic slots in place
+// in `y` (they are left there for observation). Returns, per lane, the number
+// of projection blocks that did not converge in `status` (may be null).
+extern "C" __global__ void {{ name }}_rhs_batch(
+    double time,
+    double *y,
+    const double *p,
+    double *out,
+    int *status,
+    int y_stride,
+    int p_stride,
+    int out_stride,
+    int batch_count)
+{
+    int batch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (batch >= batch_count) {
+        return;
+    }
+    double *batch_y = y + ((long long)batch * (long long)y_stride);
+    const double *batch_p = p + ((long long)batch * (long long)p_stride);
+    double *batch_out = out + ((long long)batch * (long long)out_stride);
+    int failures = {{ name }}_refresh(time, batch_y, batch_p);
+    {{ name }}_derivative_rows(time, batch_y, batch_p, batch_out);
+    // A failed function call (a checked domain error) leaves NaN derivatives.
+    for (int i = 0; i < {{ state_count }}; ++i) {
+        failures += !isfinite(batch_out[i]);
+    }
+    if (status) {
+        status[batch] = failures;
+    }
+}
+
+// Settle the algebraic slots of every lane in place.
+extern "C" __global__ void {{ name }}_refresh_batch(
+    double time,
+    double *y,
+    const double *p,
+    int *status,
+    int y_stride,
+    int p_stride,
+    int batch_count)
+{
+    int batch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (batch >= batch_count) {
+        return;
+    }
+    double *batch_y = y + ((long long)batch * (long long)y_stride);
+    const double *batch_p = p + ((long long)batch * (long long)p_stride);
+    int failures = {{ name }}_refresh(time, batch_y, batch_p);
+    if (status) {
+        status[batch] = failures;
+    }
+}
+
+{%- if starts %}
+
+// ---------------------------------------------------------------------------
+// Start values of every y and p slot, as the compiler evaluated them.
+__device__ const double {{ name }}_start_y[{{ [y_len, 1] | max }}] = { {% for value in starts.y %}{{ value }}{{ ", " if not loop.last else "" }}{% else %}0.0{% endfor %} };
+__device__ const double {{ name }}_start_p[{{ [p_len, 1] | max }}] = { {% for value in starts.p %}{{ value }}{{ ", " if not loop.last else "" }}{% else %}0.0{% endfor %} };
+
+// Copy the start values into every lane; launch first, then change any
+// parameter, then launch `{{ name }}_initialize_batch`.
+extern "C" __global__ void {{ name }}_load_starts_batch(
+    double *y,
+    double *p,
+    int y_stride,
+    int p_stride,
+    int batch_count)
+{
+    int batch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (batch >= batch_count) {
+        return;
+    }
+    double *batch_y = y + ((long long)batch * (long long)y_stride);
+    double *batch_p = p + ((long long)batch * (long long)p_stride);
+    for (int i = 0; i < {{ y_len }}; ++i) {
+        batch_y[i] = {{ name }}_start_y[i];
+    }
+    for (int i = 0; i < {{ p_len }}; ++i) {
+        batch_p[i] = {{ name }}_start_p[i];
+    }
+}
+{%- endif %}
+
+// ---------------------------------------------------------------------------
+// Events. Relations of the continuous rows read frozen relation memories in
+// p; they change only in `{{ name }}_event_update_batch`, which the host
+// launches at each static time event and whenever an event indicator of
+// `{{ name }}_event_indicators_batch` changes sign over a step.
+
+__device__ void {{ name }}_roots(double time, const double *batch_y, const double *batch_p, double *__roots)
+{
     (void)time;
     (void)batch_y;
     (void)batch_p;
-    for (int i = 0; i < {{ derivative.output_count }}; ++i) {
-        batch_out[i] = 0.0;
-    }
-{%- if derivative.scalar_plan.programs | length == 0 %}
-    (void)batch_out;
+    (void)__roots;
+{{ programs(ev.roots, out="__roots") }}
+}
+
+__device__ void {{ name }}_discrete_rows(double time, const double *batch_y, const double *batch_p, double *__values)
+{
+    (void)time;
+    (void)batch_y;
+    (void)batch_p;
+    (void)__values;
+{{ programs(ev.discrete, out="__values") }}
+}
+
+// One event iteration at `time`: settle the algebraic slots, re-encode every
+// relation memory from its root, apply the discrete equations, and repeat
+// until nothing changes; then advance the condition memories. Returns the
+// number of passes, or -1 when the iteration did not settle.
+__device__ int {{ name }}_event_iterate(double time, double *batch_y, double *batch_p)
+{
+    double roots[{{ [ev.root_count, 1] | max }}];
+    double values[{{ [ev.discrete_count, 1] | max }}];
+    const int root_index[{{ [nroots, 1] | max }}] = {{ int_list(ev.event_roots | map(attribute="root") | list) }};
+    const int memory[{{ [nroots, 1] | max }}] = {{ int_list(ev.event_roots | map(attribute="memory") | list) }};
+    const int zero[{{ [nroots, 1] | max }}] = {{ int_list(ev.event_roots | map(attribute="zero") | list) }};
+    (void)roots;
+    (void)values;
+    (void)root_index;
+    (void)memory;
+    (void)zero;
+    int passes = 0;
+    int settled = 0;
+    for (; passes < {{ NAME }}_EVENT_MAX_PASSES && !settled; ++passes) {
+        (void){{ name }}_refresh(time, batch_y, batch_p);
+        int changed = 0;
+{%- if nroots > 0 %}
+        {{ name }}_roots(time, batch_y, batch_p, roots);
+        for (int k = 0; k < {{ nroots }}; ++k) {
+            double root = roots[root_index[k]];
+            if (root == 0.0) {
+                root = zero[k] > 0 ? 2.220446049250313e-16 : (zero[k] < 0 ? -2.220446049250313e-16 : root);
+            }
+            double value = root < 0.0 ? 1.0 : 0.0;
+            if (root == 0.0) {
+                value = batch_p[memory[k]];
+            }
+            changed |= batch_p[memory[k]] != value;
+            batch_p[memory[k]] = value;
+        }
 {%- endif %}
-{%- for program in derivative.scalar_plan.programs %}
-    {
-{%- for op in program.ops %}
-{{ scalar_op(op) }}
+{%- if ev.discrete_count > 0 %}
+        {{ name }}_discrete_rows(time, batch_y, batch_p, values);
+{%- for target in ev.discrete_targets %}
+{%- if not ev.discrete_memory[loop.index0] %}
+        changed |= batch_{{ target.column }}[{{ target.index }}] != values[{{ loop.index0 }}];
+        batch_{{ target.column }}[{{ target.index }}] = values[{{ loop.index0 }}];
+{%- endif %}
 {%- endfor %}
+{%- endif %}
+        settled = !changed;
+    }
+    (void){{ name }}_refresh(time, batch_y, batch_p);
+{%- if ev.discrete_count > 0 %}
+    {{ name }}_discrete_rows(time, batch_y, batch_p, values);
+{%- for target in ev.discrete_targets %}
+{%- if ev.discrete_memory[loop.index0] %}
+    batch_{{ target.column }}[{{ target.index }}] = values[{{ loop.index0 }}];
+{%- endif %}
+{%- endfor %}
+{%- endif %}
+    return settled ? passes : -1;
+}
+
+// The event indicators of every lane (z, stride z_stride): a sign change of
+// indicator k over a step is a state event; an exact zero is reported on its
+// relation's current side. Settles the algebraic slots of y in place.
+extern "C" __global__ void {{ name }}_event_indicators_batch(
+    double time,
+    double *y,
+    const double *p,
+    double *z,
+    int y_stride,
+    int p_stride,
+    int z_stride,
+    int batch_count)
+{
+    int batch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (batch >= batch_count) {
+        return;
+    }
+    double *batch_y = y + ((long long)batch * (long long)y_stride);
+    const double *batch_p = p + ((long long)batch * (long long)p_stride);
+    double *batch_z = z + ((long long)batch * (long long)z_stride);
+    (void)batch_z;
+    (void){{ name }}_refresh(time, batch_y, batch_p);
+{%- if nroots > 0 %}
+    double roots[{{ [ev.root_count, 1] | max }}];
+    {{ name }}_roots(time, batch_y, batch_p, roots);
+{%- for event_root in ev.event_roots %}
+    {
+        double value = roots[{{ event_root.root }}];
+        if (value == 0.0) {
+{%- if event_root.zero > 0 %}
+            value = 2.220446049250313e-16;
+{%- elif event_root.zero < 0 %}
+            value = -2.220446049250313e-16;
+{%- else %}
+            value = batch_p[{{ event_root.memory }}] <= 0.5 ? 2.220446049250313e-16 : -2.220446049250313e-16;
+{%- endif %}
+        }
+        batch_z[{{ loop.index0 }}] = value;
     }
 {%- endfor %}
+{%- endif %}
+}
+
+// Handle an event at `time` for every lane (static time event or located
+// state event): see `{{ name }}_event_iterate`. `passes` (may be null)
+// receives the passes taken, or -1 when the iteration did not settle.
+extern "C" __global__ void {{ name }}_event_update_batch(
+    double time,
+    double *y,
+    double *p,
+    int *passes,
+    int y_stride,
+    int p_stride,
+    int batch_count)
+{
+    int batch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (batch >= batch_count) {
+        return;
+    }
+    double *batch_y = y + ((long long)batch * (long long)y_stride);
+    double *batch_p = p + ((long long)batch * (long long)p_stride);
+    int taken = {{ name }}_event_iterate(time, batch_y, batch_p);
+    if (passes) {
+        passes[batch] = taken;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Initialization (MLS 8.6): parameter and start bindings, the initial
+// equations solved for their unknowns, the algebraic refresh, and the
+// initial event. Launch after `{{ name }}_load_starts_batch` (and after
+// overriding any parameter) at the start time. `status` (may be null)
+// receives 0, or the number of initialization blocks that did not converge
+// (plus 1000 when the initial event did not settle).
+
+__device__ void {{ name }}_bindings(double time, double *batch_y, double *batch_p)
+{
+    (void)time;
+    (void)batch_y;
+    (void)batch_p;
+{%- if init.p_bindings %}
+{{ programs(init.p_bindings, out="batch_p") }}
+{%- endif %}
+{%- if init.y_bindings %}
+{{ programs(init.y_bindings, out="batch_y") }}
+{%- endif %}
+}
+{%- for blk in init.blocks %}
+{%- set b = name ~ "_init" ~ loop.index0 %}
+{{ residual_rows(b, blk.residual_rows, blk.n) }}
+
+__device__ int {{ b }}_project(double time, double *batch_y, double *batch_p)
+{
+    double f[{{ blk.n }}];
+    double jacobian[{{ blk.n * blk.n }}];
+    int converged = 0;
+    for (int iteration = 0; iteration < {{ NAME }}_NEWTON_MAX_ITERATIONS; ++iteration) {
+{%- if blk.reads_algebraics %}
+        (void){{ name }}_refresh(time, batch_y, batch_p);
+{%- endif %}
+        int exact = 1;
+        for (int i = 0; i < {{ blk.n }}; ++i) {
+            f[i] = {{ b }}_row(i, time, batch_y, batch_p);
+            if (!isfinite(f[i])) {
+                return 2;
+            }
+            exact &= f[i] == 0.0;
+        }
+        if (exact || converged) {
+            return 0;
+        }
+{%- for unknown in blk.unknowns %}
+        {
+            double x = batch_{{ unknown.column }}[{{ unknown.index }}];
+            double h = 1.4901161193847656e-08 * fmax(1.0, fabs(x));
+            batch_{{ unknown.column }}[{{ unknown.index }}] = x + h;
+{%- if blk.reads_algebraics %}
+            (void){{ name }}_refresh(time, batch_y, batch_p);
+{%- endif %}
+            for (int i = 0; i < {{ blk.n }}; ++i) {
+                jacobian[i * {{ blk.n }} + {{ loop.index0 }}] = ({{ b }}_row(i, time, batch_y, batch_p) - f[i]) / h;
+            }
+            batch_{{ unknown.column }}[{{ unknown.index }}] = x;
+        }
+{%- endfor %}
+        for (int i = 0; i < {{ blk.n }}; ++i) {
+            f[i] = -f[i];
+        }
+        if ({{ name }}_lu_solve(jacobian, f, {{ blk.n }}) != 0) {
+            return 1;
+        }
+        double largest = 0.0;
+{%- for unknown in blk.unknowns %}
+        {
+            double x = batch_{{ unknown.column }}[{{ unknown.index }}];
+            batch_{{ unknown.column }}[{{ unknown.index }}] = x + f[{{ loop.index0 }}];
+            largest = fmax(largest, fabs(f[{{ loop.index0 }}]) / (1.0 + fabs(x)));
+        }
+{%- endfor %}
+        converged = largest <= {{ NAME }}_NEWTON_STEP_TOLERANCE;
+    }
+    return 3;
+}
+{%- endfor %}
+
+extern "C" __global__ void {{ name }}_initialize_batch(
+    double time,
+    double *y,
+    double *p,
+    int *status,
+    int y_stride,
+    int p_stride,
+    int batch_count)
+{
+    int batch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (batch >= batch_count) {
+        return;
+    }
+    double *batch_y = y + ((long long)batch * (long long)y_stride);
+    double *batch_p = p + ((long long)batch * (long long)p_stride);
+    int failures = 0;
+{%- if ev.homotopy_lambda is not none %}
+    batch_p[{{ ev.homotopy_lambda }}] = 1.0;
+{%- endif %}
+{%- if ev.initial_flag is not none %}
+    batch_p[{{ ev.initial_flag }}] = 1.0;
+{%- endif %}
+    for (int round = 0; round < {{ 2 if init.solves_parameters else 1 }}; ++round) {
+        failures = 0;
+        {{ name }}_bindings(time, batch_y, batch_p);
+        failures += {{ name }}_refresh(time, batch_y, batch_p) != 0;
+{%- for blk in init.blocks %}
+        failures += {{ name }}_init{{ loop.index0 }}_project(time, batch_y, batch_p) != 0;
+{%- endfor %}
+    }
+{%- if ev.initial_flag is not none %}
+    if ({{ name }}_event_iterate(time, batch_y, batch_p) < 0) {
+        failures += 1000;
+    }
+    batch_p[{{ ev.initial_flag }}] = 0.0;
+{%- else %}
+    if ({{ name }}_event_iterate(time, batch_y, batch_p) < 0) {
+        failures += 1000;
+    }
+{%- endif %}
+    (void){{ name }}_refresh(time, batch_y, batch_p);
+    if (status) {
+        status[batch] = failures;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// State manifold: lower-order constraints that index reduction replaced by
+// differentiated ones. After every accepted step (and after initialization)
+// the host launches `{{ name }}_project_manifold_batch`, which moves the
+// listed state coordinates by a minimum-norm Gauss-Newton correction back
+// onto the constraints so they do not drift.
+{%- set manifold = lanes.manifold %}
+{%- for blk in manifold.blocks %}
+{%- set b = name ~ "_manifold" ~ loop.index0 %}
+{%- set n = blk.y | length %}
+{{ residual_rows(b, blk.residual_rows, blk.m) }}
+
+__device__ int {{ b }}_project(double time, double *batch_y, const double *batch_p)
+{
+    const int coordinate[{{ n }}] = {{ int_list(blk.y) }};
+    double r[{{ blk.m }}];
+    double jacobian[{{ blk.m * n }}];
+    double normal[{{ blk.m * blk.m }}];
+    for (int iteration = 0; iteration < {{ NAME }}_NEWTON_MAX_ITERATIONS; ++iteration) {
+{%- if blk.reads_algebraics %}
+        (void){{ name }}_refresh(time, batch_y, batch_p);
+{%- endif %}
+        int exact = 1;
+        for (int i = 0; i < {{ blk.m }}; ++i) {
+            r[i] = {{ b }}_row(i, time, batch_y, batch_p);
+            if (!isfinite(r[i])) {
+                return 2;
+            }
+            exact &= r[i] == 0.0;
+        }
+        if (exact) {
+            return 0;
+        }
+        for (int column = 0; column < {{ n }}; ++column) {
+            double x = batch_y[coordinate[column]];
+            double h = 1.4901161193847656e-08 * fmax(1.0, fabs(x));
+            batch_y[coordinate[column]] = x + h;
+{%- if blk.reads_algebraics %}
+            (void){{ name }}_refresh(time, batch_y, batch_p);
+{%- endif %}
+            for (int i = 0; i < {{ blk.m }}; ++i) {
+                jacobian[i * {{ n }} + column] = ({{ b }}_row(i, time, batch_y, batch_p) - r[i]) / h;
+            }
+            batch_y[coordinate[column]] = x;
+        }
+        for (int i = 0; i < {{ blk.m }}; ++i) {
+            for (int j = 0; j < {{ blk.m }}; ++j) {
+                double sum = 0.0;
+                for (int column = 0; column < {{ n }}; ++column) {
+                    sum += jacobian[i * {{ n }} + column] * jacobian[j * {{ n }} + column];
+                }
+                normal[i * {{ blk.m }} + j] = sum;
+            }
+        }
+        if ({{ name }}_lu_solve(normal, r, {{ blk.m }}) != 0) {
+            return 1;
+        }
+        double largest = 0.0;
+        for (int column = 0; column < {{ n }}; ++column) {
+            double step = 0.0;
+            for (int i = 0; i < {{ blk.m }}; ++i) {
+                step -= jacobian[i * {{ n }} + column] * r[i];
+            }
+            double x = batch_y[coordinate[column]];
+            batch_y[coordinate[column]] = x + step;
+            largest = fmax(largest, fabs(step) / (1.0 + fabs(x)));
+        }
+        if (largest <= {{ NAME }}_NEWTON_STEP_TOLERANCE) {
+            return 0;
+        }
+    }
+    return 3;
+}
+{%- endfor %}
+
+// Project every lane's states onto the retained constraints, then settle its
+// algebraic slots. `status` (may be null) receives the blocks that failed.
+extern "C" __global__ void {{ name }}_project_manifold_batch(
+    double time,
+    double *y,
+    const double *p,
+    int *status,
+    int y_stride,
+    int p_stride,
+    int batch_count)
+{
+    int batch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (batch >= batch_count) {
+        return;
+    }
+    double *batch_y = y + ((long long)batch * (long long)y_stride);
+    const double *batch_p = p + ((long long)batch * (long long)p_stride);
+    int failures = 0;
+{%- for blk in manifold.blocks %}
+    failures += {{ name }}_manifold{{ loop.index0 }}_project(time, batch_y, batch_p) != 0;
+{%- endfor %}
+    (void){{ name }}_refresh(time, batch_y, batch_p);
+    if (status) {
+        status[batch] = failures;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// delay(): each lane keeps a ring buffer of accepted (time, source) points in
+// `history` (stride {{ NAME }}_DELAY_HISTORY_STRIDE doubles per lane). The
+// host launches `{{ name }}_delay_init_batch` once after initialization,
+// `{{ name }}_delay_apply_batch` at the time of every derivative evaluation
+// (before it), and `{{ name }}_delay_commit_batch` after every accepted step.
+// The capacity must cover the longest delay at the smallest step; override it
+// with -D{{ NAME }}_DELAY_CAPACITY=n.
+#ifndef {{ NAME }}_DELAY_CAPACITY
+#define {{ NAME }}_DELAY_CAPACITY 1024
+#endif
+#define {{ NAME }}_DELAY_HISTORY_STRIDE (2 + {{ NAME }}_DELAY_CAPACITY * (1 + {{ NAME }}_DELAYS))
+{%- if delays.count > 0 %}
+
+__device__ void {{ name }}_delay_sources(double time, const double *batch_y, const double *batch_p, double *__sources)
+{
+    (void)time;
+    (void)batch_y;
+    (void)batch_p;
+{{ programs(delays.source, out="__sources") }}
+}
+
+__device__ void {{ name }}_delay_times(double time, const double *batch_y, const double *batch_p, double *__times)
+{
+    (void)time;
+    (void)batch_y;
+    (void)batch_p;
+{{ programs(delays.delay_time, out="__times") }}
+}
+
+// The history value of channel `channel` at `query`: the oldest point before
+// the history, the newest after it, the left point for a discrete source,
+// and linear interpolation otherwise.
+__device__ double {{ name }}_delay_read(const double *history, int channel, double query, int discrete)
+{
+    const int capacity = {{ NAME }}_DELAY_CAPACITY;
+    int count = (int)history[0];
+    int head = (int)history[1];
+    const double *times = history + 2;
+    const double *values = history + 2 + (long long)capacity * (long long)(1 + channel);
+    if (count <= 0) {
+        return NAN;
+    }
+    if (query <= times[head]) {
+        return values[head];
+    }
+    int last = (head + count - 1) % capacity;
+    if (query >= times[last]) {
+        return values[last];
+    }
+    int low = 0;
+    int high = count - 1;
+    while (high - low > 1) {
+        int middle = (low + high) / 2;
+        if (times[(head + middle) % capacity] <= query) {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    int lower = (head + low) % capacity;
+    int upper = (head + high) % capacity;
+    double span = times[upper] - times[lower];
+    if (discrete || !(span > 0.0)) {
+        return values[lower];
+    }
+    double fraction = (query - times[lower]) / span;
+    return values[lower] + fraction * (values[upper] - values[lower]);
+}
+
+__device__ void {{ name }}_delay_append(double *history, double time, const double *sources)
+{
+    const int capacity = {{ NAME }}_DELAY_CAPACITY;
+    int count = (int)history[0];
+    int head = (int)history[1];
+    if (count == capacity) {
+        head = (head + 1) % capacity;
+        count -= 1;
+    }
+    int slot = (head + count) % capacity;
+    history[2 + slot] = time;
+    for (int channel = 0; channel < {{ delays.count }}; ++channel) {
+        history[2 + (long long)capacity * (long long)(1 + channel) + slot] = sources[channel];
+    }
+    history[0] = (double)(count + 1);
+    history[1] = (double)head;
+}
+{%- endif %}
+
+// Start every delay history at `time` from the initialized lane: the value
+// before the start time is the source's start value.
+extern "C" __global__ void {{ name }}_delay_init_batch(
+    double time,
+    double *y,
+    double *p,
+    double *history,
+    int y_stride,
+    int p_stride,
+    int history_stride,
+    int batch_count)
+{
+    int batch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (batch >= batch_count) {
+        return;
+    }
+    double *batch_y = y + ((long long)batch * (long long)y_stride);
+    double *batch_p = p + ((long long)batch * (long long)p_stride);
+    double *batch_history = history + ((long long)batch * (long long)history_stride);
+    (void)time;
+    (void)batch_y;
+    (void)batch_p;
+    batch_history[0] = 0.0;
+    batch_history[1] = 0.0;
+{%- if delays.count > 0 %}
+    const int value_parameter[{{ delays.count }}] = {{ int_list(delays.value_parameters) }};
+    double sources[{{ delays.count }}];
+    // The delayed values feed the rows their sources read: settle the
+    // start-time fixed point a few times.
+    for (int pass = 0; pass < 4; ++pass) {
+        (void){{ name }}_refresh(time, batch_y, batch_p);
+        {{ name }}_delay_sources(time, batch_y, batch_p, sources);
+        int changed = 0;
+        for (int channel = 0; channel < {{ delays.count }}; ++channel) {
+            changed |= batch_p[value_parameter[channel]] != sources[channel];
+            batch_p[value_parameter[channel]] = sources[channel];
+        }
+        if (!changed) {
+            break;
+        }
+    }
+    (void){{ name }}_refresh(time, batch_y, batch_p);
+    {{ name }}_delay_sources(time, batch_y, batch_p, sources);
+    {{ name }}_delay_append(batch_history, time, sources);
+{%- endif %}
+}
+
+// Write every delayed value at `time` into its parameter slot.
+extern "C" __global__ void {{ name }}_delay_apply_batch(
+    double time,
+    const double *y,
+    double *p,
+    const double *history,
+    int y_stride,
+    int p_stride,
+    int history_stride,
+    int batch_count)
+{
+    int batch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (batch >= batch_count) {
+        return;
+    }
+    const double *batch_y = y + ((long long)batch * (long long)y_stride);
+    double *batch_p = p + ((long long)batch * (long long)p_stride);
+    const double *batch_history = history + ((long long)batch * (long long)history_stride);
+    (void)time;
+    (void)batch_y;
+    (void)batch_p;
+    (void)batch_history;
+{%- if delays.count > 0 %}
+    const int value_parameter[{{ delays.count }}] = {{ int_list(delays.value_parameters) }};
+    const int discrete[{{ delays.count }}] = {{ int_list(delays.discrete) }};
+    double delay_time[{{ delays.count }}];
+    {{ name }}_delay_times(time, batch_y, batch_p, delay_time);
+    for (int channel = 0; channel < {{ delays.count }}; ++channel) {
+        batch_p[value_parameter[channel]] = {{ name }}_delay_read(batch_history, channel, time - delay_time[channel], discrete[channel]);
+    }
+{%- endif %}
+}
+
+// Record the accepted point at `time` (after the step that reached it, with
+// the delayed values of `time` applied).
+extern "C" __global__ void {{ name }}_delay_commit_batch(
+    double time,
+    double *y,
+    const double *p,
+    double *history,
+    int y_stride,
+    int p_stride,
+    int history_stride,
+    int batch_count)
+{
+    int batch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (batch >= batch_count) {
+        return;
+    }
+    double *batch_y = y + ((long long)batch * (long long)y_stride);
+    const double *batch_p = p + ((long long)batch * (long long)p_stride);
+    double *batch_history = history + ((long long)batch * (long long)history_stride);
+    (void)time;
+    (void)batch_y;
+    (void)batch_p;
+    (void)batch_history;
+{%- if delays.count > 0 %}
+    double sources[{{ delays.count }}];
+    (void){{ name }}_refresh(time, batch_y, batch_p);
+    {{ name }}_delay_sources(time, batch_y, batch_p, sources);
+    {{ name }}_delay_append(batch_history, time, sources);
+{%- endif %}
 }
 
 // Solve-IR derivative block inventory:
