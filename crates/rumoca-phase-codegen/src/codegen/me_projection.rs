@@ -166,6 +166,24 @@ pub fn me_refresh_admissible(problem: &solve::SolveProblem) -> bool {
             .all(|plan| refresh_plans_admissible(&chart::alternate_problem(problem, plan)))
 }
 
+/// Solve-only admissibility of the staged refresh for a target that projects
+/// each algebraic block per lane (`solve_blocks.lanes.refresh`) and the
+/// retained state-manifold blocks itself after each accepted step. Alternate
+/// reduced charts remain refused.
+#[must_use]
+pub fn lane_refresh_admissible(problem: &solve::SolveProblem) -> bool {
+    problem.validate().is_ok()
+        && problem
+            .continuous
+            .algebraic_projection_plan
+            .blocks
+            .scalar_blocks()
+            .iter()
+            .all(|block| block.alternate_charts.is_empty())
+        && problem.continuous.reduced_chart_set.charts.is_empty()
+        && refresh_plans_admissible(problem)
+}
+
 /// Canonical blocks of one chart referenced by any step or complete-plan
 /// fallback, each described once over the shared program table.
 struct BlockCatalog<'a> {
