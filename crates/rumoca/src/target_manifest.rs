@@ -923,6 +923,12 @@ fn validate_target_requirements(
             // The renderer inlines pure calls from the owners lowered with
             // the problem (`build_solve_template_renderer`), so the gate reads
             // the same pair.
+            if manifest.ir == TargetTemplateIr::Solve
+                && capabilities.algebraic_projection == Some(true)
+            {
+                lane_validation::validate(result, manifest, capabilities)?;
+                return Ok(validated);
+            }
             let solve = rumoca_sim::lower_solve_package(&result.dae)
                 .context("Lower Solve IR for target capability validation")?;
             validate_solve_target_capabilities_with_calls(
@@ -1022,6 +1028,9 @@ enum ManifestRenderer {
     Ir(TemplateIr),
     /// `wgsl-ode` renders Solve kernels without the DAE JSON context.
     WgslSolve,
+    /// `cuda-ode` renders against the complete lowered model, so its lanes
+    /// can be seeded with the model's start values.
+    SolveModel,
     /// One checked tensor-native FMI component plus its lazy Solve program.
     #[cfg(feature = "fmi")]
     Fmi {
@@ -1053,6 +1062,9 @@ fn resolve_manifest_renderer(
     let ValidatedTarget {} = validated;
     if manifest.ir == TargetTemplateIr::Solve && manifest.name.as_deref() == Some("wgsl-ode") {
         return Ok(ManifestRenderer::WgslSolve);
+    }
+    if manifest.ir == TargetTemplateIr::Solve && manifest.name.as_deref() == Some("cuda-ode") {
+        return Ok(ManifestRenderer::SolveModel);
     }
     if matches!(
         manifest.ir,
@@ -1119,6 +1131,9 @@ impl ManifestRenderer {
             Self::WgslSolve => result
                 .render_solve_template_str_without_dae(template, model_identifier)
                 .map_err(Into::into),
+            Self::SolveModel => result
+                .render_solve_model_template_str(template, model_identifier)
+                .map_err(Into::into),
             #[cfg(feature = "fmi")]
             Self::Fmi { renderer, artifact } => renderer
                 .render_with_name_and_artifact(template, model_identifier, artifact)
@@ -1154,6 +1169,9 @@ impl ManifestRenderer {
                 .map_err(Into::into),
             Self::WgslSolve => result
                 .render_solve_template_str_without_dae(template, model_identifier)
+                .map_err(Into::into),
+            Self::SolveModel => result
+                .render_solve_model_template_str(template, model_identifier)
                 .map_err(Into::into),
             #[cfg(feature = "fmi")]
             Self::Fmi { renderer, .. } => renderer
@@ -1215,6 +1233,8 @@ fn print_target_completion_message(
     }
     Ok(())
 }
+
+mod lane_validation;
 
 #[cfg(all(test, feature = "fmu-packaging"))]
 mod prepared_package_tests;
