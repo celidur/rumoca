@@ -459,18 +459,42 @@ __device__ int {{ b }}_project(double time, double *batch_y, const double *batch
             }
             batch_y[iterated[column]] = x;
         }
+        double before = 0.0;
         for (int i = 0; i < {{ k }}; ++i) {
+            before += f[i] * f[i];
             f[i] = -f[i];
         }
         if ({{ name }}_lu_solve(jacobian, f, {{ k }}) != 0) {
             {{ b }}_sweep(time, batch_y, batch_p);
             return 1;
         }
+        // Backtrack until the residual decreases, so a piecewise-linear row
+        // (a table interpolation) cannot make the iteration cycle across a
+        // breakpoint; keep the full step when no fraction decreases it.
+        double base[{{ k }}];
+        for (int column = 0; column < {{ k }}; ++column) {
+            base[column] = batch_y[iterated[column]];
+        }
+        double lambda = 1.0;
+        for (int trial = 0; trial < 10; ++trial) {
+            for (int column = 0; column < {{ k }}; ++column) {
+                batch_y[iterated[column]] = base[column] + lambda * f[column];
+            }
+            {{ b }}_sweep(time, batch_y, batch_p);
+            double after = 0.0;
+            for (int i = 0; i < {{ k }}; ++i) {
+                double r = {{ b }}_row(residual[i], time, batch_y, batch_p);
+                after += r * r;
+            }
+            if (after < before) {
+                break;
+            }
+            lambda = trial == 9 ? 1.0 : 0.5 * lambda;
+        }
         double largest = 0.0;
         for (int column = 0; column < {{ k }}; ++column) {
-            double x = batch_y[iterated[column]];
-            batch_y[iterated[column]] = x + f[column];
-            largest = fmax(largest, fabs(f[column]) / (1.0 + fabs(x)));
+            batch_y[iterated[column]] = base[column] + lambda * f[column];
+            largest = fmax(largest, fabs(lambda * f[column]) / (1.0 + fabs(base[column])));
         }
         converged = largest <= {{ NAME }}_NEWTON_STEP_TOLERANCE;
     }
