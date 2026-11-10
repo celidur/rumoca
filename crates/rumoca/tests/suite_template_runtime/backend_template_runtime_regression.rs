@@ -75,13 +75,23 @@ end ImplicitAlgebraic;
             "the FMI kernel must project the coupled block"
         );
     }
+    // cuda-ode solves the coupled block per lane by Newton in-kernel.
+    let files = rumoca::render_target_files(&compiled, "ImplicitAlgebraic", "cuda-ode", None)
+        .expect("cuda-ode projects the implicit algebraic block per lane");
+    let kernel = files
+        .iter()
+        .find(|file| file.path.ends_with("_ode.cu"))
+        .expect("cuda-ode emits its kernel");
+    assert!(
+        kernel.content.contains("_refresh_batch"),
+        "the CUDA kernel must settle the coupled block per lane"
+    );
     for target in [
         "c-ode",
         "rust-ode",
         "rust-fixed-ode",
         "casadi-ode",
         "jax-ode",
-        "cuda-ode",
         "wgsl-ode",
     ] {
         let error = rumoca::render_target_files(&compiled, "ImplicitAlgebraic", target, None)
