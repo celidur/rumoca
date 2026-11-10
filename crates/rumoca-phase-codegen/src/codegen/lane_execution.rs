@@ -820,6 +820,11 @@ fn lane_part(handle: &SolveRenderHandle, key: &str) -> Result<Value, CodegenErro
                 minijinja::context! {
                     y => start_values(&model.initial_y),
                     p => start_values(&model.parameters),
+                    // Reporting only: a layout with an unnamed slot emits
+                    // no name table.
+                    y_names => problem
+                        .solver_named_report(0..problem.solver_scalar_count())
+                        .ok(),
                 }
             },
         )),
