@@ -122,8 +122,8 @@
     double __r{{ op.dst + offset }};
 {%- endfor %}
     {
-        const double __captures[{{ op.capture_count }}] = { {% for offset in range(op.capture_count) %}__r{{ op.capture_start + offset }}{{ ", " if not loop.last else "" }}{% endfor %} };
-        double __result[{{ op.result_count }}];
+        const double __captures[{{ [op.capture_count, 1] | max }}] = { {% for offset in range(op.capture_count) %}__r{{ op.capture_start + offset }}{{ ", " if not loop.last else "" }}{% else %}0.0{% endfor %} };
+        double __result[{{ [op.result_count, 1] | max }}];
         int __taken = 0;
         (void)__captures;
 {%- for arm in op.arms %}
@@ -231,6 +231,11 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#endif
+#if defined(__CUDACC__) && !defined(__CUDACC_RTC__)
+// Generated registers are often read by only one branch; keep nvcc quiet.
+#pragma nv_diag_suppress 550
+#pragma nv_diag_suppress 177
 #endif
 #if !defined(__CUDACC__) && !defined(__noinline__)
 #define __noinline__
