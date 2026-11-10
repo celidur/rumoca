@@ -699,6 +699,10 @@ fn lane_part(handle: &SolveRenderHandle, key: &str) -> Result<Value, CodegenErro
             minijinja::context! {
                 y => start_values(&model.initial_y),
                 p => start_values(&model.parameters),
+                y_names => problem
+                    .solver_names()
+                    .map(|name| name.unwrap_or_default())
+                    .collect::<Vec<_>>(),
             }
         })),
     }
