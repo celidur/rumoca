@@ -57,8 +57,10 @@ impl Session {
             dae_options: config.dae_options(),
             compile_policies: CompilePolicies {
                 unit_metadata: config.unit_metadata_policy,
+                connector_quantity: config.connector_quantity_policy,
             },
             unit_metadata_warnings_by_model: IndexMap::new(),
+            connector_quantity_warnings_by_model: IndexMap::new(),
             structural_override_sources: Vec::new(),
             documents: IndexMap::new(),
             detached_document_uris: IndexSet::new(),
@@ -93,10 +95,22 @@ impl Session {
             .unwrap_or(&[])
     }
 
+    /// Return the EF037 warnings [`ConnectorQuantityPolicy::Warn`] produced in
+    /// the most recent compile or flat-model query of `model_name`, including
+    /// one served from a cache.
+    pub fn connector_quantity_warnings(&self, model_name: &str) -> &[CommonDiagnostic] {
+        self.connector_quantity_warnings_by_model
+            .get(model_name)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
     /// Forget the policy warnings recorded for `model_name` before it is
     /// compiled again.
     pub(super) fn clear_policy_warnings(&mut self, model_name: &str) {
         self.unit_metadata_warnings_by_model
+            .shift_remove(model_name);
+        self.connector_quantity_warnings_by_model
             .shift_remove(model_name);
     }
 
@@ -104,6 +118,8 @@ impl Session {
     pub(super) fn record_policy_warnings(&mut self, model_name: &str, warnings: PolicyWarnings) {
         self.unit_metadata_warnings_by_model
             .insert(model_name.to_string(), warnings.unit_metadata);
+        self.connector_quantity_warnings_by_model
+            .insert(model_name.to_string(), warnings.connector_quantity);
     }
 
     pub(crate) fn invalidate_resolved_state(&mut self, cause: CacheInvalidationCause) {
@@ -160,6 +176,7 @@ impl Session {
     pub(crate) fn bump_revision(&mut self) -> RevisionId {
         self.sync_query_state_from_snapshots();
         self.unit_metadata_warnings_by_model.clear();
+        self.connector_quantity_warnings_by_model.clear();
         self.source_root_indexing.read_prewarm_session_revision = None;
         self.next_revision = self.next_revision.saturating_add(1);
         let revision = RevisionId::new(self.next_revision);

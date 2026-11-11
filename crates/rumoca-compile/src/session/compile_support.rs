@@ -86,6 +86,7 @@ pub(super) fn flatten_options_for_tree() -> FlattenOptions {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct CompilePolicies {
     pub(super) unit_metadata: UnitMetadataPolicy,
+    pub(super) connector_quantity: ConnectorQuantityPolicy,
 }
 
 impl CompilePolicies {
@@ -100,6 +101,8 @@ impl CompilePolicies {
 pub(super) struct PolicyWarnings {
     /// ET010 warnings of [`UnitMetadataPolicy::Warn`].
     pub(super) unit_metadata: Vec<CommonDiagnostic>,
+    /// EF037 warnings of [`ConnectorQuantityPolicy::Warn`].
+    pub(super) connector_quantity: Vec<CommonDiagnostic>,
 }
 
 fn dae_model_outcome_internal_with_options(
@@ -164,8 +167,13 @@ fn dae_model_outcome_and_warnings_with_options(
     notify_compile_phase(FailedPhase::Flatten, CompilePhaseEvent::Started);
     let flatten_start = maybe_start_timer();
     let closure = reachable_closure_for_tree(tree, model_name);
-    let (flat_outcome, flattened_built) =
-        flat_model_outcome_from_typed(tree, model_name, &closure, typed_outcome);
+    let (flat_outcome, flattened_built, connector_quantity) = flat_model_outcome_from_typed(
+        tree,
+        model_name,
+        &closure,
+        typed_outcome,
+        policies.connector_quantity,
+    );
     if flattened_built {
         maybe_record_compile_phase_timing(FailedPhase::Flatten, flatten_start);
     }
@@ -191,7 +199,14 @@ fn dae_model_outcome_and_warnings_with_options(
         }),
         _ => None,
     };
-    (dae_outcome, warnings, PolicyWarnings { unit_metadata })
+    (
+        dae_outcome,
+        warnings,
+        PolicyWarnings {
+            unit_metadata,
+            connector_quantity,
+        },
+    )
 }
 
 fn dae_model_outcome_internal(tree: &ast::ClassTree, model_name: &str) -> DaeModelOutcome {
@@ -348,7 +363,8 @@ pub(super) fn flat_model_outcome_from_typed(
     model_name: &str,
     closure: &ReachableModelClosure,
     typed_outcome: TypedModelOutcome,
-) -> (FlatModelOutcome, bool) {
+    connector_quantity_policy: ConnectorQuantityPolicy,
+) -> (FlatModelOutcome, bool, Vec<CommonDiagnostic>) {
     let overlay = match typed_outcome {
         TypedModelOutcome::Success(overlay) => *overlay,
         TypedModelOutcome::NeedsInner {
@@ -361,33 +377,43 @@ pub(super) fn flat_model_outcome_from_typed(
                     missing_spans,
                 },
                 false,
+                Vec::new(),
             );
         }
         TypedModelOutcome::InstantiateError(error) => {
-            return (FlatModelOutcome::InstantiateError(error), false);
+            return (FlatModelOutcome::InstantiateError(error), false, Vec::new());
         }
         TypedModelOutcome::TypecheckError(diags) => {
-            return (FlatModelOutcome::TypecheckError(diags), false);
+            return (FlatModelOutcome::TypecheckError(diags), false, Vec::new());
         }
     };
 
     let target_closure = TargetClosure::new(tree, &closure.reachable_classes);
-    match flatten_ref_in_closure(
-        tree,
-        &overlay,
-        model_name,
-        flatten_options_for_tree(),
-        &target_closure,
-    ) {
+    let (flatten_result, connector_quantity_warnings) =
+        flatten_ref_in_closure_with_connector_quantity_policy(
+            tree,
+            &overlay,
+            model_name,
+            flatten_options_for_tree(),
+            &target_closure,
+            connector_quantity_policy,
+        );
+    let connector_quantity_warnings = connector_quantity_warnings
+        .iter()
+        .map(|warning| warning.diagnostic())
+        .collect();
+    match flatten_result {
         Ok(flat) => (
             FlatModelOutcome::Success(Box::new(FlatModelArtifactData { flat })),
             true,
+            connector_quantity_warnings,
         ),
         Err(error) => (
             FlatModelOutcome::FlattenError {
                 error: Box::new(error),
             },
             true,
+            connector_quantity_warnings,
         ),
     }
 }
