@@ -24,6 +24,8 @@
 // initialize and probe once on the CPU.
 //   g++ -O1 -std=c++17 -w -x c++ -DHOST_TU -DMODEL_SRC='"<M>_ode.cu"'
 //     -DM=<M> -DU=<U> -c gpu_btf.cu -o gpu_btf_host.o
+//   objcopy --keep-global-symbol=host_init --keep-global-symbol=host_rhs gpu_btf_host.o
+//     (the model's globals are defined in both objects; keep only these two)
 //   nvcc -O1 -Xcicc -O1 -Xptxas -O1 -std=c++17 -arch=native
 //     -DMODEL_SRC='"<M>_ode.cu"' -DM=<M> -DU=<U> gpu_btf.cu gpu_btf_host.o -o gpu_btf
 // CPU emulation:
