@@ -38,35 +38,41 @@ struct BuiltinCallVisitor<'a> {
 
 impl ast::Visitor for BuiltinCallVisitor<'_> {
     fn enter_scope(&mut self, scope: ast::VisitScope<'_>) -> std::ops::ControlFlow<()> {
-        match scope {
-            ast::VisitScope::ForEquation(indices)
-            | ast::VisitScope::ForStatement(indices)
-            | ast::VisitScope::ArrayComprehension(indices) => {
-                for index in indices {
-                    // MLS §8.3.2 / §11.2.2: a fixed range gives a fixed loop index.
-                    let is_fixed = self.range_is_fixed(&index.range);
-                    self.loop_indices.push(LoopIndex {
-                        name: index.ident.text.to_string(),
-                        is_fixed,
-                    });
-                }
+        // For-equation and for-statement indices are bound one by one in
+        // `visit_for_equation` / `visit_for_statement`.
+        if let ast::VisitScope::ArrayComprehension(indices) = scope {
+            for index in indices {
+                self.push_loop_index(index);
             }
-            ast::VisitScope::Class(_) => {}
         }
         Continue(())
     }
 
     fn exit_scope(&mut self, scope: ast::VisitScope<'_>) -> std::ops::ControlFlow<()> {
-        match scope {
-            ast::VisitScope::ForEquation(indices)
-            | ast::VisitScope::ForStatement(indices)
-            | ast::VisitScope::ArrayComprehension(indices) => {
-                self.loop_indices
-                    .truncate(self.loop_indices.len().saturating_sub(indices.len()));
-            }
-            ast::VisitScope::Class(_) => {}
+        if let ast::VisitScope::ArrayComprehension(indices) = scope {
+            self.pop_loop_indices(indices.len());
         }
         Continue(())
+    }
+
+    fn visit_for_equation(
+        &mut self,
+        indices: &[ast::ForIndex],
+        equations: &[ast::Equation],
+    ) -> std::ops::ControlFlow<()> {
+        self.with_sequential_loop_indices(indices, |visitor| {
+            visitor.visit_each(equations, Self::visit_equation)
+        })
+    }
+
+    fn visit_for_statement(
+        &mut self,
+        indices: &[ast::ForIndex],
+        statements: &[ast::Statement],
+    ) -> std::ops::ControlFlow<()> {
+        self.with_sequential_loop_indices(indices, |visitor| {
+            visitor.visit_each(statements, Self::visit_statement)
+        })
     }
 
     fn visit_class_def(&mut self, class: &ClassDef) -> std::ops::ControlFlow<()> {
@@ -151,6 +157,45 @@ impl ast::Visitor for BuiltinCallVisitor<'_> {
 }
 
 impl BuiltinCallVisitor<'_> {
+    fn push_loop_index(&mut self, index: &ast::ForIndex) {
+        // MLS §8.3.2 / §11.2.2: a fixed range gives a fixed loop index.
+        let is_fixed = self.range_is_fixed(&index.range);
+        self.loop_indices.push(LoopIndex {
+            name: index.ident.text.to_string(),
+            is_fixed,
+        });
+    }
+
+    fn pop_loop_indices(&mut self, count: usize) {
+        self.loop_indices
+            .truncate(self.loop_indices.len().saturating_sub(count));
+    }
+
+    /// MLS §8.3.2.1 / §11.2.2.1: `for i in r1, j in r2 loop` nests `j` inside
+    /// `i`, so each range is visited and classified with the preceding indices
+    /// in scope but before its own index shadows an outer one.
+    fn with_sequential_loop_indices(
+        &mut self,
+        indices: &[ast::ForIndex],
+        body: impl FnOnce(&mut Self) -> std::ops::ControlFlow<()>,
+    ) -> std::ops::ControlFlow<()> {
+        let mut bound = 0;
+        let mut result = Continue(());
+        for index in indices {
+            result = ast::Visitor::visit_for_index(self, index);
+            if result.is_break() {
+                break;
+            }
+            self.push_loop_index(index);
+            bound += 1;
+        }
+        if result.is_continue() {
+            result = body(self);
+        }
+        self.pop_loop_indices(bound);
+        result
+    }
+
     fn range_is_fixed(&self, expr: &Expression) -> bool {
         self.current_class()
             .is_some_and(|class| is_parameter_expression_in_scope(expr, class, &self.loop_indices))

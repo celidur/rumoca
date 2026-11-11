@@ -160,3 +160,277 @@ end TestPkg;
     let inner = pkg.classes.get("Inner").expect("Inner should exist");
     assert!(inner.def_id.is_some());
 }
+
+#[test]
+fn delay_parameter_accepts_for_equation_array_subscripts() {
+    resolve_test_source(
+        r#"
+model DelayLoop
+  parameter Integer m = 2;
+  parameter Real tau[m] = {0.1, 0.2};
+  Real y[m];
+equation
+  for i in 1:m loop
+    if time < tau[i] then
+      y[i] = 0;
+    else
+      y[i] = delay(time, tau[i]);
+    end if;
+  end for;
+end DelayLoop;
+"#,
+    )
+    .expect("parameter array indexed by a structural iterator is a parameter expression");
+}
+
+#[test]
+fn delay_parameter_accepts_three_argument_for_equation() {
+    resolve_test_source(
+        r#"
+model DelayLoop3arg
+  parameter Real tau[2] = {0.1, 0.2};
+  Real y[2];
+equation
+  for i in 1:2 loop
+    y[i] = delay(time, 0.05 + 0.01 * sin(time), tau[i]);
+  end for;
+end DelayLoop3arg;
+"#,
+    )
+    .expect("delayMax may use a parameter iterator; delayTime may vary");
+}
+
+#[test]
+fn delay_parameter_accepts_for_statement_array_subscripts() {
+    resolve_test_source(
+        r#"
+model Test
+  parameter Integer m = 2;
+  parameter Real tau[m] = {0.1, 0.2};
+  Integer i = 1;
+  Real y[m];
+algorithm
+  for i in 1:m loop
+    y[i] := delay(time, tau[i]);
+  end for;
+end Test;
+"#,
+    )
+    .expect("parameter-range iterator must hide a non-parameter class component");
+}
+
+#[test]
+fn delay_parameter_accepts_array_comprehension_subscripts() {
+    resolve_test_source(
+        r#"
+model Test
+  parameter Integer m = 2;
+  parameter Real tau[m] = {0.1, 0.2};
+  Real y[m];
+equation
+  y = {delay(time, tau[i]) for i in 1:m};
+end Test;
+"#,
+    )
+    .expect("array comprehension supplies its own parameter-range iterator scope");
+}
+
+#[test]
+fn delay_parameter_accepts_nested_shadowing_and_enclosing_range() {
+    resolve_test_source(
+        r#"
+model Test
+  parameter Integer i = 2;
+  parameter Real tau[2] = {0.1, 0.2};
+  Real y[2,2];
+equation
+  for i in 1:i loop
+    for i in 1:i loop
+      y[i,i] = delay(time, tau[i]);
+    end for;
+  end for;
+end Test;
+"#,
+    )
+    .expect("each range resolves before binding the new iterator of the same name");
+}
+
+fn assert_delay_parameter_error_count(source: &str, expected: usize) {
+    let diagnostics = resolve_test_source(source).expect_err("invalid delay must fail resolution");
+    let count = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code.as_deref() == Some("ER055"))
+        .count();
+    assert_eq!(count, expected, "unexpected diagnostics: {diagnostics:#?}");
+}
+
+#[test]
+fn delay_parameter_rejects_dynamic_for_equation_range() {
+    assert_delay_parameter_error_count(
+        r#"
+model Test
+  Integer n = 2;
+  parameter Real tau[2] = {0.1, 0.2};
+  Real y[2];
+equation
+  for i in 1:n loop
+    y[i] = delay(time, tau[i]);
+  end for;
+end Test;
+"#,
+        1,
+    );
+}
+
+#[test]
+fn delay_parameter_rejects_dynamic_nested_index_and_restores_outer_scope() {
+    assert_delay_parameter_error_count(
+        r#"
+model Test
+  parameter Real tau[2] = {0.1, 0.2};
+  Integer n = 2;
+  Real y[2];
+algorithm
+  for i in 1:2 loop
+    for i in 1:n loop
+      y[i] := delay(time, tau[i]);
+    end for;
+    y[i] := delay(time, tau[i]);
+  end for;
+end Test;
+"#,
+        1,
+    );
+}
+
+#[test]
+fn delay_parameter_rejects_dynamic_comprehension_shadowing_parameter() {
+    assert_delay_parameter_error_count(
+        r#"
+model Test
+  parameter Integer i = 1;
+  parameter Real tau[2] = {0.1, 0.2};
+  Integer n = 2;
+  Real y[2];
+equation
+  y = {delay(time, 0.05, tau[i]) for i in 1:n};
+end Test;
+"#,
+        1,
+    );
+}
+
+#[test]
+fn delay_parameter_rejects_dynamic_subscript_inside_parameter_loop() {
+    assert_delay_parameter_error_count(
+        r#"
+model Test
+  parameter Real tau[2] = {0.1, 0.2};
+  Integer j = 1;
+  Real y[2];
+equation
+  for i in 1:2 loop
+    y[i] = delay(time, tau[j]);
+  end for;
+end Test;
+"#,
+        1,
+    );
+}
+
+#[test]
+fn delay_parameter_iterator_does_not_leak_into_following_class() {
+    assert_delay_parameter_error_count(
+        r#"
+package Test
+  model First
+    parameter Real tau[2] = {0.1, 0.2};
+    Real y[2];
+  equation
+    for i in 1:2 loop
+      y[i] = delay(time, tau[i]);
+    end for;
+  end First;
+  model Second
+    parameter Real tau[2] = {0.1, 0.2};
+    Integer i = 1;
+    Real y;
+  equation
+    y = delay(time, tau[i]);
+  end Second;
+end Test;
+"#,
+        1,
+    );
+}
+
+#[test]
+fn delay_parameter_for_statement_later_range_sees_earlier_iterator() {
+    resolve_test_source(
+        r#"
+model Test
+  parameter Real tau[2] = {0.1, 0.2};
+  Real y;
+algorithm
+  for i in 1:2, j in {integer(delay(time, tau[i]))} loop
+    y := j;
+  end for;
+end Test;
+"#,
+    )
+    .expect("later algorithm range must see the preceding parameter iterator");
+}
+
+#[test]
+fn delay_parameter_for_equation_later_range_sees_earlier_iterator() {
+    resolve_test_source(
+        r#"
+model Test
+  parameter Real tau[2] = {0.1, 0.2};
+  Real y[2];
+equation
+  for i in 1:2, j in {integer(delay(1.0, tau[i]))} loop
+    y[i] = j;
+  end for;
+end Test;
+"#,
+    )
+    .expect("later equation range must see the preceding parameter iterator");
+}
+
+#[test]
+fn delay_parameter_later_range_sees_outer_same_name_before_binding() {
+    resolve_test_source(
+        r#"
+model Test
+  parameter Real tau[2] = {0.1, 0.2};
+  Real y;
+algorithm
+  for i in 1:2 loop
+    for j in 1:2, i in {integer(delay(time, tau[i] + tau[j]))} loop
+      y := j;
+    end for;
+  end for;
+end Test;
+"#,
+    )
+    .expect("new i range must see outer i and preceding j before shadowing i");
+}
+
+#[test]
+fn delay_parameter_iterator_is_not_bound_in_its_own_range() {
+    assert_delay_parameter_error_count(
+        r#"
+model Test
+  parameter Real tau[2] = {0.1, 0.2};
+  Integer i = 1;
+  Real y;
+algorithm
+  for j in 1:2, i in {integer(delay(time, tau[i]))} loop
+    y := j;
+  end for;
+end Test;
+"#,
+        1,
+    );
+}
