@@ -13,6 +13,13 @@ fn delay_accepts_parameter_arrays_indexed_by_fixed_loops() {
          y[i] = delay(time, tau[j]); end for; end for;",
         "equation for i in 1:2, j in 1:i loop \
          y[i] = delay(time, tau[j]); end for;",
+        "equation for i in 1:2, j in {integer(delay(1.0, tau[i]))} loop \
+         y[i] = j; end for;",
+        "algorithm for i in 1:2, j in {integer(delay(time, tau[i]))} loop \
+         y[i] := j; end for;",
+        "algorithm for i in 1:2 loop \
+         for j in 1:2, i in {integer(delay(time, tau[i] + tau[j]))} loop \
+         y[j] := i; end for; end for;",
     ] {
         let source =
             format!("model M parameter Real tau[2] = {{0.1, 0.2}}; Real y[2]; {body} end M;");
@@ -33,6 +40,8 @@ fn delay_rejects_nonparameter_indices_and_arrays() {
          y = delay(time, tau[i]); end for; end for; y = delay(time, tau[i]);",
         "algorithm for i in 1:2 loop for i in 1:k loop \
          y := delay(time, tau[i]); end for; end for;",
+        "algorithm for j in 1:2, i in {integer(delay(time, tau[i]))} loop \
+         y := j; end for;",
     ] {
         let source = format!(
             "model M parameter Real tau[2] = {{0.1, 0.2}}; \
