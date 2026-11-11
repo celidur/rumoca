@@ -784,3 +784,100 @@ fn function_index_parameter_preserves_call_site_specialization() {
         ));
     });
 }
+
+#[test]
+fn integer_matrix_products_and_scalar_broadcasts_select_exact_index_slices() {
+    let mut sources = SourceMap::new();
+    let source_text = "{1,1} * {{1,2},{3,4}}; x[{4,6}]";
+    let source = sources.add("integer_matrix_index.mo", source_text);
+    let at = provenance(source, 0, source_text.len());
+    let mut indexed_ids = [0_u32; 3];
+    let model = dae::Dae::construct(sources, |model| {
+        let target_type = model.types(|types| {
+            types.intern(
+                TypeId::new(0),
+                dae::ValueType::array(dae::ScalarType::Real, [6]),
+                at,
+            )
+        })?;
+        let target = model.variables(|variables| {
+            variables.algebraic(
+                VarName::new("x"),
+                target_type,
+                at,
+                dae::VariableAttributes::default(),
+            )
+        })?;
+        let (matrix_index, scaled_index, elementwise_index) = model.expressions(|expressions| {
+            let one = expressions.at(at).literal(dae::DaeLiteral::Integer(1))?;
+            let two = expressions.at(at).literal(dae::DaeLiteral::Integer(2))?;
+            let three = expressions.at(at).literal(dae::DaeLiteral::Integer(3))?;
+            let four = expressions.at(at).literal(dae::DaeLiteral::Integer(4))?;
+            let row_vector = expressions.at(at).array([one, one])?;
+            let row_one = expressions.at(at).array([one, two])?;
+            let row_two = expressions.at(at).array([three, four])?;
+            let matrix = expressions.at(at).array([row_one, row_two])?;
+            let matrix_product =
+                expressions
+                    .at(at)
+                    .binary(dae::BinaryOperator::Multiply, row_vector, matrix)?;
+
+            let vector = expressions.at(at).array([one, two])?;
+            let scaled = expressions
+                .at(at)
+                .binary(dae::BinaryOperator::Multiply, two, vector)?;
+            let elementwise =
+                expressions
+                    .at(at)
+                    .binary(dae::BinaryOperator::ElementwiseMultiply, two, vector)?;
+            let base = expressions
+                .at(at)
+                .coordinate(dae::CoordinateInput::Algebraic(target))?;
+            let matrix_index = expressions.at(at).index(
+                base,
+                [dae::Subscript::Value {
+                    expression: matrix_product,
+                    provenance: at,
+                }],
+            )?;
+            let scaled_index = expressions.at(at).index(
+                base,
+                [dae::Subscript::Value {
+                    expression: scaled,
+                    provenance: at,
+                }],
+            )?;
+            let elementwise_index = expressions.at(at).index(
+                base,
+                [dae::Subscript::Value {
+                    expression: elementwise,
+                    provenance: at,
+                }],
+            )?;
+            Ok((matrix_index, scaled_index, elementwise_index))
+        })?;
+        indexed_ids = [
+            matrix_index.index(),
+            scaled_index.index(),
+            elementwise_index.index(),
+        ];
+        Ok(())
+    })
+    .unwrap();
+
+    model.inspect(|view| {
+        for (expression_id, expected) in [
+            (indexed_ids[0], [3, 5]),
+            (indexed_ids[1], [1, 3]),
+            (indexed_ids[2], [1, 3]),
+        ] {
+            let indexed = view.expression_id(expression_id as usize).unwrap();
+            for (scalar, expected_flat) in expected.into_iter().enumerate() {
+                let mut visited = Vec::new();
+                let record = |_, base_scalar| visited.push(base_scalar);
+                for_each_scalar_coordinate(view, indexed, scalar, None, record).unwrap();
+                assert_eq!(visited, [expected_flat]);
+            }
+        }
+    });
+}

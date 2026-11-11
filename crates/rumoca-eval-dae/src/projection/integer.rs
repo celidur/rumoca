@@ -83,9 +83,7 @@ impl<'dae> Projection<'_, 'dae> {
                 }
             }
             dae::ExpressionOperation::Binary { operator, lhs, rhs } => {
-                let lhs = self.integer(lhs, scalar_index)?;
-                let rhs = self.integer(rhs, scalar_index)?;
-                integer_binary(operator, lhs, rhs, span)
+                self.integer_binary_expression(operator, lhs, rhs, scalar_index, span)
             }
             dae::ExpressionOperation::Call {
                 function,
@@ -117,6 +115,53 @@ impl<'dae> Projection<'_, 'dae> {
             }
             _ => Err(ProjectionError::DynamicSubscript { span }),
         }
+    }
+
+    /// MLS §10.6: `*` with two array operands is a matrix or scalar product
+    /// whose result entries sum several operand products; rank-zero operands
+    /// broadcast. Neither form reads both operands at the result ordinal.
+    fn integer_binary_expression(
+        &mut self,
+        operator: dae::BinaryOperator,
+        lhs: dae::ExprId<'dae>,
+        rhs: dae::ExprId<'dae>,
+        scalar_index: usize,
+        span: Span,
+    ) -> Result<i64, ProjectionError> {
+        let lhs_dimensions = self.node(lhs).value_type().dimensions().to_vec();
+        let rhs_dimensions = self.node(rhs).value_type().dimensions().to_vec();
+        if operator == dae::BinaryOperator::Power && !lhs_dimensions.is_empty() {
+            // Matrix power couples result entries; it is not element-wise.
+            return Err(ProjectionError::DynamicSubscript { span });
+        }
+        if operator == dae::BinaryOperator::Multiply
+            && !lhs_dimensions.is_empty()
+            && !rhs_dimensions.is_empty()
+        {
+            let mut sum = 0i64;
+            for (lhs_scalar, rhs_scalar) in
+                multiplication_scalar_pairs(&lhs_dimensions, &rhs_dimensions, scalar_index)
+            {
+                let product = self
+                    .integer(lhs, lhs_scalar)?
+                    .checked_mul(self.integer(rhs, rhs_scalar)?)
+                    .ok_or(ProjectionError::IntegerOverflow { span })?;
+                sum = sum
+                    .checked_add(product)
+                    .ok_or(ProjectionError::IntegerOverflow { span })?;
+            }
+            return Ok(sum);
+        }
+        let operand_scalar = |dimensions: &[u32]| {
+            if dimensions.is_empty() {
+                0
+            } else {
+                scalar_index
+            }
+        };
+        let lhs = self.integer(lhs, operand_scalar(&lhs_dimensions))?;
+        let rhs = self.integer(rhs, operand_scalar(&rhs_dimensions))?;
+        integer_binary(operator, lhs, rhs, span)
     }
 
     pub(super) fn integer_parameter(
