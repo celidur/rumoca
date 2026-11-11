@@ -5171,7 +5171,7 @@ pub struct Stream {
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct String {
-    pub string: crate::ParserToken, /* "([^"\\]|\\['"?\\abfnrtv])*" */
+    pub string: crate::ParserToken, /* "([^"\\]|\\[^\r\n])*" */
 }
 
 ///
@@ -7013,7 +7013,7 @@ impl<'t, 'u> ModelicaGrammarAuto<'t, 'u> {
 
     /// Semantic action for production 61:
     ///
-    /// `string: /"([^"\\]|\\['"?\\abfnrtv])*"/;`
+    /// `string: /"([^"\\]|\\[^\r\n])*"/;`
     ///
     #[parol_runtime::function_name::named]
     fn string(&mut self, string: &ParseTreeType<'t>) -> Result<()> {

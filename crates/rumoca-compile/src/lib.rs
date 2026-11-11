@@ -76,7 +76,8 @@ pub mod source_roots {
     pub use crate::source_root_cache::{
         ParsedSourceRoot, SourceRootCacheStatus, SourceRootCacheTiming,
         parse_source_root_with_cache, parse_source_root_with_cache_in,
-        resolve_source_root_cache_dir, set_cache_root_override,
+        parse_source_root_with_string_escape_policy, resolve_source_root_cache_dir,
+        set_cache_root_override,
     };
     pub use crate::source_root_discovery::{
         SourceRootDuplicateSkip, SourceRootLoadPlan, canonical_path_key,
@@ -96,6 +97,7 @@ pub mod parsing {
         ClassDef, ComponentReference, Expression, StoredDefinition, TerminalType,
         walk_component_reference_default,
     };
+    pub use rumoca_phase_parse::{StringEscapePolicy, StringEscapeWarning};
 
     pub use crate::merge::{
         collect_class_type_counts, collect_model_declarations, collect_model_names,

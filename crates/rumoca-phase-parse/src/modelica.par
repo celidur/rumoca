@@ -288,7 +288,7 @@ ident
 //    | "\a" | "\b" | "\f" | "\n" | "\r" | "\t" | "\v"
 // ✅ STRING = """ { S-CHAR | S-ESCAPE } """ ;
 string
-    : /"([^"\\]|\\['"?\\abfnrtv])*"/
+    : /"([^"\\]|\\[^\r\n])*"/
     ;
 
 // S-CHAR is any member of the Unicode character set

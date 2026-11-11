@@ -45,6 +45,30 @@ pub use expressions::{
 };
 pub use sections::{AlgorithmSection, EquationSection};
 
+/// Policy for string escapes outside the Modelica standard escape set.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum StringEscapePolicy {
+    /// Reject unknown escapes, matching the Modelica language specification.
+    #[default]
+    Strict,
+    /// Preserve unknown backslash-character pairs and report them as warnings,
+    /// matching OpenModelica's compatibility behavior.
+    OpenModelica,
+}
+
+/// One unknown string escape accepted under [`StringEscapePolicy::OpenModelica`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StringEscapeWarning {
+    /// Name supplied to the parser for the source file.
+    pub file_name: String,
+    /// UTF-8 byte offset of the backslash, inclusive.
+    pub byte_start: usize,
+    /// UTF-8 byte offset after the escaped character, exclusive.
+    pub byte_end: usize,
+    /// The raw backslash-character pair from the source.
+    pub escape: String,
+}
+
 /// A parsed comment with its location information
 #[derive(Debug, Clone, Default)]
 pub struct ParsedComment {
@@ -262,12 +286,61 @@ pub struct ModelicaGrammar<'t> {
     pub modelica: Option<rumoca_ir_ast::StoredDefinition>,
     /// Comments collected during parsing, in order of appearance
     pub comments: Vec<ParsedComment>,
+    file_name: String,
+    string_escape_policy: StringEscapePolicy,
+    string_escape_warnings: Vec<StringEscapeWarning>,
     _phantom: std::marker::PhantomData<&'t str>,
 }
 
-impl ModelicaGrammar<'_> {
+impl<'t> ModelicaGrammar<'t> {
+    /// Construct a strict parser grammar, preserving the original public
+    /// constructor used by direct generated-parser clients.
     pub fn new() -> Self {
-        ModelicaGrammar::default()
+        Self::new_with_string_escape_policy("", StringEscapePolicy::Strict)
+    }
+
+    /// Construct a grammar with a per-parse unknown-escape policy.
+    pub fn new_with_string_escape_policy(
+        file_name: &str,
+        string_escape_policy: StringEscapePolicy,
+    ) -> Self {
+        Self {
+            modelica: None,
+            comments: Vec::new(),
+            file_name: file_name.to_owned(),
+            string_escape_policy,
+            string_escape_warnings: Vec::new(),
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    fn inspect_string_escapes(&mut self, string: &ParserToken) -> parol_runtime::Result<()> {
+        let token = &string.0;
+        let token_start = token.location.start as usize;
+        for (relative_start, relative_end, escape) in unknown_string_escapes(&token.text) {
+            let byte_start = token_start + relative_start;
+            let byte_end = token_start + relative_end;
+            match self.string_escape_policy {
+                StringEscapePolicy::Strict => {
+                    let semantic_error = errors::ParseSemanticError {
+                        message: format!("invalid Modelica string escape `{escape}`"),
+                        span: Span::from_offsets(token.location.source, byte_start, byte_end),
+                    };
+                    return Err(parol_runtime::ParolError::UserError(anyhow::Error::new(
+                        semantic_error,
+                    )));
+                }
+                StringEscapePolicy::OpenModelica => {
+                    self.string_escape_warnings.push(StringEscapeWarning {
+                        file_name: self.file_name.clone(),
+                        byte_start,
+                        byte_end,
+                        escape,
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -289,6 +362,11 @@ impl Display for ModelicaGrammar<'_> {
 impl<'t> modelica_grammar_trait::ModelicaGrammarTrait for ModelicaGrammar<'t> {
     fn stored_definition(&mut self, arg: &modelica_grammar_trait::StoredDefinition) -> Result<()> {
         self.modelica = Some(arg.try_into()?);
+        Ok(())
+    }
+
+    fn string(&mut self, arg: &modelica_grammar_trait::String) -> Result<()> {
+        self.inspect_string_escapes(&arg.string)?;
         Ok(())
     }
 
@@ -339,6 +417,18 @@ pub fn parse_to_ast_with_errors(
     parse_to_syntax(source, file_name).into_parsed_result()
 }
 
+/// Parse a Modelica source string under an explicit unknown-string-escape
+/// policy. The AST contains decoded standard escapes and, in OpenModelica mode,
+/// preserves unknown backslash-character pairs. Warning offsets address the
+/// original UTF-8 source bytes; the source itself is never rewritten.
+pub fn parse_to_ast_with_string_escape_policy(
+    source: &str,
+    file_name: &str,
+    policy: StringEscapePolicy,
+) -> std::result::Result<(ast::StoredDefinition, Vec<StringEscapeWarning>), Vec<ParseError>> {
+    parse_once_to_ast_with_string_escape_policy(source, file_name, policy)
+}
+
 /// Parse a Modelica source string into a recoverable syntax artifact.
 ///
 /// Architecture note, following rust-analyzer's syntax-layer rule: parsing at
@@ -387,8 +477,17 @@ fn parse_once_to_ast(
     source: &str,
     file_name: &str,
 ) -> std::result::Result<ast::StoredDefinition, Vec<ParseError>> {
+    parse_once_to_ast_with_string_escape_policy(source, file_name, StringEscapePolicy::Strict)
+        .map(|(parsed, _)| parsed)
+}
+
+fn parse_once_to_ast_with_string_escape_policy(
+    source: &str,
+    file_name: &str,
+    policy: StringEscapePolicy,
+) -> std::result::Result<(ast::StoredDefinition, Vec<StringEscapeWarning>), Vec<ParseError>> {
     let parse_source = ParserSourceContext::new(file_name);
-    let mut grammar = ModelicaGrammar::new();
+    let mut grammar = ModelicaGrammar::new_with_string_escape_policy(file_name, policy);
     let parse_result = generated::modelica_parser::parse(source, file_name, &mut grammar);
     if let Err(parol_err) = parse_result {
         return Err(errors::convert_parol_error(
@@ -398,11 +497,41 @@ fn parse_once_to_ast(
         ));
     }
     match grammar.modelica {
-        Some(ast) => Ok(ast),
+        Some(ast) => Ok((ast, grammar.string_escape_warnings)),
         None => Err(vec![ParseError::NoAstProduced {
             span: errors::default_parse_span(parse_source.source_id),
         }]),
     }
+}
+
+fn unknown_string_escapes(raw: &str) -> Vec<(usize, usize, String)> {
+    let content_start = usize::from(raw.starts_with('"'));
+    let content_end = raw.len().saturating_sub(usize::from(raw.ends_with('"')));
+    let contents = raw.get(content_start..content_end).unwrap_or_default();
+    let mut unknown = Vec::new();
+    let mut chars = contents.char_indices().peekable();
+    while let Some((start, ch)) = chars.next() {
+        if ch != '\\' {
+            continue;
+        }
+        let Some((escaped_start, escaped)) = chars.next() else {
+            break;
+        };
+        if is_standard_string_escape(escaped) {
+            continue;
+        }
+        let end = content_start + escaped_start + escaped.len_utf8();
+        let start = content_start + start;
+        unknown.push((start, end, raw[start..end].to_owned()));
+    }
+    unknown
+}
+
+fn is_standard_string_escape(ch: char) -> bool {
+    matches!(
+        ch,
+        '\'' | '"' | '?' | '\\' | 'a' | 'b' | 'f' | 'n' | 'r' | 't' | 'v'
+    )
 }
 
 fn collect_recovered_parse_errors(
@@ -898,6 +1027,121 @@ end Test;"#;
             s.binding.as_ref().expect("binding").to_string(),
             r#""line\nquote\"slash\\""#
         );
+    }
+
+    #[test]
+    fn unknown_string_escapes_are_strict_by_default_and_omc_compatible_on_request() {
+        let source = r#"model EscapePolicyProbe "doc \d Ω"
+  parameter String s = "value\dΩ";
+  parameter String unicode = "value\Ω";
+  parameter String known = "line\nquote\"slash\\";
+  parameter String slashD = "literal\\d";
+  parameter String multiline = "first
+second";
+  // Unknown escapes in comments are not string escapes: \q
+end EscapePolicyProbe;"#;
+
+        let strict_errors = parse_to_ast_with_string_escape_policy(
+            source,
+            "escape_policy.mo",
+            StringEscapePolicy::Strict,
+        )
+        .expect_err("strict parsing rejects unknown escapes");
+        let escape_offsets = [
+            source.find(r#"\d"#).unwrap(),
+            source.find(r#"value\dΩ"#).unwrap() + "value".len(),
+        ];
+        let span = strict_errors[0].span();
+        assert_eq!(
+            (span.start.0, span.end.0),
+            (escape_offsets[0], escape_offsets[0] + 2)
+        );
+        assert!(parse_to_ast(source, "escape_policy.mo").is_err());
+
+        let mut direct_grammar = ModelicaGrammar::new();
+        assert!(
+            generated::modelica_parser::parse(source, "escape_policy.mo", &mut direct_grammar)
+                .is_err()
+        );
+
+        let (parsed, warnings) = parse_to_ast_with_string_escape_policy(
+            source,
+            "escape_policy.mo",
+            StringEscapePolicy::OpenModelica,
+        )
+        .expect("OpenModelica policy accepts unknown escapes");
+        assert_eq!(warnings.len(), 3);
+        for (warning, start) in warnings.iter().zip(escape_offsets) {
+            assert_eq!(warning.file_name, "escape_policy.mo");
+            assert_eq!((warning.byte_start, warning.byte_end), (start, start + 2));
+            assert_eq!(warning.escape, r#"\d"#);
+        }
+        let unicode_escape = source.find(r#"\Ω"#).unwrap();
+        assert_eq!(warnings[2].byte_start, unicode_escape);
+        assert_eq!(warnings[2].byte_end, unicode_escape + "\\Ω".len());
+        assert_eq!(warnings[2].escape, "\\Ω");
+
+        let model = parsed
+            .classes
+            .get("EscapePolicyProbe")
+            .expect("class should parse");
+        assert_eq!(model.description[0].text.as_ref(), "doc \\d Ω");
+        let ast::Expression::Terminal {
+            terminal_type: ast::TerminalType::String,
+            token,
+            ..
+        } = model.components["s"]
+            .binding
+            .as_ref()
+            .expect("string binding should parse")
+        else {
+            panic!("expected a string terminal");
+        };
+        assert_eq!(token.text.as_ref(), "value\\dΩ");
+
+        let ast::Expression::Terminal { token, .. } = model.components["known"]
+            .binding
+            .as_ref()
+            .expect("known string binding should parse")
+        else {
+            panic!("expected a string terminal");
+        };
+        assert_eq!(token.text.as_ref(), "line\nquote\"slash\\");
+
+        let ast::Expression::Terminal { token, .. } = model.components["slashD"]
+            .binding
+            .as_ref()
+            .expect("escaped slash binding should parse")
+        else {
+            panic!("expected a string terminal");
+        };
+        assert_eq!(token.text.as_ref(), "literal\\d");
+
+        let ast::Expression::Terminal { token, .. } = model.components["multiline"]
+            .binding
+            .as_ref()
+            .expect("multiline string binding should parse")
+        else {
+            panic!("expected a string terminal");
+        };
+        assert_eq!(token.text.as_ref(), "first\nsecond");
+    }
+
+    #[test]
+    fn reused_strict_grammar_never_accepts_unknown_escapes() {
+        let source = r#"model Invalid parameter String s="\d"; end Invalid;"#;
+        let mut grammar = ModelicaGrammar::new();
+        for _ in 0..2 {
+            assert!(generated::modelica_parser::parse(source, "invalid.mo", &mut grammar).is_err());
+        }
+    }
+
+    #[test]
+    fn string_escape_policy_does_not_accept_unterminated_literals() {
+        let source = "model Broken\n  parameter String s = \"unterminated\\\nend Broken;";
+        for policy in [StringEscapePolicy::Strict, StringEscapePolicy::OpenModelica] {
+            assert!(parse_to_ast_with_string_escape_policy(source, "broken.mo", policy).is_err());
+        }
     }
 
     #[test]
