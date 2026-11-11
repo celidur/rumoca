@@ -316,9 +316,9 @@ mod tests {
                 "{{ arms|length }}\
                  {% for arm in arms %}|{{ arm|list|join(',') }}\
                  {% for part in arm %}|{{ arm[part]|list|join(',') }}:{{ arm[part].register_count }}\
-                 {% for op in arm[part].ops %};{{ op|list|length > 0 }}{% endfor %}\
+                 {% for op in arm[part].ops %};{{ 'true' if op|list|length > 0 else 'false' }}{% endfor %}\
                  {% endfor %}{% endfor %}|{{ fallback.ops|length }}\
-                 |{{ arms[0].result.ops[1].output_index }}|{{ arms[5] is undefined }}"
+                 |{{ arms[0].result.ops[1].output_index }}|{{ 'true' if arms[5] is undefined else 'false' }}"
             ),
             "1|condition,result|ops,register_count:3;true;true;true;true\
              |ops,register_count:1;true;true|2|0|true"

@@ -168,7 +168,7 @@ fn a_state_start_assignment_renders_as_a_calculated_state() {
     let renderer = SolveTemplateRenderer::new_owned_with_fmi(view)
         .expect("a state start assignment is admitted by the C profile");
     let rendered = renderer
-        .render("{{ fmi.variables[0].initial }}|{{ fmi.variables[0].start is defined }}")
+        .render("{{ fmi.variables[0].initial }}|{{ 'true' if fmi.variables[0].start is defined else 'false' }}")
         .expect("the narrowed view renders");
     assert_eq!(rendered, "calculated|false");
 }
@@ -327,7 +327,7 @@ fn the_fmi_render_context_exposes_no_dae() {
 
     assert_eq!(
         renderer
-            .render("{{ dae is undefined }}|{{ fmi.variables | length }}")
+            .render("{{ 'true' if dae is undefined else 'false' }}|{{ fmi.variables | length }}")
             .expect("the probe template renders"),
         "true|1"
     );
