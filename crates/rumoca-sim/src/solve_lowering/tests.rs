@@ -20,6 +20,7 @@ mod coincident_strict;
 mod compiled_messages;
 #[cfg(all(feature = "solver-diffsol", feature = "solver-rk45"))]
 mod continuous_input_writes;
+mod delay_families;
 #[cfg(feature = "fmi")]
 mod fmi_export_defaults;
 mod function_loop_exits;
