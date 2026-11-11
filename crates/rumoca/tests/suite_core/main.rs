@@ -196,6 +196,7 @@ mod function_matrix_construction;
 mod function_nested_fold_captures;
 mod function_nested_record_assembly;
 mod function_noelse_if_test;
+mod function_output_dimensions_from_arguments;
 mod function_output_shadow_state_test;
 mod function_parameter_slicing;
 mod function_path_partial_definitions;

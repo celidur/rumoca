@@ -1,6 +1,7 @@
 use super::*;
 
 mod dimension_preparation;
+mod function_dimensions;
 
 fn test_span() -> rumoca_core::Span {
     rumoca_core::Span::from_offsets(
