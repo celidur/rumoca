@@ -28,7 +28,15 @@ impl Session {
         cached: CachedCompileResult,
     ) -> PhaseResult {
         match cached {
-            CachedCompileResult::Full(result) => result,
+            CachedCompileResult::Full(result) => {
+                // A cached result can outlive the session revision that
+                // cleared the policy warnings; the DAE query restores them
+                // from the phase artifacts.
+                if self.compile_policies.records_warnings() {
+                    let _ = self.compile_phase_result_query(tree, mode, model_name);
+                }
+                result
+            }
             CachedCompileResult::Success => self.compile_phase_result_query(tree, mode, model_name),
         }
     }

@@ -53,6 +53,162 @@ fn test_typecheck_instanced_checks_compound_equation_types_and_builtin_arguments
 }
 
 #[test]
+fn unit_metadata_warn_policy_preserves_et010_and_keeps_legacy_strict() {
+    let source = r#"
+        model Test
+            Real x(unit = "kV RMSLL");
+        end Test;
+    "#;
+    let parsed = parse(source);
+    let resolved = resolve(parsed).expect("resolve should succeed");
+    let tree = resolved.into_inner();
+    let model = tree
+        .get_class_by_qualified_name("Test")
+        .expect("Test class");
+    let mut strict_overlay = InstanceOverlay::new();
+    add_instanced_component(
+        &mut strict_overlay,
+        "Test.x",
+        model.components.get("x").expect("x component"),
+        true,
+    );
+    let strict = typecheck_instanced(&tree, &mut strict_overlay, "Test")
+        .expect_err("legacy entry point must remain strict");
+    assert!(strict.iter().any(|d| d.code.as_deref() == Some("ET010")));
+
+    let mut warn_overlay = InstanceOverlay::new();
+    add_instanced_component(
+        &mut warn_overlay,
+        "Test.x",
+        model.components.get("x").expect("x component"),
+        true,
+    );
+    let diagnostics = typecheck_instanced_with_unit_metadata_policy(
+        &tree,
+        &mut warn_overlay,
+        "Test",
+        UnitMetadataPolicy::Warn,
+    )
+    .expect("invalid unit metadata must not fail Warn policy");
+    let warning = diagnostics
+        .iter()
+        .find(|d| d.code.as_deref() == Some("ET010"))
+        .expect("ET010 warning should be retained");
+    assert_eq!(warning.severity, rumoca_core::DiagnosticSeverity::Warning);
+    assert!(
+        !warning.labels.is_empty(),
+        "source labels should be preserved"
+    );
+    let unit_expr = model
+        .components
+        .get("x")
+        .and_then(|component| component.modifications.get("unit"))
+        .expect("source unit modifier should remain in AST");
+    let Expression::Terminal { token, .. } = unit_expr else {
+        panic!("unit metadata should remain a string terminal");
+    };
+    assert_eq!(token.text.as_ref(), "kV RMSLL");
+}
+
+#[test]
+fn unit_metadata_warn_policy_does_not_suppress_other_modifier_errors() {
+    let source = r#"
+        model Test
+            Real x(unit = "kV RMSLL", quantity = 1, fixed = 1);
+        end Test;
+    "#;
+    let parsed = parse(source);
+    let resolved = resolve(parsed).expect("resolve should succeed");
+    let tree = resolved.into_inner();
+    let model = tree
+        .get_class_by_qualified_name("Test")
+        .expect("Test class");
+    let mut overlay = InstanceOverlay::new();
+    add_instanced_component(
+        &mut overlay,
+        "Test.x",
+        model.components.get("x").expect("x component"),
+        true,
+    );
+    let diagnostics = typecheck_instanced_with_unit_metadata_policy(
+        &tree,
+        &mut overlay,
+        "Test",
+        UnitMetadataPolicy::Warn,
+    )
+    .expect_err("Boolean modifier mismatch remains an error");
+    assert!(diagnostics.iter().any(|d| {
+        d.code.as_deref() == Some("ET010") && d.severity == rumoca_core::DiagnosticSeverity::Warning
+    }));
+    assert!(diagnostics.iter().any(|d| {
+        d.code.as_deref() == Some("ET002") && d.severity == rumoca_core::DiagnosticSeverity::Error
+    }));
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| { d.code.as_deref() == Some("ET002") && d.message.contains("fixed") })
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| { d.code.as_deref() == Some("ET002") && d.message.contains("quantity") })
+    );
+}
+
+#[test]
+fn valid_unit_metadata_has_same_typecheck_result_under_both_policies() {
+    let source = r#"
+        model Test
+            Real x(unit = "V", quantity = "Voltage", start = 2);
+        equation
+            x = 2;
+        end Test;
+    "#;
+    let resolved = resolve(parse(source)).expect("resolve should succeed");
+    let tree = resolved.into_inner();
+    let model = tree
+        .get_class_by_qualified_name("Test")
+        .expect("Test class");
+
+    let mut strict_overlay = InstanceOverlay::new();
+    add_instanced_component(
+        &mut strict_overlay,
+        "Test.x",
+        model.components.get("x").expect("x component"),
+        true,
+    );
+    let strict = typecheck_instanced_with_unit_metadata_policy(
+        &tree,
+        &mut strict_overlay,
+        "Test",
+        UnitMetadataPolicy::Strict,
+    )
+    .expect("valid metadata should pass strict policy");
+
+    let mut warn_overlay = InstanceOverlay::new();
+    add_instanced_component(
+        &mut warn_overlay,
+        "Test.x",
+        model.components.get("x").expect("x component"),
+        true,
+    );
+    let warn = typecheck_instanced_with_unit_metadata_policy(
+        &tree,
+        &mut warn_overlay,
+        "Test",
+        UnitMetadataPolicy::Warn,
+    )
+    .expect("valid metadata should pass Warn policy");
+    assert!(strict.is_empty());
+    assert!(warn.is_empty());
+    assert_eq!(
+        strict_overlay.components.len(),
+        warn_overlay.components.len()
+    );
+    assert_eq!(strict_overlay.classes.len(), warn_overlay.classes.len());
+}
+
+#[test]
 fn test_typecheck_instanced_checks_algorithms_and_bindings() {
     let source = r#"
         model Test

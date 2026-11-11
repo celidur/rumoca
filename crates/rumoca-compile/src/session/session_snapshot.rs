@@ -84,6 +84,8 @@ impl Session {
         Session {
             instantiation_options: self.instantiation_options.clone(),
             dae_options: self.dae_options,
+            compile_policies: self.compile_policies,
+            unit_metadata_warnings_by_model: self.unit_metadata_warnings_by_model.clone(),
             structural_override_sources: self.structural_override_sources.clone(),
             documents,
             detached_document_uris,
@@ -282,6 +284,8 @@ impl Session {
         let snapshot = Session {
             instantiation_options: self.instantiation_options.clone(),
             dae_options: self.dae_options,
+            compile_policies: self.compile_policies,
+            unit_metadata_warnings_by_model: self.unit_metadata_warnings_by_model.clone(),
             structural_override_sources: self.structural_override_sources.clone(),
             documents: self.documents.clone(),
             detached_document_uris: self.detached_document_uris.clone(),
@@ -372,6 +376,8 @@ impl Session {
         let snapshot = Session {
             instantiation_options: self.instantiation_options.clone(),
             dae_options: self.dae_options,
+            compile_policies: self.compile_policies,
+            unit_metadata_warnings_by_model: self.unit_metadata_warnings_by_model.clone(),
             structural_override_sources: self.structural_override_sources.clone(),
             documents: detached_documents,
             detached_document_uris: self.detached_document_uris.clone(),
@@ -441,6 +447,8 @@ impl Session {
         let snapshot = Session {
             instantiation_options: self.instantiation_options.clone(),
             dae_options: self.dae_options,
+            compile_policies: self.compile_policies,
+            unit_metadata_warnings_by_model: self.unit_metadata_warnings_by_model.clone(),
             structural_override_sources: self.structural_override_sources.clone(),
             documents,
             detached_document_uris: self.detached_document_uris.clone(),

@@ -323,7 +323,8 @@ impl TypeChecker {
     }
 
     /// MLS Chapter 19: a non-empty `unit`/`displayUnit` string literal must
-    /// match the unit-expression grammar.
+    /// match the unit-expression grammar. Under
+    /// [`crate::UnitMetadataPolicy::Warn`] a mismatch is reported as a warning.
     fn validate_unit_modifier_syntax(
         &mut self,
         comp_name: &str,
@@ -344,12 +345,17 @@ impl TypeChecker {
             else {
                 return;
             };
-            self.emit_typecheck_error(TypeCheckError::phase_diagnostic(
+            let mut diagnostic = TypeCheckError::phase_diagnostic(
                 "ET010",
                 format!("invalid {modifier_name} for `{comp_name}`: {error}"),
                 "unit string here",
                 span,
-            ));
+            )
+            .to_diagnostic();
+            if self.unit_metadata_policy == crate::UnitMetadataPolicy::Warn {
+                diagnostic.severity = rumoca_core::DiagnosticSeverity::Warning;
+            }
+            self.diagnostics.emit(diagnostic);
         }
     }
 

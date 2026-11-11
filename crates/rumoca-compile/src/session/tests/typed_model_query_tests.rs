@@ -1,5 +1,304 @@
 use super::*;
 
+/// Drop only the final compile result; DAE and flat artifacts stay cached.
+fn evict_compile_result(session: &mut Session, model: &str) {
+    session.query_state.dae.compile_results.shift_remove(model);
+}
+
+/// Drop only the cached flat artifact for `model`.
+fn evict_flat_model(session: &mut Session, model: &str) {
+    let flat_key = standard_flat_cache_key(session, model);
+    session
+        .query_state
+        .flat
+        .flat_models
+        .artifacts
+        .shift_remove(&flat_key);
+}
+
+#[test]
+fn unit_metadata_warnings_survive_typed_cache_hits_and_clear_on_invalidation() {
+    let mut session = Session::new(SessionConfig {
+        unit_metadata_policy: UnitMetadataPolicy::Warn,
+        ..SessionConfig::default()
+    });
+    session
+        .add_document(
+            "unit-warning.mo",
+            "model UnitWarning\n  Real x(unit = \"kV RMSLL\");\nequation\n  x = 1;\nend UnitWarning;\n",
+        )
+        .expect("source should parse");
+
+    let first = session
+        .compile_model_phases("UnitWarning")
+        .expect("compile should return phase result");
+    assert!(matches!(first, PhaseResult::Success(_)), "{first:?}");
+    assert_eq!(session.unit_metadata_warnings("UnitWarning").len(), 1);
+    assert_eq!(
+        session.unit_metadata_warnings("UnitWarning")[0]
+            .code
+            .as_deref(),
+        Some("ET010")
+    );
+
+    session
+        .add_document(
+            "unrelated.mo",
+            "model Unrelated\n  Real y;\nend Unrelated;\n",
+        )
+        .expect("unrelated source should parse");
+    assert!(
+        session
+            .update_document(
+                "unrelated.mo",
+                "model Unrelated\n  Real y;\n  Real z;\nend Unrelated;\n",
+            )
+            .is_none()
+    );
+    let cached_compile = session
+        .compile_model_phases("UnitWarning")
+        .expect("unchanged target compile should hit cache");
+    assert!(matches!(cached_compile, PhaseResult::Success(_)));
+    assert_eq!(session.unit_metadata_warnings("UnitWarning").len(), 1);
+
+    // Evict only the final compile result. The cached DAE and flat artifacts
+    // remain, so this compile must restore warnings on the DAE-cache-hit path.
+    evict_compile_result(&mut session, "UnitWarning");
+    let dae_hit = session
+        .compile_model_phases("UnitWarning")
+        .expect("DAE-cache-hit compile should succeed");
+    assert!(matches!(dae_hit, PhaseResult::Success(_)));
+    assert_eq!(session.unit_metadata_warnings("UnitWarning").len(), 1);
+
+    // Evict the top-level and DAE artifacts only. Keep the flat artifact so
+    // the compile traverses the flat-cache-hit branch.
+    evict_compile_result(&mut session, "UnitWarning");
+    let dae_key = standard_dae_cache_key(&mut session, "UnitWarning");
+    session.query_state.dae.dae_models.shift_remove(&dae_key);
+    let flat_hit = session
+        .compile_model_phases("UnitWarning")
+        .expect("flat-cache-hit compile should succeed");
+    assert!(matches!(flat_hit, PhaseResult::Success(_)));
+    assert_eq!(session.unit_metadata_warnings("UnitWarning").len(), 1);
+
+    let uncached_dae =
+        session.compile_model_dae_strict_reachable_uncached_with_recovery_detailed("UnitWarning");
+    assert!(uncached_dae.is_ok(), "{uncached_dae:?}");
+    assert_eq!(session.unit_metadata_warnings("UnitWarning").len(), 1);
+
+    let uncached_report =
+        session.compile_model_strict_reachable_uncached_with_recovery("UnitWarning");
+    assert!(uncached_report.requested_succeeded());
+    assert_eq!(session.unit_metadata_warnings("UnitWarning").len(), 1);
+
+    // Clear only later phase caches so the next request exercises the typed
+    // model cache while preserving the same source fingerprint.
+    evict_compile_result(&mut session, "UnitWarning");
+    let dae_key = standard_dae_cache_key(&mut session, "UnitWarning");
+    session.query_state.dae.dae_models.shift_remove(&dae_key);
+    evict_flat_model(&mut session, "UnitWarning");
+    let warm = session
+        .compile_model_phases("UnitWarning")
+        .expect("cached typed model should compile");
+    assert!(matches!(warm, PhaseResult::Success(_)), "{warm:?}");
+    assert_eq!(session.unit_metadata_warnings("UnitWarning").len(), 1);
+
+    assert!(session
+        .update_document(
+            "unit-warning.mo",
+            "model UnitWarning\n  Real x(unit = \"V\");\nequation\n  x = 1;\nend UnitWarning;\n",
+        )
+        .is_none());
+    let rebuilt = session
+        .compile_model_phases("UnitWarning")
+        .expect("updated source should compile");
+    assert!(matches!(rebuilt, PhaseResult::Success(_)), "{rebuilt:?}");
+    assert!(
+        session.unit_metadata_warnings("UnitWarning").is_empty(),
+        "stale warning must not survive input invalidation"
+    );
+
+    // A later parse failure happens before typed-model query. The getter must
+    // still reflect the current failed compile, not retain the prior result.
+    assert!(
+        session
+            .update_document("unit-warning.mo", "model UnitWarning\n  Real x(\n")
+            .is_some()
+    );
+    assert!(session.compile_model_phases("UnitWarning").is_err());
+    assert!(session.unit_metadata_warnings("UnitWarning").is_empty());
+}
+
+#[test]
+fn session_exposes_unit_warnings_even_when_other_type_errors_fail_compile() {
+    let mut session = Session::new(SessionConfig {
+        unit_metadata_policy: UnitMetadataPolicy::Warn,
+        ..SessionConfig::default()
+    });
+    session
+        .add_document(
+            "unit-warning-error.mo",
+            "model UnitWarningError\n  Real x(unit = \"kV RMSLL\");\n  Boolean b;\nequation\n  x = b;\nend UnitWarningError;\n",
+        )
+        .expect("source should parse");
+    let result = session
+        .compile_model_phases("UnitWarningError")
+        .expect("compile should return phase diagnostics");
+    assert!(
+        matches!(
+            result,
+            PhaseResult::Failed {
+                phase: FailedPhase::Typecheck,
+                ..
+            }
+        ),
+        "{result:?}"
+    );
+    let warnings = session.unit_metadata_warnings("UnitWarningError");
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(warnings[0].code.as_deref(), Some("ET010"));
+}
+
+#[test]
+fn unit_metadata_warnings_survive_cached_typecheck_failures() {
+    let mut session = Session::new(SessionConfig {
+        unit_metadata_policy: UnitMetadataPolicy::Warn,
+        ..SessionConfig::default()
+    });
+    session
+        .add_document(
+            "unit-warning-error.mo",
+            "model UnitWarningError\n  Real x(unit = \"kV RMSLL\");\n  Boolean b;\nequation\n  x = b;\nend UnitWarningError;\n",
+        )
+        .expect("source should parse");
+    let first = session
+        .compile_model_phases("UnitWarningError")
+        .expect("compile should return phase diagnostics");
+    assert!(matches!(first, PhaseResult::Failed { .. }), "{first:?}");
+
+    session
+        .add_document("unrelated.mo", "model Unrelated end Unrelated;")
+        .expect("unrelated source should parse");
+    let cached = session
+        .compile_model_phases("UnitWarningError")
+        .expect("cached failure is a phase result");
+    assert!(matches!(cached, PhaseResult::Failed { .. }), "{cached:?}");
+    assert_eq!(session.unit_metadata_warnings("UnitWarningError").len(), 1);
+}
+
+#[test]
+fn parallel_compiles_apply_the_unit_metadata_policy() {
+    let mut session = Session::new(SessionConfig {
+        unit_metadata_policy: UnitMetadataPolicy::Warn,
+        ..SessionConfig::default()
+    });
+    session
+        .add_document(
+            "unit-warning-parallel.mo",
+            "model First\n  Real x(unit = \"kV RMSLL\");\nequation\n  x = 1;\nend First;\nmodel Second\n  Real y(unit = \"V\");\nequation\n  y = 1;\nend Second;\n",
+        )
+        .expect("source should parse");
+    let results = session
+        .compile_models_parallel(&["First", "Second"])
+        .expect("compile should return phase results");
+    for (name, result) in &results {
+        assert!(
+            matches!(result, PhaseResult::Success(_)),
+            "{name}: {result:?}"
+        );
+    }
+    assert_eq!(session.unit_metadata_warnings("First").len(), 1);
+    assert!(session.unit_metadata_warnings("Second").is_empty());
+    for name in ["First", "Second"] {
+        let entry = session
+            .query_state
+            .dae
+            .compile_results
+            .get(name)
+            .expect("compile result is cached");
+        assert!(
+            matches!(entry.result, CachedCompileResult::Success),
+            "query-backed compiles do not duplicate the DAE artifact"
+        );
+    }
+}
+
+/// Drop the cached typed artifact for `model`.
+fn evict_typed_model(session: &mut Session, model: &str) {
+    let typed_key = standard_typed_cache_key(session, model);
+    session
+        .query_state
+        .flat
+        .typed_models
+        .artifacts
+        .shift_remove(&typed_key);
+}
+
+fn has_typed_model(session: &mut Session, model: &str) -> bool {
+    let typed_key = standard_typed_cache_key(session, model);
+    session
+        .query_state
+        .flat
+        .typed_models
+        .artifacts
+        .contains_key(&typed_key)
+}
+
+fn has_dae_model(session: &mut Session, model: &str) -> bool {
+    let dae_key = standard_dae_cache_key(session, model);
+    session.query_state.dae.dae_models.contains_key(&dae_key)
+}
+
+#[test]
+fn strict_cache_hits_do_not_query_phase_artifacts_again() {
+    let mut session = Session::default();
+    session
+        .add_document(
+            "strict-cache.mo",
+            "model Good\n  Real x;\nequation\n  x = 1;\nend Good;\nmodel Bad\n  Real x;\n  Boolean b;\nequation\n  x = b;\nend Bad;\n",
+        )
+        .expect("source should parse");
+    let bad = session.compile_model_phases("Bad").expect("phase result");
+    assert!(matches!(bad, PhaseResult::Failed { .. }), "{bad:?}");
+    let good = session.compile_model_phases("Good").expect("phase result");
+    assert!(matches!(good, PhaseResult::Success(_)), "{good:?}");
+
+    // A cached failure is returned without querying its phase artifacts.
+    let dae_key = standard_dae_cache_key(&mut session, "Bad");
+    session.query_state.dae.dae_models.shift_remove(&dae_key);
+    evict_flat_model(&mut session, "Bad");
+    evict_typed_model(&mut session, "Bad");
+    let bad = session.compile_model_phases("Bad").expect("phase result");
+    assert!(matches!(bad, PhaseResult::Failed { .. }), "{bad:?}");
+    assert!(!has_dae_model(&mut session, "Bad"));
+    assert!(!has_typed_model(&mut session, "Bad"));
+
+    // A DAE artifact hit does not revisit the typed model.
+    evict_compile_result(&mut session, "Good");
+    evict_typed_model(&mut session, "Good");
+    let good = session.compile_model_phases("Good").expect("phase result");
+    assert!(matches!(good, PhaseResult::Success(_)), "{good:?}");
+    assert!(!has_typed_model(&mut session, "Good"));
+
+    // Parallel compiles of uncached models build no query artifacts.
+    evict_compile_result(&mut session, "Good");
+    evict_compile_result(&mut session, "Bad");
+    let dae_key = standard_dae_cache_key(&mut session, "Good");
+    session.query_state.dae.dae_models.shift_remove(&dae_key);
+    for (name, result) in session
+        .compile_models_parallel(&["Good", "Bad"])
+        .expect("phase results")
+    {
+        assert_eq!(
+            matches!(result, PhaseResult::Success(_)),
+            name == "Good",
+            "{name}: {result:?}"
+        );
+    }
+    assert!(!has_dae_model(&mut session, "Good"));
+    assert!(!has_dae_model(&mut session, "Bad"));
+}
+
 fn assert_typecheck_failure(result: PhaseResult, expected_code: &str) {
     match result {
         PhaseResult::Failed {

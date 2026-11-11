@@ -979,7 +979,7 @@ areas.
 
 | ID | Contract | MLS | Requirement |
 |----|----------|-----|-------------|
-| UNIT-001 | Syntax match | §19.1 | "Unit string shall match the unit-expression rule" |
+| UNIT-001 | Syntax match | §19.1 | "Unit string shall match the unit-expression rule". Rumoca: a non-empty `unit` or `displayUnit` that does not match is refused (ET010). The opt-in `UnitMetadataPolicy::Warn` (`SessionConfig::unit_metadata_policy`) reports ET010 as a warning and keeps the string as written. Tested in `rumoca-phase-typecheck` (`unit_metadata_warn_policy_preserves_et010_and_keeps_legacy_strict`) |
 | UNIT-002 | No whitespace | §19.1 | "Modelica unit string syntax allows neither comments nor white-space" |
 | UNIT-003 | No multiple divisors | §19.1 | "SI standard does not allow multiple units right of division-symbol (ambiguous)" |
 | UNIT-004 | No exponent spacing | §19.1 | "There must be no spacing between unit-operand and possible unit-exponent" |

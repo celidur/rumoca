@@ -21,7 +21,7 @@ use rumoca_phase_instantiate::{
     instantiate_model_with_outcome_options,
 };
 use rumoca_phase_resolve::{ResolvedTree, resolve_with_diagnostics};
-use rumoca_phase_typecheck::typecheck_instanced;
+use rumoca_phase_typecheck::{UnitMetadataPolicy, typecheck_instanced_with_unit_metadata_policy};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::mem;
@@ -111,7 +111,8 @@ pub use compile_phase_timing::{
 use compile_phase_timing::{maybe_record_compile_phase_timing, notify_compile_phase};
 mod compile_support;
 use compile_support::{
-    compile_model_dae_internal, compile_model_dae_internal_with_warnings, compile_model_internal,
+    CompilePolicies, PolicyWarnings, compile_model_dae_internal,
+    compile_model_dae_internal_with_warnings, compile_model_internal,
     compile_model_internal_with_options, compile_phase_result_from_dae,
     dae_model_outcome_from_flat, dae_phase_result_from_dae, diagnostics_from_vec,
     diagnostics_to_anyhow, finalize_strict_compile_report,
@@ -320,6 +321,7 @@ impl TypedModelCacheKey {
 struct TypedModelArtifact {
     fingerprint: Fingerprint,
     outcome: TypedModelOutcome,
+    unit_metadata_warnings: Vec<CommonDiagnostic>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1925,6 +1927,10 @@ impl CompilationSummary {
 pub struct Session {
     instantiation_options: InstantiateOptions,
     dae_options: rumoca_phase_dae::ToDaeOptions,
+    compile_policies: CompilePolicies,
+    /// Warnings from the most recent typed-model query for each model. The
+    /// typed cache also stores these per artifact so cache hits reproduce them.
+    unit_metadata_warnings_by_model: IndexMap<String, Vec<CommonDiagnostic>>,
     structural_override_sources: Vec<StructuralOverrideSource>,
     documents: IndexMap<String, Arc<Document>>,
     detached_document_uris: IndexSet<String>,

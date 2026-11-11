@@ -1,4 +1,5 @@
 use rumoca_phase_instantiate::{DEFAULT_INSTANTIATION_DEPTH_LIMIT, InstantiateOptions};
+use rumoca_phase_typecheck::UnitMetadataPolicy;
 use std::sync::Once;
 
 static RAYON_INIT: Once = Once::new();
@@ -15,6 +16,8 @@ pub struct SessionConfig {
     /// but differentiate the same ones (`rumoca compile
     /// --retain-parameter-guards`, `rumoca_phase_dae::ToDaeOptions`).
     pub retain_parameter_guards: bool,
+    /// Policy for invalid `unit` and `displayUnit` metadata strings.
+    pub unit_metadata_policy: UnitMetadataPolicy,
 }
 
 impl Default for SessionConfig {
@@ -23,6 +26,7 @@ impl Default for SessionConfig {
             parallel: false,
             instantiation_depth_limit: DEFAULT_INSTANTIATION_DEPTH_LIMIT,
             retain_parameter_guards: false,
+            unit_metadata_policy: UnitMetadataPolicy::Strict,
         }
     }
 }

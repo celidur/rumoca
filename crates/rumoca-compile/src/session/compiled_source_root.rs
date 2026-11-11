@@ -1,5 +1,7 @@
 use super::*;
-use crate::session::compile_support::finalize_strict_compile_report_from_uncached_targets;
+use crate::session::compile_support::{
+    CompilePolicies, finalize_strict_compile_report_from_uncached_targets,
+};
 
 /// Indexed source root for efficient multi-model compilation.
 ///
@@ -454,7 +456,9 @@ impl CompiledSourceRoot {
             &closure.compile_targets,
             InstantiateOptions::default(),
             rumoca_phase_dae::ToDaeOptions::default(),
+            CompilePolicies::default(),
         )
+        .0
     }
 
     /// Compile the requested model through DAE strictly against its reachable

@@ -82,6 +82,26 @@ pub(super) fn flatten_options_for_tree() -> FlattenOptions {
     }
 }
 
+/// The compatibility policies one compile applies, strict by default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct CompilePolicies {
+    pub(super) unit_metadata: UnitMetadataPolicy,
+}
+
+impl CompilePolicies {
+    /// Whether a policy is relaxed, so a compile can record policy warnings.
+    pub(super) fn records_warnings(self) -> bool {
+        self != Self::default()
+    }
+}
+
+/// The warnings relaxed [`CompilePolicies`] recorded in one model's compile.
+#[derive(Debug, Clone, Default)]
+pub(super) struct PolicyWarnings {
+    /// ET010 warnings of [`UnitMetadataPolicy::Warn`].
+    pub(super) unit_metadata: Vec<CommonDiagnostic>,
+}
+
 fn dae_model_outcome_internal_with_options(
     tree: &ast::ClassTree,
     model_name: &str,
@@ -93,18 +113,26 @@ fn dae_model_outcome_internal_with_options(
         model_name,
         instantiation_options,
         dae_options,
+        CompilePolicies::default(),
     )
     .0
 }
 
-/// [`dae_model_outcome_internal_with_options`], plus the warnings a successful
-/// outcome carries, taken from the typed overlay before flatten consumes it.
+/// [`dae_model_outcome_internal_with_options`] under explicit compatibility
+/// policies, plus the warnings a successful outcome carries (taken from the
+/// typed overlay before flatten consumes it) and the warnings the policies
+/// recorded.
 fn dae_model_outcome_and_warnings_with_options(
     tree: &ast::ClassTree,
     model_name: &str,
     instantiation_options: InstantiateOptions,
     dae_options: rumoca_phase_dae::ToDaeOptions,
-) -> (DaeModelOutcome, Option<StrictCompileWarnings>) {
+    policies: CompilePolicies,
+) -> (
+    DaeModelOutcome,
+    Option<StrictCompileWarnings>,
+    PolicyWarnings,
+) {
     notify_compile_phase(FailedPhase::Instantiate, CompilePhaseEvent::Started);
     let instantiate_start = maybe_start_timer();
     let instantiate_outcome = InstantiatedModelOutcome::from_instantiation_outcome(
@@ -115,8 +143,12 @@ fn dae_model_outcome_and_warnings_with_options(
 
     notify_compile_phase(FailedPhase::Typecheck, CompilePhaseEvent::Started);
     let typecheck_start = maybe_start_timer();
-    let (typed_outcome, typechecked_built) =
-        typed_model_outcome_from_instantiated(tree, model_name, instantiate_outcome);
+    let (typed_outcome, typechecked_built, unit_metadata) = typed_model_outcome_from_instantiated(
+        tree,
+        model_name,
+        instantiate_outcome,
+        policies.unit_metadata,
+    );
     if typechecked_built {
         maybe_record_compile_phase_timing(FailedPhase::Typecheck, typecheck_start);
     }
@@ -159,7 +191,7 @@ fn dae_model_outcome_and_warnings_with_options(
         }),
         _ => None,
     };
-    (dae_outcome, warnings)
+    (dae_outcome, warnings, PolicyWarnings { unit_metadata })
 }
 
 fn dae_model_outcome_internal(tree: &ast::ClassTree, model_name: &str) -> DaeModelOutcome {
@@ -196,6 +228,26 @@ pub(super) fn compile_model_internal_with_options(
     compile_phase_result_from_dae(tree, model_name, dae_outcome)
 }
 
+fn compile_model_internal_with_options_and_policies(
+    tree: &ast::ClassTree,
+    model_name: &str,
+    instantiation_options: InstantiateOptions,
+    dae_options: rumoca_phase_dae::ToDaeOptions,
+    policies: CompilePolicies,
+) -> (PhaseResult, PolicyWarnings) {
+    let (dae_outcome, _, policy_warnings) = dae_model_outcome_and_warnings_with_options(
+        tree,
+        model_name,
+        instantiation_options,
+        dae_options,
+        policies,
+    );
+    (
+        compile_phase_result_from_dae(tree, model_name, dae_outcome),
+        policy_warnings,
+    )
+}
+
 pub(super) fn compile_model_dae_internal(
     tree: &ast::ClassTree,
     model_name: &str,
@@ -204,23 +256,31 @@ pub(super) fn compile_model_dae_internal(
     dae_phase_result_from_dae(tree, model_name, dae_outcome)
 }
 
-/// Compile one model to a DAE with the given instantiation options, plus a
-/// successful compile's warnings for the model's Save diagnostics.
+/// Compile one model to a DAE with the given instantiation options and
+/// compatibility policies, plus a successful compile's warnings for the
+/// model's Save diagnostics and the warnings the policies recorded.
 pub(super) fn compile_model_dae_internal_with_warnings(
     tree: &ast::ClassTree,
     model_name: &str,
     instantiation_options: InstantiateOptions,
     dae_options: rumoca_phase_dae::ToDaeOptions,
-) -> (DaePhaseResult, Option<StrictCompileWarnings>) {
-    let (dae_outcome, warnings) = dae_model_outcome_and_warnings_with_options(
+    policies: CompilePolicies,
+) -> (
+    DaePhaseResult,
+    Option<StrictCompileWarnings>,
+    PolicyWarnings,
+) {
+    let (dae_outcome, warnings, policy_warnings) = dae_model_outcome_and_warnings_with_options(
         tree,
         model_name,
         instantiation_options,
         dae_options,
+        policies,
     );
     (
         dae_phase_result_from_dae(tree, model_name, dae_outcome),
         warnings,
+        policy_warnings,
     )
 }
 
@@ -228,7 +288,8 @@ pub(super) fn typed_model_outcome_from_instantiated(
     tree: &ast::ClassTree,
     model_name: &str,
     instantiate_outcome: InstantiatedModelOutcome,
-) -> (TypedModelOutcome, bool) {
+    unit_metadata_policy: UnitMetadataPolicy,
+) -> (TypedModelOutcome, bool, Vec<CommonDiagnostic>) {
     let mut overlay = match instantiate_outcome {
         InstantiatedModelOutcome::Success(overlay) => *overlay,
         InstantiatedModelOutcome::NeedsInner {
@@ -241,21 +302,45 @@ pub(super) fn typed_model_outcome_from_instantiated(
                     missing_spans,
                 },
                 false,
+                Vec::new(),
             );
         }
         InstantiatedModelOutcome::Error(error) => {
-            return (TypedModelOutcome::InstantiateError(error), false);
+            return (
+                TypedModelOutcome::InstantiateError(error),
+                false,
+                Vec::new(),
+            );
         }
     };
 
-    if let Err(diags) = typecheck_instanced(tree, &mut overlay, model_name) {
-        return (
+    let unit_metadata_warnings = |diags: &rumoca_core::Diagnostics| {
+        diags
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code.as_deref() == Some("ET010")
+                    && diagnostic.severity == rumoca_core::DiagnosticSeverity::Warning
+            })
+            .cloned()
+            .collect()
+    };
+    match typecheck_instanced_with_unit_metadata_policy(
+        tree,
+        &mut overlay,
+        model_name,
+        unit_metadata_policy,
+    ) {
+        Err(diags) => (
             TypedModelOutcome::TypecheckError(diags.iter().cloned().collect()),
             true,
-        );
+            unit_metadata_warnings(&diags),
+        ),
+        Ok(diags) => (
+            TypedModelOutcome::Success(Box::new(overlay)),
+            true,
+            unit_metadata_warnings(&diags),
+        ),
     }
-
-    (TypedModelOutcome::Success(Box::new(overlay)), true)
 }
 
 pub(super) fn flat_model_outcome_from_typed(
@@ -604,7 +689,8 @@ pub(super) fn finalize_strict_compile_report_from_uncached_targets(
     targets: &[String],
     instantiation_options: InstantiateOptions,
     dae_options: rumoca_phase_dae::ToDaeOptions,
-) -> StrictCompileReport {
+    policies: CompilePolicies,
+) -> (StrictCompileReport, Vec<(String, PolicyWarnings)>) {
     finalize_strict_compile_report_from_uncached_targets_impl(
         tree,
         requested_model,
@@ -612,7 +698,29 @@ pub(super) fn finalize_strict_compile_report_from_uncached_targets(
         targets,
         instantiation_options,
         dae_options,
+        policies,
     )
+}
+
+/// Finalize the report from the targets' streamed results, keeping each
+/// target's policy warnings beside it.
+fn finalize_strict_compile_report_from_policy_results<I>(
+    tree: &ast::ClassTree,
+    requested_model: &str,
+    mut failures: Vec<ModelFailureDiagnostic>,
+    results: I,
+) -> (StrictCompileReport, Vec<(String, PolicyWarnings)>)
+where
+    I: IntoIterator<Item = (String, PhaseResult, PolicyWarnings)>,
+{
+    let mut policy_warnings = Vec::new();
+    let results = results.into_iter().map(|(name, result, warnings)| {
+        policy_warnings.push((name.clone(), warnings));
+        (name, result)
+    });
+    let report =
+        finalize_strict_compile_report_from_results(tree, requested_model, &mut failures, results);
+    (report, policy_warnings)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -623,20 +731,19 @@ fn finalize_strict_compile_report_from_uncached_targets_impl(
     targets: &[String],
     instantiation_options: InstantiateOptions,
     dae_options: rumoca_phase_dae::ToDaeOptions,
-) -> StrictCompileReport {
-    let mut failures = failures;
+    policies: CompilePolicies,
+) -> (StrictCompileReport, Vec<(String, PolicyWarnings)>) {
     let results = targets.iter().map(|name| {
-        (
-            name.clone(),
-            compile_model_internal_with_options(
-                tree,
-                name,
-                instantiation_options.clone(),
-                dae_options,
-            ),
-        )
+        let (result, warnings) = compile_model_internal_with_options_and_policies(
+            tree,
+            name,
+            instantiation_options.clone(),
+            dae_options,
+            policies,
+        );
+        (name.clone(), result, warnings)
     });
-    finalize_strict_compile_report_from_results(tree, requested_model, &mut failures, results)
+    finalize_strict_compile_report_from_policy_results(tree, requested_model, failures, results)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -647,28 +754,30 @@ fn finalize_strict_compile_report_from_uncached_targets_impl(
     targets: &[String],
     instantiation_options: InstantiateOptions,
     dae_options: rumoca_phase_dae::ToDaeOptions,
-) -> StrictCompileReport {
-    let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<(String, PhaseResult)>(1);
+    policies: CompilePolicies,
+) -> (StrictCompileReport, Vec<(String, PolicyWarnings)>) {
+    let (result_tx, result_rx) =
+        std::sync::mpsc::sync_channel::<(String, PhaseResult, PolicyWarnings)>(1);
 
     std::thread::scope(|scope| {
         let consumer = scope.spawn(move || {
-            let mut failures = failures;
-            finalize_strict_compile_report_from_results(
+            finalize_strict_compile_report_from_policy_results(
                 tree,
                 requested_model,
-                &mut failures,
+                failures,
                 result_rx,
             )
         });
 
         targets.par_iter().for_each_with(result_tx, |tx, name| {
-            let result = compile_model_internal_with_options(
+            let (result, warnings) = compile_model_internal_with_options_and_policies(
                 tree,
                 name,
                 instantiation_options.clone(),
                 dae_options,
+                policies,
             );
-            let _ = tx.send((name.clone(), result));
+            let _ = tx.send((name.clone(), result, warnings));
         });
 
         consumer
