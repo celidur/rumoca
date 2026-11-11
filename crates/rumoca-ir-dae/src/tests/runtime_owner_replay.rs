@@ -122,6 +122,83 @@ fn function_owner_fixture() -> Dae {
     .expect("a function quotient owner constructs completely")
 }
 
+fn function_fold_owner_fixture() -> Dae {
+    let source = TestSource::new(
+        "function f\n input Real u;\n output Real y;\nalgorithm\n y := 0.0;\n for k in 1:2 loop\n  y := mod(u, 2.0);\n end for;\nend f;",
+    );
+    let function_at = source.source("function f", 0);
+    let parameter_at = source.source("input Real u", 0);
+    let output_at = source.source("output Real y", 0);
+    let loop_at = source.source("for k in 1:2 loop", 0);
+    let initial_assignment = source.source("y := 0.0", 0);
+    let zero_at = source.source("0.0", 0);
+    let parameter_use = source.source("u", 1);
+    let two_at = source.source("2.0", 0);
+    let quotient_at = source.source("mod(u, 2.0)", 0);
+    let assignment_at = source.source("y := mod(u, 2.0)", 0);
+    let finish_at = source.source("end for", 0);
+    Dae::construct(source.map, |dae| {
+        let real =
+            dae.types(|types| types.derived(ValueType::scalar(ScalarType::Real), function_at))?;
+        dae.function(
+            FunctionSignature::new(VarName::new("f"), [real], [real], function_at),
+            |dae, reservation| {
+                let parameter = dae.functions(|functions| {
+                    functions.parameter(&reservation, VarName::new("u"), 0, parameter_at)
+                })?;
+                let output = dae.functions(|functions| {
+                    functions.output(&reservation, VarName::new("y"), 0, output_at)
+                })?;
+                let mut body =
+                    dae.functions(|functions| functions.begin(reservation, function_at))?;
+                let zero = dae.expressions(|expressions| {
+                    expressions.at(zero_at).literal(DaeLiteral::Real(0.0))
+                })?;
+                dae.functions(|functions| {
+                    functions.assign(&mut body, output, zero, initial_assignment)
+                })?;
+                let domain = dae.domains(|domains| {
+                    domains.structured(
+                        StructuredIndexDomain {
+                            binders: vec![StructuredIndexBinder {
+                                provenance: rumoca_core::IndexBinderProvenance::Generated,
+                                id: 0,
+                                display_name: "k".to_owned(),
+                                lower: 1,
+                                upper: 2,
+                                step: 1,
+                            }],
+                        },
+                        loop_at,
+                    )
+                })?;
+                let mut loop_body = dae
+                    .functions(|functions| functions.begin_loop(body, domain, [output], loop_at))?;
+                let u = dae.expressions(|expressions| {
+                    expressions.at(parameter_use).function_parameter(parameter)
+                })?;
+                let two = dae.expressions(|expressions| {
+                    expressions.at(two_at).literal(DaeLiteral::Real(2.0))
+                })?;
+                let quotient = dae.function_runtime_quotient(
+                    loop_body.body(),
+                    PureBuiltin::Mod,
+                    [u, two],
+                    quotient_at,
+                )?;
+                dae.functions(|functions| {
+                    functions.assign_loop(&mut loop_body, output, quotient, assignment_at)
+                })?;
+                let body =
+                    dae.functions(|functions| functions.finish_loop(loop_body, finish_at))?;
+                dae.functions(|functions| functions.define(body, function_at))
+            },
+        )?;
+        Ok(())
+    })
+    .expect("a function quotient owner inside a checked fold constructs")
+}
+
 fn assert_model_owner_shape(dae: &Dae) {
     dae.inspect(|view| {
         assert_eq!(view.root_count(), 1);
@@ -211,6 +288,53 @@ fn function_owner_round_trips_event_free() {
     });
     let re_encoded = serde_json::to_string(&replayed).unwrap();
     assert_eq!(encoded, re_encoded);
+}
+
+#[test]
+fn function_owner_inside_checked_fold_round_trips_event_free() {
+    let dae = function_fold_owner_fixture();
+    let encoded = serde_json::to_string(&dae).unwrap();
+    let replayed: Dae = serde_json::from_str(&encoded).unwrap();
+    replayed.inspect(|view| {
+        assert_eq!(view.root_count(), 0);
+        assert_eq!(view.condition_count(), 0);
+        assert_eq!(view.runtime_quotient_owner_count(), 1);
+        let owner = view
+            .runtime_quotient_owner_at(0)
+            .expect("fold-scoped function owner survives replay");
+        assert!(matches!(
+            owner.kind(),
+            RuntimeQuotientOwnerKind::FunctionBody { function }
+                if function.index() == 0
+        ));
+        let function = view.function(view.function_id(0).unwrap()).unwrap();
+        assert!(matches!(
+            function.statements().nth(1),
+            Some(FunctionStatementView::For { .. })
+        ));
+    });
+    assert_eq!(
+        serde_json::to_string(&replayed).unwrap(),
+        encoded,
+        "fold-scoped owner replay is idempotent"
+    );
+}
+
+#[test]
+fn forged_fold_owner_function_identity_rejects() {
+    let mut wire = serde_json::to_value(function_fold_owner_fixture()).unwrap();
+    let owner = wire["storage"]["expressions"]["nodes"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find_map(|node| node.get_mut("runtime_quotient_owner"))
+        .expect("the function quotient is represented by an owner record");
+    owner["kind"]["function"]["function"] = serde_json::json!(99_u32);
+    let message = expect_rejected(wire);
+    assert!(
+        message.contains("function") || message.contains("function_quotient_owner"),
+        "{message}"
+    );
 }
 
 fn model_owner_wire() -> serde_json::Value {
