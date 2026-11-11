@@ -400,15 +400,28 @@ __device__ double {{ prefix }}_row(int row, double time, {{ y_type }} *batch_y, 
 {{ residual_rows(b, blk.residual_rows, blk.n, y_type="double") }}
 
 // Solve one row for one unknown (a causal step) by a few secant steps.
-__device__ void {{ b }}_isolate(int row, int y_index, double time, double *batch_y, const double *batch_p)
+// Returns 1 when it gave up on a nonzero residual (flat or non-finite row).
+__device__ int {{ b }}_isolate(int row, int y_index, double time, double *batch_y, const double *batch_p)
 {
+    int gave_up = 0;
     double x = batch_y[y_index];
     double r = {{ b }}_row(row, time, batch_y, batch_p);
     for (int iteration = 0; iteration < 8 && r != 0.0 && isfinite(r); ++iteration) {
+        // The secant step is scaled by |x|, but the residual may be many
+        // orders larger (a far Newton trial point): then x + h rounds to the
+        // same residual and the slope reads 0. Grow the step before giving up.
         double h = 1.4901161193847656e-08 * fmax(1.0, fabs(x));
-        batch_y[y_index] = x + h;
-        double slope = ({{ b }}_row(row, time, batch_y, batch_p) - r) / h;
+        double slope = 0.0;
+        for (int grow = 0; grow < 6; ++grow) {
+            batch_y[y_index] = x + h;
+            slope = ({{ b }}_row(row, time, batch_y, batch_p) - r) / h;
+            if (slope != 0.0 && isfinite(slope)) {
+                break;
+            }
+            h *= 1e3;
+        }
         if (!(slope != 0.0) || !isfinite(slope)) {
+            gave_up = 1;
             break;
         }
         double next = x - r / slope;
@@ -421,16 +434,20 @@ __device__ void {{ b }}_isolate(int row, int y_index, double time, double *batch
         }
     }
     batch_y[y_index] = x;
+    return gave_up || !isfinite(r);
 }
 
-__device__ void {{ b }}_sweep(double time, double *batch_y, const double *batch_p)
+// Returns the number of causal steps that could not solve their row.
+__device__ int {{ b }}_sweep(double time, double *batch_y, const double *batch_p)
 {
     (void)time;
     (void)batch_y;
     (void)batch_p;
+    int unresolved = 0;
 {%- for step in blk.causal %}
-    {{ b }}_isolate({{ step.row }}, {{ step.y }}, time, batch_y, batch_p);
+    unresolved += {{ b }}_isolate({{ step.row }}, {{ step.y }}, time, batch_y, batch_p);
 {%- endfor %}
+    return unresolved;
 }
 
 // Returns 0 when converged, nonzero when the Newton iteration failed.
@@ -442,7 +459,7 @@ __device__ int {{ b }}_project(double time, double *batch_y, const double *batch
     double jacobian[{{ k * k }}];
     int converged = 0;
     for (int iteration = 0; iteration < {{ NAME }}_NEWTON_MAX_ITERATIONS; ++iteration) {
-        {{ b }}_sweep(time, batch_y, batch_p);
+        int unresolved = {{ b }}_sweep(time, batch_y, batch_p);
         int exact = 1;
         for (int i = 0; i < {{ k }}; ++i) {
             f[i] = {{ b }}_row(residual[i], time, batch_y, batch_p);
@@ -452,7 +469,9 @@ __device__ int {{ b }}_project(double time, double *batch_y, const double *batch
             exact &= f[i] == 0.0;
         }
         if (exact || converged) {
-            return 0;
+            // Zero tear residuals mean nothing when a causal step left its
+            // own row unsolved.
+            return unresolved ? 4 : 0;
         }
         for (int column = 0; column < {{ k }}; ++column) {
             double x = batch_y[iterated[column]];

@@ -1169,6 +1169,111 @@ int main() {{
 }
 
 #[test]
+fn cuda_ode_torn_block_solves_from_a_far_tear_guess() {
+    // One tear unknown `d`, three causal steps. A tear guess far from the
+    // solution makes the causal residuals huge while the isolated unknowns
+    // sit near 0: a secant step scaled by |x| then rounds to a zero slope.
+    // The causal steps must still solve their rows, or the block must report
+    // the failure; a silently wrong derivative is the bug this guards.
+    let compiled = Compiler::new()
+        .model("TornIsolate")
+        .compile_str(
+            r#"
+model TornIsolate
+  Real x(start = 0, fixed = true);
+  Real a;
+  Real b;
+  Real c;
+  Real d;
+equation
+  der(x) = -x + a;
+  c = a + b;
+  d = a - b;
+  c + d = 4 + b;
+  c - 2 * d = x;
+end TornIsolate;
+"#,
+            "TornIsolate.mo",
+        )
+        .expect("the compiler accepts the torn affine block");
+    let (directory, files) = rendered_model_target(&compiled, "TornIsolate", "cuda-ode");
+    let source = files
+        .iter()
+        .find(|file| file.path.ends_with("_ode.cu"))
+        .expect("cuda-ode emits its kernel");
+    assert!(
+        source.content.contains("_isolate("),
+        "the block must be torn with causal steps for this test to bite"
+    );
+    let harness = directory.path().join("torn.cpp");
+    fs::write(
+        &harness,
+        format!(
+            r#"#include <cmath>
+#include <cstdio>
+#include <cstring>
+struct Dim3 {{ int x; }};
+static Dim3 blockIdx, blockDim, threadIdx;
+#define __global__
+#define __host__
+#define __device__
+#include {:?}
+
+static int slot(const char *name) {{
+    for (int i = 0; i < TORNISOLATE_Y_LEN; ++i) {{
+        if (std::strcmp(TornIsolate_y_names[i], name) == 0) {{
+            return i;
+        }}
+    }}
+    return -1;
+}}
+
+int main() {{
+    const int d = slot("d");
+    if (d < 0 || slot("a") < 0) {{
+        return 2;
+    }}
+    blockIdx.x = 0;
+    blockDim.x = 1;
+    threadIdx.x = 0;
+    const double guesses[5] = {{1.0, 1e6, 1e9, 1e12, 1e15}};
+    for (double guess : guesses) {{
+        double y[TORNISOLATE_Y_LEN] = {{0.0}};
+        double out[TORNISOLATE_STATE_COUNT] = {{0.0}};
+        int status = -1;
+        y[d] = guess;
+        TornIsolate_rhs_batch(0.0, y, nullptr, out, &status,
+            TORNISOLATE_Y_LEN, 0, TORNISOLATE_STATE_COUNT, 1);
+        // a = 3 b, 2 a = 4 + b: a = 2.4 and der(x) = a at x = 0.
+        if (status != 0 || std::fabs(out[0] - 2.4) > 1e-9 || std::fabs(y[slot("a")] - 2.4) > 1e-9) {{
+            std::printf("guess %g: status %d, der %.17g\n", guess, status, out[0]);
+            return 1;
+        }}
+    }}
+    return 0;
+}}
+"#,
+            source.path,
+        ),
+    )
+    .expect("write torn-block harness");
+    let executable = directory.path().join("cuda-ode-torn");
+    run_checked(
+        Command::new("c++")
+            .args(["-std=c++17", "-Wall", "-Wextra", "-Werror"])
+            .arg(&harness)
+            .arg("-o")
+            .arg(&executable)
+            .current_dir(directory.path()),
+        "compile CUDA ODE torn-block emulation",
+    );
+    run_checked(
+        &mut Command::new(executable),
+        "execute CUDA ODE torn-block emulation",
+    );
+}
+
+#[test]
 fn cuda_ode_generated_kernel_compiles_with_required_nvcc() {
     let (directory, files) = rendered_target("cuda-ode");
     let source = files
