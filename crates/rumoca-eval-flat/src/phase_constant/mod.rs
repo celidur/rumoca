@@ -14,6 +14,7 @@ mod boolean_eval;
 mod borrowed_context;
 mod dimension_scope;
 mod enum_identity;
+mod function_dimensions;
 
 use rustc_hash::FxHashMap;
 
@@ -29,6 +30,7 @@ use dimension_scope::DimensionScope;
 #[cfg(test)]
 use enum_identity::EnumCanonicalizer;
 pub use enum_identity::canonicalize_enum_literal;
+use function_dimensions::bind_function_dimension_args;
 
 // Conditional tracing support (SPEC_0008)
 #[cfg(feature = "tracing")]
@@ -351,25 +353,8 @@ fn infer_user_function_call_dimensions(
             });
     }
 
-    let mut locals = DimensionArgs {
-        ints: ctx.known_ints.clone(),
-        reals: ctx.known_reals.clone(),
-        bools: ctx.known_bools.clone(),
-        values: FxHashMap::default(),
-    };
-    bind_function_dimension_args(func, args, ctx, &mut locals)?;
-
-    let local_ctx = ParamEvalContext {
-        known_ints: &locals.ints,
-        known_reals: &locals.reals,
-        known_bools: &locals.bools,
-        known_enums: ctx.known_enums,
-        array_dims: ctx.array_dims,
-        known_values: &locals.values,
-        resources: None,
-        functions: ctx.functions,
-        var_context: None,
-    };
+    let locals = bind_function_dimension_args(func, args, ctx)?;
+    let local_ctx = locals.context(ctx);
 
     let local_scope = DimensionScope::new(&local_ctx);
     output
@@ -522,6 +507,7 @@ fn infer_builtin_call_dimensions_with_context(
         rumoca_core::BuiltinFunction::Zeros | rumoca_core::BuiltinFunction::Ones => {
             eval_dimension_args_with_context(args, ctx)
         }
+        rumoca_core::BuiltinFunction::Cat => infer_cat_dimensions(args, ctx),
         rumoca_core::BuiltinFunction::Fill => {
             if args.len() < 2 {
                 return None;
@@ -565,6 +551,34 @@ fn infer_builtin_call_dimensions_with_context(
     }
 }
 
+/// MLS §10.4.2: `cat(k, A, B, ...)` sums extent `k` of arrays that agree on
+/// every other axis.
+fn infer_cat_dimensions(
+    args: &[rumoca_core::Expression],
+    ctx: &DimensionScope<'_, '_>,
+) -> Option<Vec<i64>> {
+    let (axis, arrays) = args.split_first()?;
+    let axis = usize::try_from(ctx.integer(axis)?.checked_sub(1)?).ok()?;
+    let (first, rest) = arrays.split_first()?;
+    let mut dims = infer_dimensions_scoped(first, ctx)?;
+    if axis >= dims.len() || dims.iter().any(|extent| *extent < 0) {
+        return None;
+    }
+    for array in rest {
+        let shape = infer_dimensions_scoped(array, ctx)?;
+        if shape.len() != dims.len()
+            || shape
+                .iter()
+                .enumerate()
+                .any(|(index, extent)| *extent < 0 || (index != axis && *extent != dims[index]))
+        {
+            return None;
+        }
+        dims[axis] = dims[axis].checked_add(shape[axis])?;
+    }
+    Some(dims)
+}
+
 fn eval_dimension_args_with_context(
     args: &[rumoca_core::Expression],
     ctx: &DimensionScope<'_, '_>,
@@ -589,77 +603,6 @@ fn infer_if_dimensions_with_context(
         }
     }
     infer_dimensions_scoped(else_branch, ctx)
-}
-
-/// The values a function call binds to its inputs while its result shape is
-/// evaluated (MLS §12.4.1).
-struct DimensionArgs {
-    ints: FxHashMap<String, i64>,
-    reals: FxHashMap<String, f64>,
-    bools: FxHashMap<String, bool>,
-    values: FxHashMap<String, Value>,
-}
-
-impl DimensionArgs {
-    fn binds(&self, name: &str) -> bool {
-        self.ints.contains_key(name)
-            || self.reals.contains_key(name)
-            || self.bools.contains_key(name)
-            || self.values.contains_key(name)
-    }
-
-    /// Bind `name` to the value of `expr`, typed by the value it evaluates to.
-    fn bind(
-        &mut self,
-        name: &str,
-        expr: &rumoca_core::Expression,
-        ctx: &DimensionScope<'_, '_>,
-    ) -> Option<()> {
-        match ctx.value_of(expr)? {
-            Value::Integer(value) => {
-                self.ints.insert(name.to_string(), value);
-            }
-            Value::Real(value) => {
-                self.reals.insert(name.to_string(), value);
-            }
-            Value::Bool(value) => {
-                self.bools.insert(name.to_string(), value);
-            }
-            value @ (Value::String(_) | Value::Array(_)) => {
-                self.values.insert(name.to_string(), value);
-            }
-            Value::Enum(..) | Value::Record(_) => return None,
-        }
-        Some(())
-    }
-}
-
-fn bind_function_dimension_args(
-    func: &rumoca_core::Function,
-    args: &[rumoca_core::Expression],
-    ctx: &DimensionScope<'_, '_>,
-    locals: &mut DimensionArgs,
-) -> Option<()> {
-    let mut positional = 0usize;
-    for arg in args {
-        let (param_name, value_expr) = if let Some((name, value)) = named_call_arg(arg) {
-            (name, value)
-        } else {
-            let param = func.inputs.get(positional)?;
-            positional += 1;
-            (param.name.as_str(), arg)
-        };
-        locals.bind(param_name, value_expr, ctx)?;
-    }
-
-    for param in &func.inputs {
-        if locals.binds(&param.name) {
-            continue;
-        }
-        let default = param.default.as_ref()?;
-        locals.bind(&param.name, default, ctx)?;
-    }
-    Some(())
 }
 
 fn eval_param_shape_subscript(
