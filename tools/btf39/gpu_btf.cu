@@ -337,6 +337,22 @@ struct Buffers {
     Work w; int lanes, out_lanes, out_rows;
 };
 
+// One RHS of lane 0 at its current y and history, on the device, into fp
+// (y copied to xp first). Used to compare device and host model arithmetic.
+#ifdef CPU_EMU
+static void k_rhs_check(int lane, Buffers B, double t) {
+#else
+__global__ void k_rhs_check(Buffers B, double t) {
+    int lane = LANE_ID;
+#endif
+    if (lane != 0) return;
+    Lane L{B.arena, B.p, B.hist, B.piv, B.state, B.st, B.w};
+    long long calls = L.s->rhs_calls, fails = L.s->rhs_failures;
+    copy(L.a + L.w.xp, L.a + L.w.y, NY);
+    lane_rhs(L, t, L.a + L.w.xp, L.a + L.w.fp);
+    L.s->rhs_calls = calls; L.s->rhs_failures = fails;
+}
+
 // First RHS (f0 at t=0), then `steps` top-level steps, recording lanes below
 // out_lanes every OUT_EVERY steps.
 #ifdef CPU_EMU
@@ -466,6 +482,23 @@ template <class T> static void download(std::vector<T> &dst, const T *src, size_
     CHECK(cudaMemcpy(dst.data(), src, sizeof(T) * n, cudaMemcpyDeviceToHost));
 #endif
 }
+static void sync();
+// Device RHS against host RHS at lane 0's current state.
+static void rhs_check(const Buffers &B, double t, const char *when) {
+    LAUNCH(k_rhs_check, 1, B, t); sync();
+    std::vector<double> a, hp, hh; download(a, B.arena, (size_t)B.w.len);
+    download(hp, B.p, (size_t)NP + 1); download(hh, B.hist, (size_t)HS);
+    std::vector<double> y(a.begin() + B.w.y, a.begin() + B.w.y + NY), f(NS);
+    int st = host_rhs(t, y.data(), hp.data(), hh.data(), f.data());
+    double worst = 0, scale = 0; int at = -1, nd = 0;
+    for (int i = 0; i < NS; ++i) {
+        double g = a[B.w.fp + i], d = fabs(g - f[i]), r = d / fmax(fabs(f[i]), 1e-300);
+        scale = fmax(scale, fabs(f[i])); nd += g != f[i];
+        if (r > worst) { worst = r; at = i; }
+    }
+    printf("rhs check %s (t=%g, host status %d): %d of %d derivatives differ, worst relative %.3g at %d (host %.17g device %.17g), max |f|=%.3g\n",
+           when, t, st, nd, NS, worst, at, at >= 0 ? f[at] : 0.0, at >= 0 ? a[B.w.fp + at] : 0.0, scale);
+}
 static void sync() {
 #ifndef CPU_EMU
     CHECK(cudaGetLastError()); CHECK(cudaDeviceSynchronize());
@@ -552,6 +585,7 @@ int main(int argc, char **argv) {
         }
         upload_to(B.arena, ha); upload_to(B.p, hp); upload_to(B.hist, hh); upload_to(B.state, hs0);
     }
+    rhs_check(B, 0.0, "at t=0");
     auto run0 = std::chrono::steady_clock::now();
     for (int start = 0; start < steps; start += CHUNK_STEPS) {
         int n = std::min(CHUNK_STEPS, steps - start);
@@ -559,6 +593,7 @@ int main(int argc, char **argv) {
         std::vector<LaneState> s0; download(s0, B.state, 1);
         printf("t=%.6g lane0: halvings=%d rhs_calls=%lld wall=%.1fs\n", s0[0].t, s0[0].halvings, s0[0].rhs_calls,
                std::chrono::duration<double>(std::chrono::steady_clock::now() - run0).count());
+        rhs_check(B, s0[0].t, "after chunk");
         fflush(stdout);
     }
     double run_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - run0).count();
