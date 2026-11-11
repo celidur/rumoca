@@ -13,7 +13,7 @@ mod literal_profile;
 mod pruned;
 pub use coordinate_query::CoordinateQuery;
 use coordinate_query::ProjectionQuery;
-pub use error::ProjectionError;
+pub use error::{ProjectionError, StaticProjectionError};
 use error::{external_projection_error, unsupported_record_operation};
 pub use pruned::PrunedScalarCoordinateProjection;
 mod literal_update_sweeps;
@@ -25,6 +25,8 @@ mod record_fields;
 mod replay_fold;
 use record_fields::FieldPath;
 mod scalar_selection;
+mod static_index;
+pub use static_index::{project_indexed_scalar, project_static_integer};
 #[cfg(test)]
 mod tests;
 mod visited;
@@ -238,25 +240,11 @@ fn project_coordinates<'dae>(
     request: ProjectionRequest<'_, 'dae>,
     visit: &mut dyn FnMut(dae::CoordinateView<'dae>, usize),
 ) -> Result<(), ProjectionError> {
-    let mut projection = Projection {
-        activation: Activation::Guaranteed,
-        view,
-        domain_contexts: domain_context::DomainContexts::new(match domain_point {
-            Some((domain, point)) => vec![(domain, point.to_vec())],
-            None => Vec::new(),
-        }),
-        integer_stack: HashSet::default(),
-        function_frames: Vec::new(),
-        function_call_active: HashSet::default(),
-        function_fold_active: HashSet::default(),
-        function_summary_captures: Vec::new(),
-        model_visited: std::mem::take(&mut cache.model_visited),
-        frame_memos: Vec::new(),
-        cache,
-        visit,
-        relevant: request.relevant,
-        omitted: request.omitted,
+    let domain_points = match domain_point {
+        Some((domain, point)) => vec![(domain, point.to_vec())],
+        None => Vec::new(),
     };
+    let mut projection = Projection::new(view, domain_points, cache, request, visit);
     projection.model_visited.clear();
     let result = projection.expression(root, scalar_index);
     let model_visited = std::mem::take(&mut projection.model_visited);
@@ -309,6 +297,33 @@ struct Projection<'visit, 'dae> {
     visit: &'visit mut dyn FnMut(dae::CoordinateView<'dae>, usize),
     relevant: Option<ProjectionQuery<'visit, 'dae>>,
     omitted: Option<&'visit dyn Fn(dae::ExprId<'dae>) -> bool>,
+}
+
+impl<'visit, 'dae> Projection<'visit, 'dae> {
+    fn new(
+        view: dae::DaeView<'dae>,
+        domain_points: Vec<(dae::DomainId<'dae>, Vec<i64>)>,
+        cache: &'visit mut ScalarCoordinateProjectionCache<'dae>,
+        request: ProjectionRequest<'visit, 'dae>,
+        visit: &'visit mut dyn FnMut(dae::CoordinateView<'dae>, usize),
+    ) -> Self {
+        Self {
+            activation: Activation::Guaranteed,
+            view,
+            domain_contexts: domain_context::DomainContexts::new(domain_points),
+            integer_stack: HashSet::default(),
+            function_frames: Vec::new(),
+            function_call_active: HashSet::default(),
+            function_fold_active: HashSet::default(),
+            function_summary_captures: Vec::new(),
+            model_visited: std::mem::take(&mut cache.model_visited),
+            frame_memos: Vec::new(),
+            cache,
+            visit,
+            relevant: request.relevant,
+            omitted: request.omitted,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

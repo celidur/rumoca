@@ -1,3 +1,4 @@
+mod domain_point_scope;
 mod function_states;
 mod invariant_guards;
 pub use invariant_guards::invariant_boolean_guards;
@@ -597,18 +598,7 @@ where
         point: Vec<i64>,
         body: dae::ExprId<'dae>,
     ) -> Result<SourceValues, NumericEvaluationError> {
-        self.domain_points.push((domain, point));
-        let owner = self
-            .view
-            .expression(body)
-            .and_then(|node| node.function_scope());
-        self.scoped_expression_values.push(
-            function_states::NumericFunctionFrame::comprehension_frame(owner),
-        );
-        let body_values = self.source_values(body);
-        self.scoped_expression_values.pop();
-        self.domain_points.pop();
-        body_values
+        self.with_domain_point(domain, point, body, |this| this.source_values(body))
     }
 
     fn function_fold(

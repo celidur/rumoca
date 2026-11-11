@@ -11,6 +11,7 @@ use rumoca_ir_dae::{
     ExpressionOperation, Expressions, PureBuiltin, ScalarType, Subscript, ValueType,
 };
 
+use super::NumericEvaluationErrorKind;
 use super::NumericEvaluator;
 
 #[test]
@@ -1026,6 +1027,155 @@ fn nested_comprehensions_evaluate_with_lexically_scoped_binders() {
         assert_eq!(
             NumericEvaluator::new(view).expression(nested).unwrap(),
             vec![2.0, 3.0, 4.0, 3.0, 4.0, 5.0]
+        );
+        let outer = view.domain_id(0).unwrap();
+        let inner = view.expression_id(3).unwrap();
+        let mut evaluator = NumericEvaluator::new(view);
+        assert_eq!(
+            evaluator
+                .expression_at_domain_point(inner, outer, &[2])
+                .unwrap(),
+            vec![3.0, 4.0, 5.0]
+        );
+    });
+}
+
+/// `R[phase]` over `phase in 1:2:5`, plus `1 / (phase - 1)`.
+fn indexed_parameter_domain_model() -> Dae {
+    let text = "parameter Real R[5]; for phase in 1:2:5 loop R[phase]";
+    let mut source_map = SourceMap::new();
+    let source = source_map.add("indexed_parameter.mo", text);
+    let at = |start: usize, end: usize| {
+        DaeProvenance::source(Span::from_offsets(source, start, end)).unwrap()
+    };
+    Dae::construct(source_map, |dae| {
+        let array_type = dae.types(|types| {
+            types.derived(ValueType::array(ScalarType::Real, [5]), at(0, text.len()))
+        })?;
+        let (parameter, reservation) = dae.variables(|variables| {
+            variables.reserve_parameter(VarName::new("R"), array_type, at(0, text.len()))
+        })?;
+        let domain = dae.domains(|domains| {
+            domains.structured(
+                StructuredIndexDomain {
+                    binders: vec![StructuredIndexBinder {
+                        provenance: rumoca_core::IndexBinderProvenance::Generated,
+                        id: 0,
+                        display_name: "phase".to_string(),
+                        lower: 1,
+                        upper: 5,
+                        step: 2,
+                    }],
+                },
+                at(0, text.len()),
+            )
+        })?;
+        let binder = dae.domains(|domains| domains.binder(domain, 0, at(0, text.len())))?;
+        let (binding, _indexed) = dae.expressions(|expressions| {
+            let values = real_literals(expressions, at(0, text.len()), [10, 20, 30, 40, 50])?;
+            let binding = expressions.at(at(0, text.len())).array(values)?;
+            let phase = expressions.at(at(0, text.len())).binder(binder)?;
+            let coordinate = expressions
+                .at(at(0, text.len()))
+                .coordinate(CoordinateInput::Parameter(parameter))?;
+            let indexed = expressions.at(at(0, text.len())).index(
+                coordinate,
+                [Subscript::Index {
+                    expression: phase,
+                    provenance: at(0, text.len()),
+                }],
+            )?;
+            Ok((binding, indexed))
+        })?;
+        dae.variables(|variables| {
+            variables.define(
+                reservation,
+                rumoca_ir_dae::VariableAttributes {
+                    binding: Some(binding),
+                    ..Default::default()
+                },
+                at(0, text.len()),
+            )
+        })?;
+        let _invalid_at_first_point = dae.expressions(|expressions| {
+            let phase = expressions.at(at(0, text.len())).binder(binder)?;
+            let one = expressions
+                .at(at(0, text.len()))
+                .literal(DaeLiteral::Integer(1))?;
+            let denominator =
+                expressions
+                    .at(at(0, text.len()))
+                    .binary(BinaryOperator::Subtract, phase, one)?;
+            expressions
+                .at(at(0, text.len()))
+                .binary(BinaryOperator::Divide, one, denominator)
+        })?;
+        Ok(())
+    })
+    .unwrap()
+}
+
+#[test]
+fn indexed_parameter_expression_evaluates_at_checked_domain_points() {
+    let dae = indexed_parameter_domain_model();
+    dae.inspect(|view| {
+        let domain = view.domain_id(0).unwrap();
+        let indexed = (0..view.expression_count())
+            .filter_map(|index| view.expression_id(index))
+            .find(|id| {
+                matches!(
+                    view.expression(*id).unwrap().operation(),
+                    ExpressionOperation::Index { .. }
+                )
+            })
+            .unwrap();
+        let invalid = (0..view.expression_count())
+            .filter_map(|index| view.expression_id(index))
+            .find(|id| {
+                matches!(
+                    view.expression(*id).unwrap().operation(),
+                    ExpressionOperation::Binary {
+                        operator: BinaryOperator::Divide,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        let mut evaluator = NumericEvaluator::new(view);
+        for (phase, expected) in [(1, 10.0), (3, 30.0), (5, 50.0), (3, 30.0)] {
+            assert_eq!(
+                evaluator
+                    .expression_at_domain_point(indexed, domain, &[phase])
+                    .unwrap(),
+                [expected]
+            );
+        }
+        for tuple in [
+            &[][..],
+            &[0][..],
+            &[-1][..],
+            &[2][..],
+            &[4][..],
+            &[6][..],
+            &[1, 1][..],
+        ] {
+            let error = evaluator
+                .expression_at_domain_point(indexed, domain, tuple)
+                .unwrap_err();
+            assert_eq!(error.kind(), NumericEvaluationErrorKind::OutOfBounds);
+            assert_eq!(
+                error.span(),
+                view.expression(indexed).unwrap().provenance().span()
+            );
+        }
+
+        let error = evaluator
+            .expression_at_domain_point(invalid, domain, &[1])
+            .unwrap_err();
+        assert_eq!(error.kind(), NumericEvaluationErrorKind::InvalidValue);
+        assert_eq!(
+            evaluator.expression(invalid).unwrap_err().kind(),
+            NumericEvaluationErrorKind::UnsupportedOperation
         );
     });
 }

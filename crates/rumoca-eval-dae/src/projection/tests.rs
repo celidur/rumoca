@@ -788,6 +788,344 @@ fn function_index_parameter_preserves_call_site_specialization() {
     });
 }
 
+/// Expression ids of [`exact_index_model`].
+struct ExactIndexIds {
+    base: u32,
+    exact: u32,
+    difference: u32,
+    dynamic: u32,
+    overflow: u32,
+    quotient: u32,
+    negative: u32,
+    past_end: u32,
+}
+
+fn integer_literals<'dae, const N: usize>(
+    expressions: &mut dae::Expressions<'_, 'dae>,
+    at: dae::DaeProvenance,
+    values: [i64; N],
+) -> Result<[dae::ExprId<'dae>; N], dae::DaeConstructionError> {
+    let mut ids = Vec::with_capacity(N);
+    for value in values {
+        ids.push(
+            expressions
+                .at(at)
+                .literal(dae::DaeLiteral::Integer(value))?,
+        );
+    }
+    Ok(ids
+        .try_into()
+        .unwrap_or_else(|_| unreachable!("one expression per literal")))
+}
+
+/// `x[2^53 + 1 - 2^53]`, a dynamic index, overflow, a Real quotient of two
+/// Integers and out-of-range indices.
+fn exact_index_model() -> (dae::Dae, ExactIndexIds) {
+    let mut sources = SourceMap::new();
+    let source = sources.add(
+        "exact_index.mo",
+        "Real x[1]; input Integer runtimeIndex; x[9007199254740993 - 9007199254740992]; x[runtimeIndex];",
+    );
+    let declaration = provenance(source, 0, 10);
+    let input_at = provenance(source, 12, 36);
+    let use_at = provenance(source, 38, 94);
+    let mut ids = None;
+    let model = dae::Dae::construct(sources, |model| {
+        let (real_array, integer) = model.types(|types| {
+            Ok((
+                types.intern(
+                    TypeId::new(0),
+                    dae::ValueType::array(dae::ScalarType::Real, [1]),
+                    declaration,
+                )?,
+                types.intern(
+                    TypeId::new(1),
+                    dae::ValueType::scalar(dae::ScalarType::Integer),
+                    input_at,
+                )?,
+            ))
+        })?;
+        let (x, runtime_index) = model.variables(|variables| {
+            Ok((
+                variables.algebraic(
+                    VarName::new("x"),
+                    real_array,
+                    declaration,
+                    dae::VariableAttributes::default(),
+                )?,
+                variables.input(
+                    VarName::new("runtimeIndex"),
+                    integer,
+                    dae::InputVariability::Discrete,
+                    input_at,
+                    dae::VariableAttributes::default(),
+                )?,
+            ))
+        })?;
+        ids = Some(model.expressions(|expressions| {
+            let [lhs, rhs, negative, two, maximum, one, three] = integer_literals(
+                expressions,
+                use_at,
+                [
+                    9_007_199_254_740_993,
+                    9_007_199_254_740_992,
+                    -1,
+                    2,
+                    i64::MAX,
+                    1,
+                    3,
+                ],
+            )?;
+            let difference =
+                expressions
+                    .at(use_at)
+                    .binary(dae::BinaryOperator::Subtract, lhs, rhs)?;
+            let base = expressions
+                .at(use_at)
+                .coordinate(dae::CoordinateInput::Algebraic(x))?;
+            let dynamic = expressions
+                .at(use_at)
+                .coordinate(dae::CoordinateInput::Input(runtime_index))?;
+            let overflow = expressions
+                .at(use_at)
+                .binary(dae::BinaryOperator::Add, maximum, one)?;
+            let quotient =
+                expressions
+                    .at(use_at)
+                    .binary(dae::BinaryOperator::Divide, three, two)?;
+            let mut indexed = [0_u32; 4];
+            for (slot, index) in indexed.iter_mut().zip([difference, dynamic, negative, two]) {
+                let subscript = dae::Subscript::Index {
+                    expression: index,
+                    provenance: use_at,
+                };
+                *slot = expressions.at(use_at).index(base, [subscript])?.index();
+            }
+            Ok(ExactIndexIds {
+                base: base.index(),
+                exact: indexed[0],
+                difference: difference.index(),
+                dynamic: indexed[1],
+                overflow: overflow.index(),
+                quotient: quotient.index(),
+                negative: indexed[2],
+                past_end: indexed[3],
+            })
+        })?);
+        Ok(())
+    })
+    .unwrap();
+
+    (model, ids.unwrap())
+}
+
+#[test]
+fn exact_static_index_projection_preserves_i64_arithmetic() {
+    let (model, ids) = exact_index_model();
+    model.inspect(|view| {
+        let id = |raw: u32| view.expression_id(raw as usize).unwrap();
+        assert_eq!(
+            project_static_integer(view, id(ids.difference), 0, None),
+            Ok(1)
+        );
+        assert_eq!(
+            project_indexed_scalar(view, id(ids.exact), 0, None),
+            Ok((id(ids.base), 0))
+        );
+        assert!(matches!(
+            project_indexed_scalar(view, id(ids.exact), 1, None),
+            Err(StaticProjectionError::Projection(
+                ProjectionError::ScalarOutOfBounds {
+                    index: 1,
+                    count: 1,
+                    ..
+                }
+            ))
+        ));
+        assert!(matches!(
+            project_indexed_scalar(view, id(ids.dynamic), 0, None),
+            Err(StaticProjectionError::Projection(
+                ProjectionError::DynamicSubscript { .. }
+            ))
+        ));
+        assert!(matches!(
+            project_static_integer(view, id(ids.overflow), 0, None),
+            Err(StaticProjectionError::Projection(
+                ProjectionError::IntegerOverflow { .. }
+            ))
+        ));
+        for (indexed, index) in [(ids.negative, -1), (ids.past_end, 2)] {
+            assert!(matches!(
+                project_indexed_scalar(view, id(indexed), 0, None),
+                Err(StaticProjectionError::Projection(
+                    ProjectionError::IndexOutOfBounds {
+                        index: found,
+                        extent: 1,
+                        ..
+                    }
+                )) if found == index
+            ));
+        }
+    });
+}
+
+/// MLS §10.6: `3 / 2` is the Real 1.5, so it has no exact i64 value even
+/// though both operands are Integer literals.
+#[test]
+fn exact_static_integer_rejects_real_quotients_of_integers() {
+    let (model, ids) = exact_index_model();
+    model.inspect(|view| {
+        let quotient = view.expression_id(ids.quotient as usize).unwrap();
+        assert!(matches!(
+            project_static_integer(view, quotient, 0, None),
+            Err(StaticProjectionError::NotIntegerExpression { .. })
+        ));
+        let base = view.expression_id(ids.base as usize).unwrap();
+        assert!(matches!(
+            project_static_integer(view, base, 0, None),
+            Err(StaticProjectionError::NotIntegerExpression { .. })
+        ));
+        assert!(matches!(
+            project_indexed_scalar(view, base, 0, None),
+            Err(StaticProjectionError::NotIndexExpression { .. })
+        ));
+    });
+}
+
+#[test]
+fn exact_index_projection_requires_a_valid_domain_point_for_binders() {
+    let mut sources = SourceMap::new();
+    let source = sources.add(
+        "domain_index.mo",
+        "Real R[3]; for phase in 1:3 loop R[phase]",
+    );
+    let at = provenance(source, 0, 41);
+    let mut domain_id = 0_u32;
+    let mut indexed_id = 0_u32;
+    let model = dae::Dae::construct(sources, |model| {
+        let real_array = model.types(|types| {
+            types.intern(
+                TypeId::new(0),
+                dae::ValueType::array(dae::ScalarType::Real, [3]),
+                at,
+            )
+        })?;
+        let x = model.variables(|variables| {
+            variables.algebraic(
+                VarName::new("R"),
+                real_array,
+                at,
+                dae::VariableAttributes::default(),
+            )
+        })?;
+        let domain = model.domains(|domains| {
+            domains.structured(
+                StructuredIndexDomain {
+                    binders: vec![StructuredIndexBinder {
+                        provenance: rumoca_core::IndexBinderProvenance::Generated,
+                        id: 0,
+                        display_name: "phase".to_owned(),
+                        lower: 1,
+                        upper: 3,
+                        step: 1,
+                    }],
+                },
+                at,
+            )
+        })?;
+        let binder = model.domains(|domains| domains.binder(domain, 0, at))?;
+        let indexed = model.expressions(|expressions| {
+            let base = expressions
+                .at(at)
+                .coordinate(dae::CoordinateInput::Algebraic(x))?;
+            let phase = expressions.at(at).binder(binder)?;
+            expressions.at(at).index(
+                base,
+                [dae::Subscript::Index {
+                    expression: phase,
+                    provenance: at,
+                }],
+            )
+        })?;
+        domain_id = domain.index();
+        indexed_id = indexed.index();
+        Ok(())
+    })
+    .unwrap();
+    model.inspect(|view| {
+        let domain = view.domain_id(domain_id as usize).unwrap();
+        let indexed = view.expression_id(indexed_id as usize).unwrap();
+        let (_, flat) = project_indexed_scalar(view, indexed, 0, Some((domain, &[2]))).unwrap();
+        assert_eq!(flat, 1);
+        assert!(matches!(
+            project_indexed_scalar(view, indexed, 0, None),
+            Err(StaticProjectionError::Projection(
+                ProjectionError::DynamicSubscript { .. }
+            ))
+        ));
+        assert!(matches!(
+            project_indexed_scalar(view, indexed, 0, Some((domain, &[4]))),
+            Err(StaticProjectionError::InvalidDomainPoint { .. })
+        ));
+    });
+}
+
+#[test]
+fn enumeration_integer_subscripts_remain_supported() {
+    let mut sources = SourceMap::new();
+    let source_text = "enumeration subscript x[2]";
+    let source = sources.add("enumeration_index.mo", source_text);
+    let at = provenance(source, 0, source_text.len());
+    let mut indexed_id = 0_u32;
+    let model = dae::Dae::construct(sources, |model| {
+        let target_type = model.types(|types| {
+            types.intern(
+                TypeId::new(0),
+                dae::ValueType::array(dae::ScalarType::Real, [3]),
+                at,
+            )
+        })?;
+        let target = model.variables(|variables| {
+            variables.algebraic(
+                VarName::new("x"),
+                target_type,
+                at,
+                dae::VariableAttributes::default(),
+            )
+        })?;
+        let indexed = model.expressions(|expressions| {
+            let base = expressions
+                .at(at)
+                .coordinate(dae::CoordinateInput::Algebraic(target))?;
+            let index = expressions.at(at).enumeration_literal(2)?;
+            expressions.at(at).index(
+                base,
+                [dae::Subscript::Index {
+                    expression: index,
+                    provenance: at,
+                }],
+            )
+        })?;
+        indexed_id = indexed.index();
+        Ok(())
+    })
+    .unwrap();
+
+    model.inspect(|view| {
+        let indexed = view.expression_id(indexed_id as usize).unwrap();
+        assert_eq!(project_indexed_scalar(view, indexed, 0, None).unwrap().1, 1);
+        let dae::ExpressionOperation::Index { subscripts, .. } =
+            view.expression(indexed).unwrap().operation()
+        else {
+            unreachable!("the fixture is an index expression");
+        };
+        let Some(dae::SubscriptView::Index { expression, .. }) = subscripts.get(0) else {
+            unreachable!("the fixture has one scalar subscript");
+        };
+        assert_eq!(project_static_integer(view, expression, 0, None), Ok(2));
+    });
+}
+
 #[test]
 fn integer_matrix_products_and_scalar_broadcasts_select_exact_index_slices() {
     let mut sources = SourceMap::new();
@@ -880,6 +1218,8 @@ fn integer_matrix_products_and_scalar_broadcasts_select_exact_index_slices() {
                 let record = |_, base_scalar| visited.push(base_scalar);
                 for_each_scalar_coordinate(view, indexed, scalar, None, record).unwrap();
                 assert_eq!(visited, [expected_flat]);
+                let (_, flat) = project_indexed_scalar(view, indexed, scalar, None).unwrap();
+                assert_eq!(flat, expected_flat);
             }
         }
     });
@@ -952,6 +1292,12 @@ fn integer_matrix_power_subscripts_remain_dynamic() {
             visited.sort_unstable();
             visited.dedup();
             assert_eq!(visited, [0, 1, 2, 3, 4, 5]);
+            assert!(matches!(
+                project_indexed_scalar(view, indexed, scalar, None),
+                Err(StaticProjectionError::Projection(
+                    ProjectionError::DynamicSubscript { .. }
+                ))
+            ));
         }
     });
 }

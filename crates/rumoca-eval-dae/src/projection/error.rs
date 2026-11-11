@@ -55,6 +55,22 @@ impl ProjectionError {
     }
 }
 
+/// Failure of the exact static-index entry points.
+///
+/// Kept separate from [`ProjectionError`] so these entry-point failures do not
+/// make existing exhaustive `ProjectionError` matches non-exhaustive.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum StaticProjectionError {
+    #[error("expression is not an array index")]
+    NotIndexExpression { span: Span },
+    #[error("expression is not an Integer or enumeration value")]
+    NotIntegerExpression { span: Span },
+    #[error("structured domain point is not valid for this DAE")]
+    InvalidDomainPoint { span: Span },
+    #[error(transparent)]
+    Projection(#[from] ProjectionError),
+}
+
 /// Report an MLS §12.9 external body that projection cannot look through.
 ///
 /// Projection resolves a call by continuing into the callee's result
