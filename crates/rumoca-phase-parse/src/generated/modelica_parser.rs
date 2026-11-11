@@ -193,7 +193,7 @@ scanner! {
             token r"within" => 63; // "Within"
             token r"[_A-Za-z][_A-Za-z0-9]*" => 64; // "LBracketUnderscoreAMinusZaMinusZRBracketLBracketUnderscoreAMinusZaMinusZ0Minus9RBracketStar"
             token r#"\'([[:ascii:]&&[^\'\\]]|\\[\'\"\\ntrfabv?])*\'"# => 65; // "TickLParenLBracketLBracketColonAsciiColonRBracketAmpAmpLBracketCircumflexTickRBracketRBracketOrLBracketTickQuoteNtrfabvQuestRBracketRParenStarTick"
-            token r#""([^"\\]|\\['"?\\abfnrtv])*""# => 66; // "String"
+            token r#""([^"\\]|\\[^\r\n])*""# => 66; // "String"
             token r"[0-9]+" => 67; // "UnsignedInteger"
             token r"[0-9]+\.[0-9]+" => 68; // "LBracket0Minus9RBracketPlusDotLBracket0Minus9RBracketPlus"
             token r"[0-9]+\.([0-9]+)?([eE][+-]?[0-9]+)?" => 69; // "LBracket0Minus9RBracketPlusDotLParenLBracket0Minus9RBracketPlusRParenQuestLParenLBracketEERBracketLBracketPlusMinusRBracketQuestLBracket0Minus9RBracketPlusRParenQuest"
@@ -6731,7 +6731,7 @@ pub const PRODUCTIONS: &[Production; 519] = &[
         lhs: 185,
         production: &[ParseType::T(65)],
     },
-    // 61 - string: /"([^"\\]|\\['"?\\abfnrtv])*"/;
+    // 61 - string: /"([^"\\]|\\[^\r\n])*"/;
     Production {
         lhs: 281,
         production: &[ParseType::T(66)],

@@ -349,7 +349,7 @@ Defines state-to-state transitions with priority and timing control.
 | LEX-010 | Float range minimum | §2.4.1 | "At least IEEE double precision range (1.797×10³⁰⁸ to 2.225×10⁻³⁰⁸)" |
 | LEX-011 | Integer range minimum | §2.4.2 | "Range at least  enough to represent largest positive IntegerType value" |
 | LEX-012 | Boolean literals only | §2.4.3 | "Only true and false permitted as Boolean literals" |
-| LEX-013 | String escapes required | §2.4.4 | "Backslash escape sequences required for quote, backslash, newline, tab, etc."
+| LEX-013 | String escapes required | §2.4.4 | "Backslash escape sequences required for quote, backslash, newline, tab, etc." Rumoca: a backslash followed by any other character is refused. The opt-in `StringEscapePolicy::OpenModelica` of one parse keeps such a pair as written and reports it as a warning, as OpenModelica does. Tested in `rumoca-phase-parse` (`unknown_string_escapes_are_strict_by_default_and_omc_compatible_on_request`)
 
 ### 4.2 Declaration Contracts (DECL)
 

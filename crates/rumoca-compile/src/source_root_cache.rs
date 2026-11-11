@@ -31,6 +31,10 @@ pub struct ParsedSourceRoot {
     pub cache_key: String,
     pub cache_file: Option<PathBuf>,
     pub timing: SourceRootCacheTiming,
+    /// Unknown string escapes accepted by
+    /// [`parse_source_root_with_string_escape_policy`], in file order. Empty
+    /// for a strict parse.
+    pub string_escape_warnings: Vec<rumoca_phase_parse::StringEscapeWarning>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -475,11 +479,87 @@ pub fn parse_source_root_with_cache_in(
         cache_key: input_hash.cache_key,
         cache_file: None,
         timing,
+        string_escape_warnings: Vec::new(),
     })
 }
 
 pub fn parse_source_root_with_cache(path: &Path) -> Result<ParsedSourceRoot> {
     parse_source_root_with_cache_in(path, resolve_source_root_cache_dir().as_deref())
+}
+
+/// Parse a source root with an explicit string-escape policy.
+///
+/// A strict parse is the regular loader without an on-disk cache directory.
+/// An OpenModelica parse bypasses the strict parsed-artifact cache and
+/// reparses every collected file with the requested policy.
+/// File collection, source-root hashing, per-file parsing (without document
+/// extension expansion), and package-layout validation match the regular
+/// source-root loader. The accepted escapes are returned in
+/// [`ParsedSourceRoot::string_escape_warnings`]; source bytes are never
+/// rewritten.
+pub fn parse_source_root_with_string_escape_policy(
+    path: &Path,
+    policy: rumoca_phase_parse::StringEscapePolicy,
+) -> Result<ParsedSourceRoot> {
+    if policy == rumoca_phase_parse::StringEscapePolicy::Strict {
+        return parse_source_root_with_cache_in(path, None);
+    }
+
+    let total_started = Instant::now();
+    let mut timing = SourceRootCacheTiming::default();
+
+    let collect_started = Instant::now();
+    let files = collect_modelica_files(path)
+        .with_context(|| format!("collect .mo files under {}", path.display()))?;
+    timing.collect_files_ms = elapsed_ms(collect_started);
+
+    let hash_started = Instant::now();
+    let input_hash = hash_source_root_inputs(path, &files)
+        .with_context(|| format!("fingerprint {}", path.display()))?;
+    timing.hash_inputs_ms = elapsed_ms(hash_started);
+
+    let parse_started = Instant::now();
+    let parsed = input_hash
+        .files
+        .par_iter()
+        .map(|file| {
+            let source = fs::read_to_string(&file.path)
+                .with_context(|| format!("read source-root file {}", file.path.display()))?;
+            let file_name = file.path.to_string_lossy().to_string();
+            let (definition, warnings) =
+                rumoca_phase_parse::parse_to_ast_with_string_escape_policy(
+                    &source, &file_name, policy,
+                )
+                .map_err(|errors| {
+                    anyhow::anyhow!(
+                        "{}",
+                        rumoca_phase_parse::format_parse_errors(&errors, &file_name, &source)
+                    )
+                })
+                .with_context(|| format!("Failed to parse file: {}", file.path.display()))?;
+            Ok(((file_name, definition), warnings))
+        })
+        .collect::<Result<Vec<_>>>()
+        .with_context(|| format!("parse source-root files under {}", path.display()))?;
+    let (docs, string_escape_warnings): (Vec<_>, Vec<_>) = parsed.into_iter().unzip();
+    let string_escape_warnings = string_escape_warnings.into_iter().flatten().collect();
+    timing.parse_files_ms = elapsed_ms(parse_started);
+
+    let validate_started = Instant::now();
+    validate_source_root_package_layout(path, &docs)?;
+    timing.validate_layout_ms = elapsed_ms(validate_started);
+
+    record_source_root_cache_result(SourceRootCacheStatus::Disabled, files.len());
+    timing.total_ms = elapsed_ms(total_started);
+    Ok(ParsedSourceRoot {
+        documents: docs,
+        file_count: files.len(),
+        cache_status: SourceRootCacheStatus::Disabled,
+        cache_key: input_hash.cache_key,
+        cache_file: None,
+        timing,
+        string_escape_warnings,
+    })
 }
 
 fn cache_prune_root_for_source_root_cache(cache_dir: &Path) -> PathBuf {
@@ -544,6 +624,77 @@ mod tests {
                     + second.timing.validate_layout_ms
         );
         assert!(second.cache_file.is_none());
+    }
+
+    #[test]
+    fn explicit_escape_policy_source_root_bypasses_strict_ast_cache_and_keeps_text() {
+        use rumoca_phase_parse::StringEscapePolicy;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let lib_dir = temp.path().join("lib");
+        std::fs::create_dir_all(&lib_dir).expect("mkdir");
+        let package_path = lib_dir.join("package.mo");
+        let source = "package Lib\n  model Text\n    parameter String label = \"café\\q\";\n  end Text;\nend Lib;\n";
+        std::fs::write(&package_path, source).expect("write package");
+
+        let compatible =
+            parse_source_root_with_string_escape_policy(&lib_dir, StringEscapePolicy::OpenModelica)
+                .expect("OpenModelica source-root parser accepts unknown escape");
+        assert_eq!(compatible.file_count, 1);
+        assert_eq!(compatible.documents.len(), 1);
+        assert_eq!(compatible.cache_status, SourceRootCacheStatus::Disabled);
+        assert_eq!(std::fs::read_to_string(&package_path).unwrap(), source);
+        assert!(compatible.documents[0].1.classes.contains_key("Lib"));
+        let escape_start = source.find("\\q").expect("unknown escape");
+        assert_eq!(compatible.string_escape_warnings.len(), 1);
+        let warning = &compatible.string_escape_warnings[0];
+        assert_eq!(warning.file_name, package_path.to_string_lossy());
+        assert_eq!(
+            (warning.byte_start, warning.byte_end),
+            (escape_start, escape_start + 2)
+        );
+        assert!(parse_source_root_with_cache_in(&lib_dir, None).is_err());
+
+        let strict_dir = temp.path().join("strict-lib");
+        std::fs::create_dir_all(&strict_dir).expect("mkdir strict root");
+        let strict_path = strict_dir.join("package.mo");
+        let strict_source = "package StrictLib\n  model Text\n    parameter String label = \"line\\n\";\n  end Text;\nend StrictLib;\n";
+        std::fs::write(&strict_path, strict_source).expect("write strict package");
+        let existing = parse_source_root_with_cache_in(&strict_dir, None)
+            .expect("existing strict source-root parser");
+        let explicit =
+            parse_source_root_with_string_escape_policy(&strict_dir, StringEscapePolicy::Strict)
+                .expect("explicit strict source-root parser");
+        assert_eq!(explicit.cache_status, SourceRootCacheStatus::Disabled);
+        assert!(explicit.string_escape_warnings.is_empty());
+        assert_eq!(explicit.file_count, existing.file_count);
+        assert_eq!(explicit.documents.len(), existing.documents.len());
+        assert_eq!(
+            format!("{:?}", explicit.documents[0].1),
+            format!("{:?}", existing.documents[0].1)
+        );
+    }
+
+    #[test]
+    fn explicit_escape_policy_source_root_parses_files_like_the_strict_loader() {
+        use rumoca_phase_parse::StringEscapePolicy;
+
+        // Source-root files are parsed as written: the strict loader does not
+        // expand document extensions such as `jacobian(...)`.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let lib_dir = temp.path().join("JacLib");
+        std::fs::create_dir_all(&lib_dir).expect("mkdir");
+        let source = "package JacLib\n  function f\n    input Real x;\n    output Real y;\n  algorithm\n    y := 2*x;\n  end f;\n  model Probe\n    Real x = 1;\n    Real J[1, 1] = jacobian(f(x), x);\n  end Probe;\nend JacLib;\n";
+        std::fs::write(lib_dir.join("package.mo"), source).expect("write package");
+
+        let strict = parse_source_root_with_cache_in(&lib_dir, None).expect("strict loader");
+        let compatible =
+            parse_source_root_with_string_escape_policy(&lib_dir, StringEscapePolicy::OpenModelica)
+                .expect("OpenModelica source-root parser");
+        assert_eq!(
+            format!("{:?}", compatible.documents),
+            format!("{:?}", strict.documents)
+        );
     }
 
     #[test]

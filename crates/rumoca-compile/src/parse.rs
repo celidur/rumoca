@@ -97,10 +97,25 @@ pub(crate) fn expanded_document_source<'source>(
     source: &'source str,
     file_name: &str,
 ) -> std::result::Result<std::borrow::Cow<'source, str>, rumoca_phase_autodiff::Refusal> {
+    expanded_document_source_with_string_escape_policy(
+        source,
+        file_name,
+        rumoca_phase_parse::StringEscapePolicy::Strict,
+    )
+}
+
+/// [`expanded_document_source`] for a document parsed under an explicit
+/// string-escape policy.
+pub(crate) fn expanded_document_source_with_string_escape_policy<'source>(
+    source: &'source str,
+    file_name: &str,
+    policy: rumoca_phase_parse::StringEscapePolicy,
+) -> std::result::Result<std::borrow::Cow<'source, str>, rumoca_phase_autodiff::Refusal> {
     if !rumoca_phase_autodiff::may_expand(source) {
         return Ok(std::borrow::Cow::Borrowed(source));
     }
-    match rumoca_phase_autodiff::expand_source(source, file_name) {
+    match rumoca_phase_autodiff::expand_source_with_string_escape_policy(source, file_name, policy)
+    {
         Ok(expanded) => Ok(std::borrow::Cow::Owned(expanded)),
         // A source that does not parse is reported by the parse that follows,
         // with the parser's own structured error rather than this one.

@@ -121,6 +121,25 @@ pub fn expand_source(source: &str, file: &str) -> Result<String, ExpansionError>
     Ok(apply_to_text(source, &expansion))
 }
 
+/// [`expand_source`] for a source parsed under an explicit string-escape
+/// policy, so a source the policy accepts is expanded like a strict one.
+pub fn expand_source_with_string_escape_policy(
+    source: &str,
+    file: &str,
+    policy: rumoca_phase_parse::StringEscapePolicy,
+) -> Result<String, ExpansionError> {
+    let (definition, _) = rumoca_phase_parse::parse_to_ast_with_string_escape_policy(
+        source, file, policy,
+    )
+    .map_err(|errors| {
+        ExpansionError::Parse(rumoca_phase_parse::format_parse_errors(
+            &errors, file, source,
+        ))
+    })?;
+    let expansion = plan(&definition, file)?;
+    Ok(apply_to_text(source, &expansion))
+}
+
 /// A failure of [`expand_source`].
 #[derive(Debug)]
 pub enum ExpansionError {

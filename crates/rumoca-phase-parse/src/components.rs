@@ -31,7 +31,15 @@ fn decode_modelica_string_literal(text: &str) -> anyhow::Result<String> {
             'r' => '\r',
             't' => '\t',
             'v' => '\x0b',
-            _ => anyhow::bail!("invalid Modelica string escape `\\{escaped}`"),
+            // The parser's owning `ModelicaGrammar` validates unknown
+            // sequences according to its scoped escape policy. Preserve them
+            // here so OpenModelica-compatible parsing can retain the original
+            // text without preprocessing the source file.
+            _ => {
+                decoded.push('\\');
+                decoded.push(escaped);
+                continue;
+            }
         });
     }
     Ok(decoded)
@@ -41,9 +49,9 @@ impl TryFrom<&modelica_grammar_trait::String> for rumoca_core::Token {
     type Error = anyhow::Error;
 
     fn try_from(ast: &modelica_grammar_trait::String) -> std::result::Result<Self, Self::Error> {
-        let mut tok: rumoca_core::Token = ast.string.clone().into();
-        tok.text = std::sync::Arc::from(decode_modelica_string_literal(&tok.text)?);
-        Ok(tok)
+        let mut token: rumoca_core::Token = ast.string.clone().into();
+        token.text = std::sync::Arc::from(decode_modelica_string_literal(&token.text)?);
+        Ok(token)
     }
 }
 

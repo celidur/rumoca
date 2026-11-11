@@ -455,6 +455,16 @@ pub fn format_parse_error(err: &ParseError, source_name: &str, source: &str) -> 
     format!("{:?}", miette::Report::new(report))
 }
 
+/// Format parse errors with source context, one [`format_parse_error`] block
+/// per error.
+pub fn format_parse_errors(errors: &[ParseError], source_name: &str, source: &str) -> String {
+    errors
+        .iter()
+        .map(|error| format_parse_error(error, source_name, source))
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
