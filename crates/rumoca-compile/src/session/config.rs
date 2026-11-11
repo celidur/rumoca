@@ -1,3 +1,4 @@
+use rumoca_phase_flatten::ConnectorQuantityPolicy;
 use rumoca_phase_instantiate::{DEFAULT_INSTANTIATION_DEPTH_LIMIT, InstantiateOptions};
 use rumoca_phase_typecheck::UnitMetadataPolicy;
 use std::sync::Once;
@@ -13,6 +14,8 @@ pub struct SessionConfig {
     pub instantiation_depth_limit: usize,
     /// Policy for invalid `unit` and `displayUnit` metadata strings.
     pub unit_metadata_policy: UnitMetadataPolicy,
+    /// Policy for connector quantity mismatches during flattening.
+    pub connector_quantity_policy: ConnectorQuantityPolicy,
 }
 
 impl Default for SessionConfig {
@@ -21,6 +24,7 @@ impl Default for SessionConfig {
             parallel: false,
             instantiation_depth_limit: DEFAULT_INSTANTIATION_DEPTH_LIMIT,
             unit_metadata_policy: UnitMetadataPolicy::Strict,
+            connector_quantity_policy: ConnectorQuantityPolicy::Strict,
         }
     }
 }

@@ -1010,6 +1010,12 @@ pub(crate) fn process_class_instances_for_flatten(
     Ok(())
 }
 
+/// The connector quantity policy and the warnings it collects for one flatten.
+pub(crate) struct ConnectorQuantityCheck<'a> {
+    pub(crate) policy: crate::ConnectorQuantityPolicy,
+    pub(crate) warnings: &'a mut Vec<crate::ConnectorQuantityWarning>,
+}
+
 pub(crate) struct FinalizeFlatModelInput<'a, 'tree> {
     pub(crate) ctx: &'a mut Context,
     pub(crate) flat: &'a mut flat::Model,
@@ -1019,6 +1025,7 @@ pub(crate) struct FinalizeFlatModelInput<'a, 'tree> {
     pub(crate) model_name: &'a str,
     pub(crate) closure: &'a TargetClosure,
     pub(crate) options: FlattenOptions,
+    pub(crate) connector_quantity: ConnectorQuantityCheck<'a>,
     pub(crate) flatten_graph: &'a FlattenGraphData,
     pub(crate) component_override_map: &'a ComponentOverrideMap,
 }
@@ -1035,6 +1042,7 @@ pub(crate) fn finalize_flat_model(
         model_name,
         closure,
         options,
+        connector_quantity,
         flatten_graph,
         component_override_map,
     } = input;
@@ -1042,6 +1050,7 @@ pub(crate) fn finalize_flat_model(
         flat,
         overlay,
         options.strict_connection_validation,
+        connector_quantity,
         flatten_graph,
     )?;
 
@@ -1178,16 +1187,19 @@ fn finalize_flat_connections(
     flat: &mut flat::Model,
     overlay: &ast::InstanceOverlay,
     strict_connection_validation: bool,
+    connector_quantity: ConnectorQuantityCheck<'_>,
     flatten_graph: &FlattenGraphData,
 ) -> Result<(), FlattenError> {
     outer_refs::redirect_outer_refs(flat, &overlay.outer_prefix_to_inner);
     let connections_start = maybe_start_timer();
     let mut oc_forest =
         vcg::OverconstrainedEquationForest::new(flatten_graph.spanning_forest.clone());
-    let result = connections::process_connections(
+    let result = connections::process_connections_with_connector_quantity_policy(
         flat,
         overlay,
         strict_connection_validation,
+        connector_quantity.policy,
+        connector_quantity.warnings,
         &mut oc_forest,
     );
     maybe_record_connections_timing(connections_start);

@@ -27,13 +27,13 @@ impl Session {
         model_name: &str,
         cached: CachedCompileResult,
     ) -> PhaseResult {
-        // Cached compile results can outlive unrelated session revisions. Warm
-        // the target's typed-model artifact first so its structured metadata
-        // warnings are restored for the current requested compile as well.
-        let _ = self.typed_model_query_impl(tree, mode, model_name, false);
+        // Cached terminal results can outlive unrelated session revisions.
+        // Revisit the DAE query so typed and flatten warnings are restored
+        // from their phase-local artifacts, including for cached failures.
+        let refreshed = self.compile_phase_result_query(tree, mode, model_name);
         match cached {
             CachedCompileResult::Full(result) => result,
-            CachedCompileResult::Success => self.compile_phase_result_query(tree, mode, model_name),
+            CachedCompileResult::Success => refreshed,
         }
     }
 

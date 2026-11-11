@@ -15,7 +15,10 @@ use rumoca_ir_ast as ast;
 use rumoca_ir_dae as dae;
 use rumoca_ir_flat as flat;
 use rumoca_phase_dae::ToDaeError;
-use rumoca_phase_flatten::{FlattenError, FlattenOptions, TargetClosure, flatten_ref_in_closure};
+use rumoca_phase_flatten::{
+    ConnectorQuantityPolicy, FlattenError, FlattenOptions, TargetClosure,
+    flatten_ref_in_closure_with_connector_quantity_policy,
+};
 use rumoca_phase_instantiate::{
     InstantiateError, InstantiateOptions, InstantiateWarning, InstantiationOutcome,
     instantiate_model_with_outcome_options,
@@ -112,7 +115,7 @@ use compile_phase_timing::{maybe_record_compile_phase_timing, notify_compile_pha
 mod compile_support;
 use compile_support::{
     compile_model_dae_internal, compile_model_dae_internal_with_warnings, compile_model_internal,
-    compile_model_internal_with_options, compile_model_internal_with_options_and_unit_policy,
+    compile_model_internal_with_options, compile_model_internal_with_options_and_policies,
     compile_phase_result_from_dae, dae_model_outcome_from_flat, dae_phase_result_from_dae,
     diagnostics_from_vec, diagnostics_to_anyhow, finalize_strict_compile_report,
     finalize_strict_compile_report_from_uncached_targets, flat_model_outcome_from_typed,
@@ -363,6 +366,7 @@ impl FlatModelCacheKey {
 struct FlatModelArtifact {
     fingerprint: Fingerprint,
     outcome: FlatModelOutcome,
+    connector_quantity_warnings: Vec<CommonDiagnostic>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -423,6 +427,7 @@ impl DaeModelCacheKey {
 struct DaeModelArtifact {
     fingerprint: Fingerprint,
     outcome: DaeModelOutcome,
+    connector_quantity_warnings: Vec<CommonDiagnostic>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1915,9 +1920,12 @@ impl CompilationSummary {
 pub struct Session {
     instantiation_options: InstantiateOptions,
     unit_metadata_policy: UnitMetadataPolicy,
+    connector_quantity_policy: ConnectorQuantityPolicy,
     /// Warnings from the most recent typed-model query for each model. The
     /// typed cache also stores these per artifact so cache hits reproduce them.
     typecheck_warnings_by_model: IndexMap<String, Vec<CommonDiagnostic>>,
+    /// Flatten-phase warnings restored from flat/DAE artifacts on cache hits.
+    connector_quantity_warnings_by_model: IndexMap<String, Vec<CommonDiagnostic>>,
     structural_override_sources: Vec<StructuralOverrideSource>,
     documents: IndexMap<String, Arc<Document>>,
     detached_document_uris: IndexSet<String>,

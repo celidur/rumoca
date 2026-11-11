@@ -53,7 +53,9 @@ impl Session {
         Self {
             instantiation_options: config.instantiate_options(),
             unit_metadata_policy: config.unit_metadata_policy,
+            connector_quantity_policy: config.connector_quantity_policy,
             typecheck_warnings_by_model: IndexMap::new(),
+            connector_quantity_warnings_by_model: IndexMap::new(),
             structural_override_sources: Vec::new(),
             documents: IndexMap::new(),
             detached_document_uris: IndexSet::new(),
@@ -83,6 +85,15 @@ impl Session {
     /// served from the typed-model cache.
     pub fn typecheck_warnings(&self, model_name: &str) -> &[CommonDiagnostic] {
         self.typecheck_warnings_by_model
+            .get(model_name)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// Return connector quantity compatibility warnings from the most recent
+    /// flatten query for `model_name`, including warnings restored from cache.
+    pub fn connector_quantity_warnings(&self, model_name: &str) -> &[CommonDiagnostic] {
+        self.connector_quantity_warnings_by_model
             .get(model_name)
             .map(Vec::as_slice)
             .unwrap_or(&[])
@@ -142,6 +153,7 @@ impl Session {
     pub(crate) fn bump_revision(&mut self) -> RevisionId {
         self.sync_query_state_from_snapshots();
         self.typecheck_warnings_by_model.clear();
+        self.connector_quantity_warnings_by_model.clear();
         self.source_root_indexing.read_prewarm_session_revision = None;
         self.next_revision = self.next_revision.saturating_add(1);
         let revision = RevisionId::new(self.next_revision);

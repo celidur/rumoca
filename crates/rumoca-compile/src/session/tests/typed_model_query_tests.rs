@@ -157,6 +157,182 @@ fn session_exposes_unit_warnings_even_when_other_type_errors_fail_compile() {
     assert_eq!(warnings[0].code.as_deref(), Some("ET010"));
 }
 
+const CONNECTOR_QUANTITY_SOURCE: &str = r#"connector LeftPin
+  Real v(quantity="ElectricPotential", unit="V");
+  flow Real i(quantity="ElectricCurrent", unit="A");
+end LeftPin;
+connector RightPin
+  Real v(quantity="Voltage", unit="V");
+  flow Real i(quantity="ElectricCurrent", unit="A");
+end RightPin;
+connector FlowPin
+  Real v(quantity="Potential");
+  flow Real i(quantity="Current");
+end FlowPin;
+connector NotFlowPin
+  Real v(quantity="Potential");
+  Real i(quantity="Current");
+end NotFlowPin;
+model IdealSource
+  LeftPin p;
+equation
+  p.v = 10;
+end IdealSource;
+model Resistor
+  parameter Real R = 1;
+  RightPin p;
+equation
+  p.v = R * p.i;
+end Resistor;
+model QuantityMismatch
+  IdealSource source;
+  Resistor load;
+equation
+  connect(source.p, load.p);
+end QuantityMismatch;
+model LaterFailure
+  LeftPin first_a;
+  RightPin first_b;
+  FlowPin second_a;
+  NotFlowPin second_b;
+equation
+  connect(first_a, first_b);
+  connect(second_a, second_b);
+end LaterFailure;
+"#;
+
+fn connector_quantity_warning_session() -> Session {
+    let mut session = Session::new(SessionConfig {
+        connector_quantity_policy: ConnectorQuantityPolicy::Warn,
+        ..SessionConfig::default()
+    });
+    session
+        .add_document("connector-quantity-warning.mo", CONNECTOR_QUANTITY_SOURCE)
+        .expect("source should parse");
+    session
+}
+
+fn compile_succeeds_with_connector_warnings(session: &mut Session, warnings: usize) {
+    let result = session
+        .compile_model_phases("QuantityMismatch")
+        .expect("compile should return a phase result");
+    assert!(matches!(result, PhaseResult::Success(_)), "{result:?}");
+    assert_eq!(
+        session
+            .connector_quantity_warnings("QuantityMismatch")
+            .len(),
+        warnings
+    );
+}
+
+#[test]
+fn connector_quantity_warnings_survive_phase_caches_and_uncached_queries() {
+    let mut session = connector_quantity_warning_session();
+    compile_succeeds_with_connector_warnings(&mut session, 1);
+    assert_eq!(
+        session.connector_quantity_warnings("QuantityMismatch")[0]
+            .code
+            .as_deref(),
+        Some("rumoca::flatten::EF036")
+    );
+
+    session
+        .add_document(
+            "unrelated-warning-cache.mo",
+            "model Unrelated end Unrelated;",
+        )
+        .expect("unrelated source should parse");
+    compile_succeeds_with_connector_warnings(&mut session, 1);
+
+    // Evict terminal compile only to exercise the cached DAE restoration path.
+    evict_compile_result(&mut session, "QuantityMismatch");
+    compile_succeeds_with_connector_warnings(&mut session, 1);
+
+    // Evict DAE and terminal results to restore from the cached flat artifact.
+    evict_compile_result(&mut session, "QuantityMismatch");
+    let dae_key = standard_dae_cache_key(&mut session, "QuantityMismatch");
+    session.query_state.dae.dae_models.shift_remove(&dae_key);
+    compile_succeeds_with_connector_warnings(&mut session, 1);
+
+    // Evict the flat and later artifacts, leaving the typed artifact warm.
+    evict_compile_result(&mut session, "QuantityMismatch");
+    let dae_key = standard_dae_cache_key(&mut session, "QuantityMismatch");
+    session.query_state.dae.dae_models.shift_remove(&dae_key);
+    evict_flat_model(&mut session, "QuantityMismatch");
+    compile_succeeds_with_connector_warnings(&mut session, 1);
+
+    let uncached_dae = session
+        .compile_model_dae_strict_reachable_uncached_with_recovery_detailed("QuantityMismatch");
+    assert!(uncached_dae.is_ok(), "{uncached_dae:?}");
+    assert_eq!(
+        session
+            .connector_quantity_warnings("QuantityMismatch")
+            .len(),
+        1
+    );
+    let uncached_strict =
+        session.compile_model_strict_reachable_uncached_with_recovery("QuantityMismatch");
+    assert!(uncached_strict.requested_succeeded());
+    assert_eq!(
+        session
+            .connector_quantity_warnings("QuantityMismatch")
+            .len(),
+        1
+    );
+
+    assert!(
+        session
+            .update_document(
+                "connector-quantity-warning.mo",
+                &CONNECTOR_QUANTITY_SOURCE.replace("Voltage", "ElectricPotential"),
+            )
+            .is_none()
+    );
+    compile_succeeds_with_connector_warnings(&mut session, 0);
+}
+
+#[test]
+fn connector_quantity_warnings_survive_later_flatten_errors() {
+    let mut session = connector_quantity_warning_session();
+    let first_failure = session
+        .compile_model_phases("LaterFailure")
+        .expect("flatten error is a structured phase result");
+    assert!(matches!(
+        first_failure,
+        PhaseResult::Failed {
+            phase: FailedPhase::Flatten,
+            ..
+        }
+    ));
+    assert_eq!(
+        session.connector_quantity_warnings("LaterFailure").len(),
+        1,
+        "a later fatal flow mismatch must not discard an earlier quantity warning"
+    );
+
+    session
+        .add_document(
+            "another-unrelated-warning-cache.mo",
+            "model Other end Other;",
+        )
+        .expect("another unrelated source should parse");
+    let cached_failure = session
+        .compile_model_phases("LaterFailure")
+        .expect("cached flatten error is a structured phase result");
+    assert!(matches!(
+        cached_failure,
+        PhaseResult::Failed {
+            phase: FailedPhase::Flatten,
+            ..
+        }
+    ));
+    assert_eq!(
+        session.connector_quantity_warnings("LaterFailure").len(),
+        1,
+        "terminal failure cache hits restore warnings from the DAE artifact"
+    );
+}
+
 fn assert_typecheck_failure(result: PhaseResult, expected_code: &str) {
     match result {
         PhaseResult::Failed {

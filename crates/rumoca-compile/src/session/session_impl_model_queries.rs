@@ -321,7 +321,7 @@ impl Session {
         model_key: &ModelKey,
         mode: ResolveBuildMode,
         fingerprint: Fingerprint,
-    ) -> Option<FlatModelOutcome> {
+    ) -> Option<(FlatModelOutcome, Vec<CommonDiagnostic>)> {
         let key = FlatModelCacheKey::new(model_key.clone(), mode);
         let artifact = self
             .query_state
@@ -330,7 +330,10 @@ impl Session {
             .artifacts
             .shift_remove(&key)?;
         let is_hit = artifact.fingerprint == fingerprint;
-        let outcome = artifact.outcome.clone();
+        let outcome = (
+            artifact.outcome.clone(),
+            artifact.connector_quantity_warnings.clone(),
+        );
         self.query_state
             .flat
             .flat_models
@@ -345,6 +348,7 @@ impl Session {
         mode: ResolveBuildMode,
         fingerprint: Fingerprint,
         outcome: FlatModelOutcome,
+        connector_quantity_warnings: Vec<CommonDiagnostic>,
     ) {
         let key = FlatModelCacheKey::new(model_key, mode);
         self.query_state
@@ -357,6 +361,7 @@ impl Session {
             FlatModelArtifact {
                 fingerprint,
                 outcome,
+                connector_quantity_warnings,
             },
         );
         Self::trim_lru_cache(
@@ -381,20 +386,32 @@ impl Session {
                 None
             };
             let closure = self.reachable_model_closure_query(tree, mode, model_name);
-            let (flat, flattened_built) =
-                flat_model_outcome_from_typed(tree, model_name, &closure, typed);
+            let (flat, flattened_built, connector_quantity_warnings) =
+                flat_model_outcome_from_typed(
+                    tree,
+                    model_name,
+                    &closure,
+                    typed,
+                    self.connector_quantity_policy,
+                );
             if record_compile_timings && flattened_built {
                 maybe_record_compile_phase_timing(FailedPhase::Flatten, flatten_started);
             }
             if flattened_built {
                 record_flat_model_build();
             }
+            self.connector_quantity_warnings_by_model
+                .insert(model_name.to_string(), connector_quantity_warnings);
             return flat;
         };
 
         let fingerprint = self.model_dependency_fingerprint(tree, mode, model_name);
-        if let Some(cached) = self.cached_flat_model(&model_key, mode, fingerprint) {
+        if let Some((cached, connector_quantity_warnings)) =
+            self.cached_flat_model(&model_key, mode, fingerprint)
+        {
             record_flat_model_cache_hit();
+            self.connector_quantity_warnings_by_model
+                .insert(model_name.to_string(), connector_quantity_warnings);
             // A flat artifact can be reused after the session warning view
             // was cleared by an unrelated input revision. Restore the typed
             // artifact's structured warnings independently of the flat hit.
@@ -410,8 +427,13 @@ impl Session {
             None
         };
         let closure = self.reachable_model_closure_query(tree, mode, model_name);
-        let (flat, flattened_built) =
-            flat_model_outcome_from_typed(tree, model_name, &closure, typed);
+        let (flat, flattened_built, connector_quantity_warnings) = flat_model_outcome_from_typed(
+            tree,
+            model_name,
+            &closure,
+            typed,
+            self.connector_quantity_policy,
+        );
         if record_compile_timings && flattened_built {
             maybe_record_compile_phase_timing(FailedPhase::Flatten, flatten_started);
         }
@@ -419,7 +441,15 @@ impl Session {
             record_flat_model_build();
         }
 
-        self.insert_flat_model(model_key, mode, fingerprint, flat.clone());
+        self.connector_quantity_warnings_by_model
+            .insert(model_name.to_string(), connector_quantity_warnings.clone());
+        self.insert_flat_model(
+            model_key,
+            mode,
+            fingerprint,
+            flat.clone(),
+            connector_quantity_warnings,
+        );
         flat
     }
 
@@ -428,11 +458,14 @@ impl Session {
         model_key: &ModelKey,
         mode: ResolveBuildMode,
         fingerprint: Fingerprint,
-    ) -> Option<DaeModelOutcome> {
+    ) -> Option<(DaeModelOutcome, Vec<CommonDiagnostic>)> {
         let key = DaeModelCacheKey::new(model_key.clone(), mode);
         let artifact = self.query_state.dae.dae_models.shift_remove(&key)?;
         let is_hit = artifact.fingerprint == fingerprint;
-        let outcome = artifact.outcome.clone();
+        let outcome = (
+            artifact.outcome.clone(),
+            artifact.connector_quantity_warnings.clone(),
+        );
         self.query_state.dae.dae_models.insert(key, artifact);
         is_hit.then_some(outcome)
     }
@@ -443,6 +476,7 @@ impl Session {
         mode: ResolveBuildMode,
         fingerprint: Fingerprint,
         outcome: DaeModelOutcome,
+        connector_quantity_warnings: Vec<CommonDiagnostic>,
     ) {
         let key = DaeModelCacheKey::new(model_key, mode);
         self.query_state.dae.dae_models.shift_remove(&key);
@@ -451,6 +485,7 @@ impl Session {
             DaeModelArtifact {
                 fingerprint,
                 outcome,
+                connector_quantity_warnings,
             },
         );
         Self::trim_lru_cache(
@@ -485,8 +520,12 @@ impl Session {
         };
 
         let fingerprint = self.model_dependency_fingerprint(tree, mode, model_name);
-        if let Some(cached) = self.cached_dae_model(&model_key, mode, fingerprint) {
+        if let Some((cached, connector_quantity_warnings)) =
+            self.cached_dae_model(&model_key, mode, fingerprint)
+        {
             record_dae_model_cache_hit();
+            self.connector_quantity_warnings_by_model
+                .insert(model_name.to_string(), connector_quantity_warnings);
             // DAE cache hits bypass both the flat and typed query paths. Warm
             // the typed artifact so warnings are present after this compile.
             let _ = self.typed_model_query_impl(tree, mode, model_name, false);
@@ -495,6 +534,11 @@ impl Session {
 
         record_dae_model_cache_miss();
         let flat = self.flat_model_query_impl(tree, mode, model_name, record_compile_timings);
+        let connector_quantity_warnings = self
+            .connector_quantity_warnings_by_model
+            .get(model_name)
+            .cloned()
+            .unwrap_or_default();
         let todae_started = if record_compile_timings {
             maybe_start_timer()
         } else {
@@ -508,7 +552,13 @@ impl Session {
             record_dae_model_build();
         }
 
-        self.insert_dae_model(model_key, mode, fingerprint, dae.clone());
+        self.insert_dae_model(
+            model_key,
+            mode,
+            fingerprint,
+            dae.clone(),
+            connector_quantity_warnings,
+        );
         dae
     }
 

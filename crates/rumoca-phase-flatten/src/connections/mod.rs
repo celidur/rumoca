@@ -97,8 +97,12 @@ mod member_pairing;
 mod path_index;
 mod stream_operators;
 use endpoint_subscripts::*;
+#[cfg(test)]
+use equation_generation::process_connections;
 use equation_generation::*;
-pub(crate) use equation_generation::{connection_involves_disabled, process_connections};
+pub(crate) use equation_generation::{
+    connection_involves_disabled, process_connections_with_connector_quantity_policy,
+};
 use member_pairing::{
     MemberPairing, classify_connection_member_pair, connection_member_declaration,
 };
@@ -581,6 +585,8 @@ fn validate_connections(
     type_roots: &IndexMap<TypeId, TypeId>,
     prefix_children: &FxHashMap<String, Vec<rumoca_core::VarName>>,
     var_index: &ConnectionVarIndex,
+    connector_quantity_policy: crate::ConnectorQuantityPolicy,
+    connector_quantity_warnings: &mut Vec<crate::ConnectorQuantityWarning>,
 ) -> Result<(), FlattenError> {
     for conn in connections {
         let path_a = conn.a.to_flat_string();
@@ -605,7 +611,14 @@ fn validate_connections(
 
             // Validate array dimension compatibility (CONN-008)
             validate_dimension_compatibility(flat, &var_a, &var_b, span)?;
-            validate_quantity_compatibility(flat, &var_a, &var_b, span)?;
+            validate_quantity_compatibility(
+                flat,
+                &var_a,
+                &var_b,
+                span,
+                connector_quantity_policy,
+                connector_quantity_warnings,
+            )?;
             continue;
         }
 
@@ -613,15 +626,17 @@ fn validate_connections(
         let subs_a = find_sub_variables_indexed(&path_a, prefix_children, var_index);
         let subs_b = find_sub_variables_indexed(&path_b, prefix_children, var_index);
         if !subs_a.is_empty() && !subs_b.is_empty() {
-            let ctx = ExpandedValidationCtx {
+            let mut ctx = ExpandedValidationCtx {
                 path_a: &path_a,
                 path_b: &path_b,
                 flat,
                 type_roots,
                 span,
                 var_index,
+                connector_quantity_policy,
+                connector_quantity_warnings,
             };
-            validate_expanded_connector_connection(&subs_a, &subs_b, &ctx)?;
+            validate_expanded_connector_connection(&subs_a, &subs_b, &mut ctx)?;
         }
     }
     Ok(())
@@ -633,6 +648,8 @@ struct ValidationVarInfo {
     type_id: TypeId,
     dims: Vec<i64>,
     quantity: Option<String>,
+    unit: Option<String>,
+    source_span: Span,
 }
 
 struct ExpandedValidationCtx<'a> {
@@ -642,6 +659,8 @@ struct ExpandedValidationCtx<'a> {
     type_roots: &'a IndexMap<TypeId, TypeId>,
     span: Span,
     var_index: &'a ConnectionVarIndex,
+    connector_quantity_policy: crate::ConnectorQuantityPolicy,
+    connector_quantity_warnings: &'a mut Vec<crate::ConnectorQuantityWarning>,
 }
 
 fn get_validation_var_info(
@@ -654,6 +673,8 @@ fn get_validation_var_info(
             type_id: v.type_id,
             dims: v.dims.clone(),
             quantity: v.quantity.clone(),
+            unit: v.unit.clone(),
+            source_span: v.source_span,
         });
     }
 
@@ -670,6 +691,8 @@ fn get_validation_var_info(
         // scalar counts from drifting apart.
         dims: connection_endpoint_dims(flat, var)?,
         quantity: base_var.quantity.clone(),
+        unit: base_var.unit.clone(),
+        source_span: base_var.source_span,
     })
 }
 
@@ -719,19 +742,42 @@ fn validate_quantity_compatibility(
     var_a: &rumoca_core::VarName,
     var_b: &rumoca_core::VarName,
     span: Span,
+    connector_quantity_policy: crate::ConnectorQuantityPolicy,
+    connector_quantity_warnings: &mut Vec<crate::ConnectorQuantityWarning>,
 ) -> Result<(), FlattenError> {
-    let quantity_a = get_validation_var_info(flat, var_a).and_then(|v| v.quantity);
-    let quantity_b = get_validation_var_info(flat, var_b).and_then(|v| v.quantity);
-    if let (Some(qa), Some(qb)) = (&quantity_a, &quantity_b)
+    let info_a = get_validation_var_info(flat, var_a);
+    let info_b = get_validation_var_info(flat, var_b);
+    let quantity_a = info_a.as_ref().and_then(|v| v.quantity.as_ref());
+    let quantity_b = info_b.as_ref().and_then(|v| v.quantity.as_ref());
+    if let (Some(qa), Some(qb)) = (quantity_a, quantity_b)
         && !qa.is_empty()
         && !qb.is_empty()
         && qa != qb
     {
-        return Err(FlattenError::incompatible_connectors(
-            format!("{} (quantity: {qa})", var_a.as_str()),
-            format!("{} (quantity: {qb})", var_b.as_str()),
-            span,
-        ));
+        match connector_quantity_policy {
+            crate::ConnectorQuantityPolicy::Strict => {
+                return Err(FlattenError::incompatible_connectors(
+                    format!("{} (quantity: {qa})", var_a.as_str()),
+                    format!("{} (quantity: {qb})", var_b.as_str()),
+                    span,
+                ));
+            }
+            crate::ConnectorQuantityPolicy::Warn => {
+                if let (Some(info_a), Some(info_b)) = (&info_a, &info_b) {
+                    connector_quantity_warnings.push(crate::ConnectorQuantityWarning {
+                        variable_a: var_a.as_str().to_string(),
+                        variable_b: var_b.as_str().to_string(),
+                        quantity_a: qa.clone(),
+                        quantity_b: qb.clone(),
+                        unit_a: info_a.unit.clone(),
+                        unit_b: info_b.unit.clone(),
+                        connection_span: span,
+                        declaration_span_a: info_a.source_span,
+                        declaration_span_b: info_b.source_span,
+                    });
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -807,7 +853,7 @@ fn validate_dimension_compatibility(
 fn validate_expanded_connector_connection(
     subs_a: &[rumoca_core::VarName],
     subs_b: &[rumoca_core::VarName],
-    ctx: &ExpandedValidationCtx<'_>,
+    ctx: &mut ExpandedValidationCtx<'_>,
 ) -> Result<(), FlattenError> {
     let sub_match_index = ConnectionSubMatchIndex::new(ctx.path_b, subs_b, ctx.var_index);
 
@@ -826,7 +872,14 @@ fn validate_expanded_connector_connection(
         validate_flow_consistency(ctx.flat, sub_a, &var_b_match, ctx.span)?;
         validate_type_compatibility(ctx.flat, ctx.type_roots, sub_a, &var_b_match, ctx.span)?;
         validate_dimension_compatibility(ctx.flat, sub_a, &var_b_match, ctx.span)?;
-        validate_quantity_compatibility(ctx.flat, sub_a, &var_b_match, ctx.span)?;
+        validate_quantity_compatibility(
+            ctx.flat,
+            sub_a,
+            &var_b_match,
+            ctx.span,
+            ctx.connector_quantity_policy,
+            ctx.connector_quantity_warnings,
+        )?;
     }
     Ok(())
 }

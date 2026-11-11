@@ -73,7 +73,7 @@ use std::time::Duration;
 
 use indexmap::IndexMap;
 use rumoca_core::{ExpressionVisitor, Reference};
-use rumoca_core::{OptionalTimer, maybe_elapsed_duration, maybe_start_timer};
+use rumoca_core::{OptionalTimer, Span, maybe_elapsed_duration, maybe_start_timer};
 use rumoca_ir_ast as ast;
 use rumoca_ir_flat as flat;
 
@@ -143,6 +143,62 @@ pub struct FlattenOptions {
     /// `true` forces full materialization -- retained as a debug toggle, which also
     /// exercises the corner-vs-full equivalence assertions.
     pub materialize_structured_families: bool,
+}
+
+/// Policy for mismatched non-empty connector quantity metadata.
+///
+/// The default and all existing flatten entry points remain strict. The
+/// warning mode is available only through the explicit policy-aware entry
+/// point, which returns its diagnostics alongside either a flat model or a
+/// later flatten failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectorQuantityPolicy {
+    Strict,
+    Warn,
+}
+
+/// Structured source-backed warning for one connector quantity mismatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectorQuantityWarning {
+    pub variable_a: String,
+    pub variable_b: String,
+    pub quantity_a: String,
+    pub quantity_b: String,
+    pub unit_a: Option<String>,
+    pub unit_b: Option<String>,
+    pub connection_span: Span,
+    pub declaration_span_a: Span,
+    pub declaration_span_b: Span,
+}
+
+impl ConnectorQuantityWarning {
+    /// Stable flatten diagnostic code for a tolerated quantity mismatch.
+    pub const CODE: &'static str = "rumoca::flatten::EF036";
+
+    /// Convert this structured warning to the generic phase diagnostic shape.
+    pub fn diagnostic(&self) -> rumoca_core::Diagnostic {
+        let unit_a = self.unit_a.as_deref().unwrap_or("<unspecified>");
+        let unit_b = self.unit_b.as_deref().unwrap_or("<unspecified>");
+        let mut diagnostic = rumoca_core::Diagnostic::warning(
+            Self::CODE,
+            "connected variables have different non-empty quantity metadata; accepted by connector quantity policy 'warn'",
+            rumoca_core::PrimaryLabel::new(self.connection_span)
+                .with_message("connector quantity mismatch accepted by explicit warning policy"),
+        );
+        diagnostic.labels.push(
+            rumoca_core::Label::secondary(self.declaration_span_a).with_message(format!(
+                "{}: quantity={} unit={unit_a}",
+                self.variable_a, self.quantity_a
+            )),
+        );
+        diagnostic.labels.push(
+            rumoca_core::Label::secondary(self.declaration_span_b).with_message(format!(
+                "{}: quantity={} unit={unit_b}",
+                self.variable_b, self.quantity_b
+            )),
+        );
+        diagnostic
+    }
 }
 
 impl Default for FlattenOptions {
@@ -367,6 +423,77 @@ pub fn flatten_ref_in_closure(
     options: FlattenOptions,
     closure: &TargetClosure,
 ) -> Result<flat::Model, FlattenError> {
+    flatten_ref_in_closure_with_connector_quantity_policy(
+        tree,
+        overlay,
+        model_name,
+        options,
+        closure,
+        ConnectorQuantityPolicy::Strict,
+    )
+    .0
+}
+
+/// Flatten the whole tree with an explicit connector quantity compatibility
+/// policy.
+///
+/// Warnings are returned even when flattening later fails, so callers can
+/// report compatibility diagnostics without hiding other connection gates.
+pub fn flatten_ref_with_connector_quantity_policy(
+    tree: &ast::ClassTree,
+    overlay: &ast::InstanceOverlay,
+    model_name: &str,
+    options: FlattenOptions,
+    connector_quantity_policy: ConnectorQuantityPolicy,
+) -> (
+    Result<flat::Model, FlattenError>,
+    Vec<ConnectorQuantityWarning>,
+) {
+    flatten_ref_in_closure_with_connector_quantity_policy(
+        tree,
+        overlay,
+        model_name,
+        options,
+        &TargetClosure::whole_tree(),
+        connector_quantity_policy,
+    )
+}
+
+/// [`flatten_ref_in_closure`] with an explicit connector quantity
+/// compatibility policy; see [`flatten_ref_with_connector_quantity_policy`].
+pub fn flatten_ref_in_closure_with_connector_quantity_policy(
+    tree: &ast::ClassTree,
+    overlay: &ast::InstanceOverlay,
+    model_name: &str,
+    options: FlattenOptions,
+    closure: &TargetClosure,
+    connector_quantity_policy: ConnectorQuantityPolicy,
+) -> (
+    Result<flat::Model, FlattenError>,
+    Vec<ConnectorQuantityWarning>,
+) {
+    let mut connector_quantity_warnings = Vec::new();
+    let result = flatten_ref_with_connector_quantity_policy_and_warnings(
+        tree,
+        overlay,
+        model_name,
+        options,
+        closure,
+        connector_quantity_policy,
+        &mut connector_quantity_warnings,
+    );
+    (result, connector_quantity_warnings)
+}
+
+fn flatten_ref_with_connector_quantity_policy_and_warnings(
+    tree: &ast::ClassTree,
+    overlay: &ast::InstanceOverlay,
+    model_name: &str,
+    options: FlattenOptions,
+    closure: &TargetClosure,
+    connector_quantity_policy: ConnectorQuantityPolicy,
+    connector_quantity_warnings: &mut Vec<ConnectorQuantityWarning>,
+) -> Result<flat::Model, FlattenError> {
     let mut ctx = Context::new();
     ctx.declared_dimensions = std::sync::Arc::new(
         rumoca_eval_ast::eval::DeclaredDimensions::from_instanced(tree, overlay),
@@ -447,6 +574,10 @@ pub fn flatten_ref_in_closure(
         model_name,
         closure,
         options,
+        connector_quantity: ConnectorQuantityCheck {
+            policy: connector_quantity_policy,
+            warnings: connector_quantity_warnings,
+        },
         flatten_graph: &flatten_graph,
         component_override_map: &component_override_map,
     })?;

@@ -852,10 +852,30 @@ pub(super) fn build_prefix_children(
     children
 }
 
+#[cfg(test)]
 pub(crate) fn process_connections(
     flat: &mut flat::Model,
     overlay: &ast::InstanceOverlay,
     strict_validation: bool,
+    oc_forest: &mut crate::vcg::OverconstrainedEquationForest,
+) -> Result<(), FlattenError> {
+    let mut warnings = Vec::new();
+    process_connections_with_connector_quantity_policy(
+        flat,
+        overlay,
+        strict_validation,
+        crate::ConnectorQuantityPolicy::Strict,
+        &mut warnings,
+        oc_forest,
+    )
+}
+
+pub(crate) fn process_connections_with_connector_quantity_policy(
+    flat: &mut flat::Model,
+    overlay: &ast::InstanceOverlay,
+    strict_validation: bool,
+    connector_quantity_policy: crate::ConnectorQuantityPolicy,
+    connector_quantity_warnings: &mut Vec<crate::ConnectorQuantityWarning>,
     oc_forest: &mut crate::vcg::OverconstrainedEquationForest,
 ) -> Result<(), FlattenError> {
     // Build prefix-to-children index once for O(1) sub-variable lookups
@@ -920,6 +940,8 @@ pub(crate) fn process_connections(
             &overlay.type_roots,
             &prefix_children,
             &var_index,
+            connector_quantity_policy,
+            connector_quantity_warnings,
         )?;
     }
 

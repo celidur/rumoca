@@ -84,7 +84,9 @@ impl Session {
         Session {
             instantiation_options: self.instantiation_options.clone(),
             unit_metadata_policy: self.unit_metadata_policy,
+            connector_quantity_policy: self.connector_quantity_policy,
             typecheck_warnings_by_model: self.typecheck_warnings_by_model.clone(),
+            connector_quantity_warnings_by_model: self.connector_quantity_warnings_by_model.clone(),
             structural_override_sources: self.structural_override_sources.clone(),
             documents,
             detached_document_uris,
@@ -283,7 +285,9 @@ impl Session {
         let snapshot = Session {
             instantiation_options: self.instantiation_options.clone(),
             unit_metadata_policy: self.unit_metadata_policy,
+            connector_quantity_policy: self.connector_quantity_policy,
             typecheck_warnings_by_model: self.typecheck_warnings_by_model.clone(),
+            connector_quantity_warnings_by_model: self.connector_quantity_warnings_by_model.clone(),
             structural_override_sources: self.structural_override_sources.clone(),
             documents: self.documents.clone(),
             detached_document_uris: self.detached_document_uris.clone(),
@@ -374,7 +378,9 @@ impl Session {
         let snapshot = Session {
             instantiation_options: self.instantiation_options.clone(),
             unit_metadata_policy: self.unit_metadata_policy,
+            connector_quantity_policy: self.connector_quantity_policy,
             typecheck_warnings_by_model: self.typecheck_warnings_by_model.clone(),
+            connector_quantity_warnings_by_model: self.connector_quantity_warnings_by_model.clone(),
             structural_override_sources: self.structural_override_sources.clone(),
             documents: detached_documents,
             detached_document_uris: self.detached_document_uris.clone(),
@@ -444,7 +450,9 @@ impl Session {
         let snapshot = Session {
             instantiation_options: self.instantiation_options.clone(),
             unit_metadata_policy: self.unit_metadata_policy,
+            connector_quantity_policy: self.connector_quantity_policy,
             typecheck_warnings_by_model: self.typecheck_warnings_by_model.clone(),
+            connector_quantity_warnings_by_model: self.connector_quantity_warnings_by_model.clone(),
             structural_override_sources: self.structural_override_sources.clone(),
             documents,
             detached_document_uris: self.detached_document_uris.clone(),
