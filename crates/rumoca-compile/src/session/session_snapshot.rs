@@ -83,6 +83,8 @@ impl Session {
             fresh_session_snapshot_caches();
         Session {
             instantiation_options: self.instantiation_options.clone(),
+            unit_metadata_policy: self.unit_metadata_policy,
+            typecheck_warnings_by_model: self.typecheck_warnings_by_model.clone(),
             structural_override_sources: self.structural_override_sources.clone(),
             documents,
             detached_document_uris,
@@ -280,6 +282,8 @@ impl Session {
             fresh_session_snapshot_caches();
         let snapshot = Session {
             instantiation_options: self.instantiation_options.clone(),
+            unit_metadata_policy: self.unit_metadata_policy,
+            typecheck_warnings_by_model: self.typecheck_warnings_by_model.clone(),
             structural_override_sources: self.structural_override_sources.clone(),
             documents: self.documents.clone(),
             detached_document_uris: self.detached_document_uris.clone(),
@@ -369,6 +373,8 @@ impl Session {
             fresh_session_snapshot_caches();
         let snapshot = Session {
             instantiation_options: self.instantiation_options.clone(),
+            unit_metadata_policy: self.unit_metadata_policy,
+            typecheck_warnings_by_model: self.typecheck_warnings_by_model.clone(),
             structural_override_sources: self.structural_override_sources.clone(),
             documents: detached_documents,
             detached_document_uris: self.detached_document_uris.clone(),
@@ -437,6 +443,8 @@ impl Session {
             fresh_session_snapshot_caches();
         let snapshot = Session {
             instantiation_options: self.instantiation_options.clone(),
+            unit_metadata_policy: self.unit_metadata_policy,
+            typecheck_warnings_by_model: self.typecheck_warnings_by_model.clone(),
             structural_override_sources: self.structural_override_sources.clone(),
             documents,
             detached_document_uris: self.detached_document_uris.clone(),

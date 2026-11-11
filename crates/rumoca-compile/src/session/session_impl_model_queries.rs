@@ -170,7 +170,7 @@ impl Session {
         model_key: &ModelKey,
         mode: ResolveBuildMode,
         fingerprint: Fingerprint,
-    ) -> Option<TypedModelOutcome> {
+    ) -> Option<(TypedModelOutcome, Vec<CommonDiagnostic>)> {
         let key = TypedModelCacheKey::new(model_key.clone(), mode);
         let artifact = self
             .query_state
@@ -179,7 +179,10 @@ impl Session {
             .artifacts
             .shift_remove(&key)?;
         let is_hit = artifact.fingerprint == fingerprint;
-        let outcome = artifact.outcome.clone();
+        let outcome = (
+            artifact.outcome.clone(),
+            artifact.unit_metadata_warnings.clone(),
+        );
         self.query_state
             .flat
             .typed_models
@@ -194,6 +197,7 @@ impl Session {
         mode: ResolveBuildMode,
         fingerprint: Fingerprint,
         outcome: TypedModelOutcome,
+        unit_metadata_warnings: Vec<CommonDiagnostic>,
     ) {
         let key = TypedModelCacheKey::new(model_key, mode);
         self.query_state
@@ -206,6 +210,7 @@ impl Session {
             TypedModelArtifact {
                 fingerprint,
                 outcome,
+                unit_metadata_warnings,
             },
         );
         Self::trim_lru_cache(
@@ -214,7 +219,7 @@ impl Session {
         );
     }
 
-    fn typed_model_query_impl(
+    pub(super) fn typed_model_query_impl(
         &mut self,
         tree: &ast::ClassTree,
         mode: ResolveBuildMode,
@@ -240,20 +245,28 @@ impl Session {
             } else {
                 None
             };
-            let (typed, typechecked_built) =
-                typed_model_outcome_from_instantiated(tree, model_name, instantiated);
+            let (typed, typechecked_built, warnings) = typed_model_outcome_from_instantiated(
+                tree,
+                model_name,
+                instantiated,
+                self.unit_metadata_policy,
+            );
             if record_compile_timings && typechecked_built {
                 maybe_record_compile_phase_timing(FailedPhase::Typecheck, typecheck_started);
             }
             if typechecked_built {
                 record_typed_model_build();
             }
+            self.typecheck_warnings_by_model
+                .insert(model_name.to_string(), warnings);
             return typed;
         };
 
         let fingerprint = self.model_dependency_fingerprint(tree, mode, model_name);
-        if let Some(cached) = self.cached_typed_model(&model_key, mode, fingerprint) {
+        if let Some((cached, warnings)) = self.cached_typed_model(&model_key, mode, fingerprint) {
             record_typed_model_cache_hit();
+            self.typecheck_warnings_by_model
+                .insert(model_name.to_string(), warnings);
             return cached;
         }
 
@@ -269,8 +282,12 @@ impl Session {
         } else {
             None
         };
-        let (typed, typechecked_built) =
-            typed_model_outcome_from_instantiated(tree, model_name, instantiated);
+        let (typed, typechecked_built, warnings) = typed_model_outcome_from_instantiated(
+            tree,
+            model_name,
+            instantiated,
+            self.unit_metadata_policy,
+        );
         if record_compile_timings && typechecked_built {
             maybe_record_compile_phase_timing(FailedPhase::Typecheck, typecheck_started);
         }
@@ -278,7 +295,15 @@ impl Session {
             record_typed_model_build();
         }
 
-        self.insert_typed_model(model_key, mode, fingerprint, typed.clone());
+        self.insert_typed_model(
+            model_key,
+            mode,
+            fingerprint,
+            typed.clone(),
+            warnings.clone(),
+        );
+        self.typecheck_warnings_by_model
+            .insert(model_name.to_string(), warnings);
         typed
     }
 
@@ -370,6 +395,10 @@ impl Session {
         let fingerprint = self.model_dependency_fingerprint(tree, mode, model_name);
         if let Some(cached) = self.cached_flat_model(&model_key, mode, fingerprint) {
             record_flat_model_cache_hit();
+            // A flat artifact can be reused after the session warning view
+            // was cleared by an unrelated input revision. Restore the typed
+            // artifact's structured warnings independently of the flat hit.
+            let _ = self.typed_model_query_impl(tree, mode, model_name, false);
             return cached;
         }
 
@@ -458,6 +487,9 @@ impl Session {
         let fingerprint = self.model_dependency_fingerprint(tree, mode, model_name);
         if let Some(cached) = self.cached_dae_model(&model_key, mode, fingerprint) {
             record_dae_model_cache_hit();
+            // DAE cache hits bypass both the flat and typed query paths. Warm
+            // the typed artifact so warnings are present after this compile.
+            let _ = self.typed_model_query_impl(tree, mode, model_name, false);
             return cached;
         }
 

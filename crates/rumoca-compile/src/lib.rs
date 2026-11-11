@@ -191,6 +191,7 @@ pub mod compile {
         for_each_expression,
     };
     pub use rumoca_ir_flat::Model as FlatModel;
+    pub use rumoca_phase_typecheck::UnitMetadataPolicy;
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct SourceSpanLocation {

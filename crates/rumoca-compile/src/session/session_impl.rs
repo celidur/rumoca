@@ -1092,6 +1092,7 @@ impl Session {
     ///
     /// Uses the new phase order: Resolve -> Instantiate -> Typecheck -> Flatten -> ToDae
     pub fn compile_model_phases(&mut self, model_name: &str) -> Result<PhaseResult> {
+        self.typecheck_warnings_by_model.shift_remove(model_name);
         self.build_resolved()?;
         let resolved = self.ensure_resolved()?.clone();
         let fingerprint = self.model_dependency_fingerprint(
@@ -1250,6 +1251,7 @@ impl Session {
         &mut self,
         model_name: &str,
     ) -> std::result::Result<Box<DaeCompilationResult>, Box<StrictCompileFailure>> {
+        self.typecheck_warnings_by_model.shift_remove(model_name);
         let target = self
             .resolve_strict_compilation_target(model_name)
             .map_err(|failure| Box::new(strict_pre_phase_failure(model_name, failure.failures)))?;
@@ -1257,11 +1259,14 @@ impl Session {
         let tree = target.resolved.inner();
         let mut failures = Vec::new();
 
-        let (requested_result, warnings) = compile_model_dae_internal_with_warnings(
+        let (requested_result, warnings, unit_warnings) = compile_model_dae_internal_with_warnings(
             tree,
             model_name,
             self.instantiation_options.clone(),
+            self.unit_metadata_policy,
         );
+        self.typecheck_warnings_by_model
+            .insert(model_name.to_string(), unit_warnings);
         let requested = dae_phase_result_requested_message(model_name, &requested_result);
         failures.extend(dae_phase_result_to_failures(
             tree,
@@ -1301,6 +1306,7 @@ impl Session {
         model_name: &str,
         use_compile_cache: bool,
     ) -> std::result::Result<(StrictCompileReport, ResolvedTree), Box<StrictCompileReport>> {
+        self.typecheck_warnings_by_model.shift_remove(model_name);
         let target = match self.resolve_strict_compilation_target(model_name) {
             Ok(target) => target,
             Err(failure) => {
@@ -1324,7 +1330,7 @@ impl Session {
                 &target.closure.compile_targets,
             );
             finalize_strict_compile_report(tree, model_name, failures, results)
-        } else {
+        } else if self.unit_metadata_policy == UnitMetadataPolicy::Strict {
             finalize_strict_compile_report_from_uncached_targets(
                 tree,
                 model_name,
@@ -1332,6 +1338,20 @@ impl Session {
                 &target.closure.compile_targets,
                 self.instantiation_options.clone(),
             )
+        } else {
+            let mut results = Vec::with_capacity(target.closure.compile_targets.len());
+            for name in &target.closure.compile_targets {
+                let (result, warnings) = compile_model_internal_with_options_and_unit_policy(
+                    tree,
+                    name,
+                    self.instantiation_options.clone(),
+                    self.unit_metadata_policy,
+                );
+                self.typecheck_warnings_by_model
+                    .insert(name.clone(), warnings);
+                results.push((name.clone(), result));
+            }
+            finalize_strict_compile_report(tree, model_name, failures, results)
         };
         Ok((report, target.resolved.as_ref().clone()))
     }

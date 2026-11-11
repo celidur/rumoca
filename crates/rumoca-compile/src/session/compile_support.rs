@@ -87,16 +87,29 @@ fn dae_model_outcome_internal_with_options(
     model_name: &str,
     instantiation_options: InstantiateOptions,
 ) -> DaeModelOutcome {
-    dae_model_outcome_and_warnings_with_options(tree, model_name, instantiation_options).0
+    dae_model_outcome_and_warnings_with_options(
+        tree,
+        model_name,
+        instantiation_options,
+        UnitMetadataPolicy::Strict,
+    )
+    .0
 }
 
-/// [`dae_model_outcome_internal_with_options`], plus the warnings a successful
-/// outcome carries, taken from the typed overlay before flatten consumes it.
+/// [`dae_model_outcome_internal_with_options`] under an explicit unit-metadata
+/// policy, plus the warnings a successful outcome carries (taken from the typed
+/// overlay before flatten consumes it) and the typecheck warnings the policy
+/// downgraded.
 fn dae_model_outcome_and_warnings_with_options(
     tree: &ast::ClassTree,
     model_name: &str,
     instantiation_options: InstantiateOptions,
-) -> (DaeModelOutcome, Option<StrictCompileWarnings>) {
+    unit_metadata_policy: UnitMetadataPolicy,
+) -> (
+    DaeModelOutcome,
+    Option<StrictCompileWarnings>,
+    Vec<CommonDiagnostic>,
+) {
     notify_compile_phase(FailedPhase::Instantiate, CompilePhaseEvent::Started);
     let instantiate_start = maybe_start_timer();
     let instantiate_outcome = InstantiatedModelOutcome::from_instantiation_outcome(
@@ -107,8 +120,12 @@ fn dae_model_outcome_and_warnings_with_options(
 
     notify_compile_phase(FailedPhase::Typecheck, CompilePhaseEvent::Started);
     let typecheck_start = maybe_start_timer();
-    let (typed_outcome, typechecked_built) =
-        typed_model_outcome_from_instantiated(tree, model_name, instantiate_outcome);
+    let (typed_outcome, typechecked_built, unit_warnings) = typed_model_outcome_from_instantiated(
+        tree,
+        model_name,
+        instantiate_outcome,
+        unit_metadata_policy,
+    );
     if typechecked_built {
         maybe_record_compile_phase_timing(FailedPhase::Typecheck, typecheck_start);
     }
@@ -150,7 +167,7 @@ fn dae_model_outcome_and_warnings_with_options(
         }),
         _ => None,
     };
-    (dae_outcome, warnings)
+    (dae_outcome, warnings, unit_warnings)
 }
 
 fn dae_model_outcome_internal(tree: &ast::ClassTree, model_name: &str) -> DaeModelOutcome {
@@ -177,6 +194,24 @@ pub(super) fn compile_model_internal_with_options(
     compile_phase_result_from_dae(tree, model_name, dae_outcome)
 }
 
+pub(super) fn compile_model_internal_with_options_and_unit_policy(
+    tree: &ast::ClassTree,
+    model_name: &str,
+    instantiation_options: InstantiateOptions,
+    unit_metadata_policy: UnitMetadataPolicy,
+) -> (PhaseResult, Vec<CommonDiagnostic>) {
+    let (dae_outcome, _, unit_warnings) = dae_model_outcome_and_warnings_with_options(
+        tree,
+        model_name,
+        instantiation_options,
+        unit_metadata_policy,
+    );
+    (
+        compile_phase_result_from_dae(tree, model_name, dae_outcome),
+        unit_warnings,
+    )
+}
+
 pub(super) fn compile_model_dae_internal(
     tree: &ast::ClassTree,
     model_name: &str,
@@ -185,18 +220,29 @@ pub(super) fn compile_model_dae_internal(
     dae_phase_result_from_dae(tree, model_name, dae_outcome)
 }
 
-/// Compile one model to a DAE with the given instantiation options, plus a
-/// successful compile's warnings for the model's Save diagnostics.
+/// Compile one model to a DAE with the given instantiation options and
+/// unit-metadata policy, plus a successful compile's warnings for the model's
+/// Save diagnostics and the typecheck warnings the policy downgraded.
 pub(super) fn compile_model_dae_internal_with_warnings(
     tree: &ast::ClassTree,
     model_name: &str,
     instantiation_options: InstantiateOptions,
-) -> (DaePhaseResult, Option<StrictCompileWarnings>) {
-    let (dae_outcome, warnings) =
-        dae_model_outcome_and_warnings_with_options(tree, model_name, instantiation_options);
+    unit_metadata_policy: UnitMetadataPolicy,
+) -> (
+    DaePhaseResult,
+    Option<StrictCompileWarnings>,
+    Vec<CommonDiagnostic>,
+) {
+    let (dae_outcome, warnings, unit_warnings) = dae_model_outcome_and_warnings_with_options(
+        tree,
+        model_name,
+        instantiation_options,
+        unit_metadata_policy,
+    );
     (
         dae_phase_result_from_dae(tree, model_name, dae_outcome),
         warnings,
+        unit_warnings,
     )
 }
 
@@ -204,7 +250,8 @@ pub(super) fn typed_model_outcome_from_instantiated(
     tree: &ast::ClassTree,
     model_name: &str,
     instantiate_outcome: InstantiatedModelOutcome,
-) -> (TypedModelOutcome, bool) {
+    unit_metadata_policy: UnitMetadataPolicy,
+) -> (TypedModelOutcome, bool, Vec<CommonDiagnostic>) {
     let mut overlay = match instantiate_outcome {
         InstantiatedModelOutcome::Success(overlay) => *overlay,
         InstantiatedModelOutcome::NeedsInner {
@@ -217,21 +264,50 @@ pub(super) fn typed_model_outcome_from_instantiated(
                     missing_spans,
                 },
                 false,
+                Vec::new(),
             );
         }
         InstantiatedModelOutcome::Error(error) => {
-            return (TypedModelOutcome::InstantiateError(error), false);
+            return (
+                TypedModelOutcome::InstantiateError(error),
+                false,
+                Vec::new(),
+            );
         }
     };
 
-    if let Err(diags) = typecheck_instanced(tree, &mut overlay, model_name) {
-        return (
+    let diags = typecheck_instanced_with_unit_metadata_policy(
+        tree,
+        &mut overlay,
+        model_name,
+        unit_metadata_policy,
+    );
+    match diags {
+        Err(diags) => (
             TypedModelOutcome::TypecheckError(diags.iter().cloned().collect()),
             true,
-        );
+            diags
+                .iter()
+                .filter(|diagnostic| {
+                    diagnostic.code.as_deref() == Some("ET010")
+                        && diagnostic.severity == rumoca_core::DiagnosticSeverity::Warning
+                })
+                .cloned()
+                .collect(),
+        ),
+        Ok(diags) => (
+            TypedModelOutcome::Success(Box::new(overlay)),
+            true,
+            diags
+                .iter()
+                .filter(|diagnostic| {
+                    diagnostic.code.as_deref() == Some("ET010")
+                        && diagnostic.severity == rumoca_core::DiagnosticSeverity::Warning
+                })
+                .cloned()
+                .collect(),
+        ),
     }
-
-    (TypedModelOutcome::Success(Box::new(overlay)), true)
 }
 
 pub(super) fn flat_model_outcome_from_typed(

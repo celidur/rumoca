@@ -1,4 +1,5 @@
 use rumoca_phase_instantiate::{DEFAULT_INSTANTIATION_DEPTH_LIMIT, InstantiateOptions};
+use rumoca_phase_typecheck::UnitMetadataPolicy;
 use std::sync::Once;
 
 static RAYON_INIT: Once = Once::new();
@@ -10,6 +11,8 @@ pub struct SessionConfig {
     pub parallel: bool,
     /// Maximum concrete class/component nesting allowed during instantiation.
     pub instantiation_depth_limit: usize,
+    /// Policy for invalid `unit` and `displayUnit` metadata strings.
+    pub unit_metadata_policy: UnitMetadataPolicy,
 }
 
 impl Default for SessionConfig {
@@ -17,6 +20,7 @@ impl Default for SessionConfig {
         Self {
             parallel: false,
             instantiation_depth_limit: DEFAULT_INSTANTIATION_DEPTH_LIMIT,
+            unit_metadata_policy: UnitMetadataPolicy::Strict,
         }
     }
 }

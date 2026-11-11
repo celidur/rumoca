@@ -2,6 +2,16 @@ use super::*;
 use rumoca_ir_ast::Visitor;
 use std::ops::ControlFlow;
 
+/// Controls whether invalid `unit` and `displayUnit` syntax is fatal.
+///
+/// The default and all legacy entry points remain strict.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum UnitMetadataPolicy {
+    #[default]
+    Strict,
+    Warn,
+}
+
 /// Collect variable references from for-loop ranges and if-equation conditions.
 ///
 /// Per MLS §18.3, parameters used in for-loop ranges and if-equation conditions
@@ -112,6 +122,28 @@ pub fn typecheck_instanced(
         Err(checker.take_diagnostics())
     } else {
         Ok(())
+    }
+}
+
+/// Type check an instanced model with an explicit unit metadata policy.
+///
+/// Under [`UnitMetadataPolicy::Warn`], only ET010 diagnostics produced for
+/// invalid `unit`/`displayUnit` strings are warnings. They are returned on
+/// successful type checking so callers can report them without losing their
+/// source labels. All other diagnostics retain their original severity.
+pub fn typecheck_instanced_with_unit_metadata_policy(
+    tree: &ClassTree,
+    overlay: &mut InstanceOverlay,
+    model_name: &str,
+    policy: UnitMetadataPolicy,
+) -> Result<Diagnostics, Diagnostics> {
+    let mut checker = TypeChecker::new_with_unit_metadata_policy(policy);
+    checker.check_instanced(tree, overlay, model_name);
+
+    if checker.has_errors() {
+        Err(checker.take_diagnostics())
+    } else {
+        Ok(checker.take_diagnostics())
     }
 }
 

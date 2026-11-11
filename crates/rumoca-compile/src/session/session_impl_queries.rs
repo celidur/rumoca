@@ -52,6 +52,8 @@ impl Session {
             fresh_session_snapshot_caches();
         Self {
             instantiation_options: config.instantiate_options(),
+            unit_metadata_policy: config.unit_metadata_policy,
+            typecheck_warnings_by_model: IndexMap::new(),
             structural_override_sources: Vec::new(),
             documents: IndexMap::new(),
             detached_document_uris: IndexSet::new(),
@@ -74,6 +76,16 @@ impl Session {
             workspace_symbol_snapshot_cache,
             query_state,
         }
+    }
+
+    /// Return structured unit-metadata warnings produced by the most recent
+    /// typed-model query for `model_name`, including when that query was
+    /// served from the typed-model cache.
+    pub fn typecheck_warnings(&self, model_name: &str) -> &[CommonDiagnostic] {
+        self.typecheck_warnings_by_model
+            .get(model_name)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
     pub(crate) fn invalidate_resolved_state(&mut self, cause: CacheInvalidationCause) {
@@ -129,6 +141,7 @@ impl Session {
 
     pub(crate) fn bump_revision(&mut self) -> RevisionId {
         self.sync_query_state_from_snapshots();
+        self.typecheck_warnings_by_model.clear();
         self.source_root_indexing.read_prewarm_session_revision = None;
         self.next_revision = self.next_revision.saturating_add(1);
         let revision = RevisionId::new(self.next_revision);

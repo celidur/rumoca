@@ -62,7 +62,10 @@ use typechecker::traversal_adapter::{
     walk_equation, walk_equations, walk_expression, walk_statement, walk_statements,
 };
 
-pub use typechecker::api::{typecheck, typecheck_instanced};
+pub use typechecker::api::{
+    UnitMetadataPolicy, typecheck, typecheck_instanced,
+    typecheck_instanced_with_unit_metadata_policy,
+};
 
 /// Type alias for typecheck results with boxed errors.
 ///
@@ -224,6 +227,10 @@ impl PhaseError for TypeCheckError {
 pub struct TypeChecker {
     /// Collected diagnostics.
     diagnostics: Diagnostics,
+    /// Whether invalid `unit`/`displayUnit` strings are warnings for this
+    /// checker. This is deliberately checker-local so concurrent sessions do
+    /// not affect one another.
+    unit_metadata_policy: UnitMetadataPolicy,
     /// Evaluation context for current class (built from constants/parameters).
     eval_ctx: rumoca_eval_ast::eval::TypeCheckEvalContext,
     /// Source map for file name → SourceId resolution in diagnostics.
@@ -297,6 +304,7 @@ impl TypeChecker {
     pub fn new() -> Self {
         Self {
             diagnostics: Diagnostics::new(),
+            unit_metadata_policy: UnitMetadataPolicy::Strict,
             eval_ctx: rumoca_eval_ast::eval::TypeCheckEvalContext::new(),
             source_map: SourceMap::default(),
             predefined_intrinsics: HashMap::new(),
@@ -322,8 +330,22 @@ impl TypeChecker {
         }
     }
 
+    pub(crate) fn new_with_unit_metadata_policy(
+        unit_metadata_policy: typechecker::api::UnitMetadataPolicy,
+    ) -> Self {
+        let mut checker = Self::new();
+        checker.unit_metadata_policy = unit_metadata_policy;
+        checker
+    }
+
     pub(crate) fn emit_typecheck_error(&mut self, error: TypeCheckError) {
-        self.diagnostics.emit(error.to_diagnostic());
+        let mut diagnostic = error.to_diagnostic();
+        if self.unit_metadata_policy == typechecker::api::UnitMetadataPolicy::Warn
+            && diagnostic.code.as_deref() == Some("ET010")
+        {
+            diagnostic.severity = rumoca_core::DiagnosticSeverity::Warning;
+        }
+        self.diagnostics.emit(diagnostic);
     }
 
     pub(crate) fn diagnostic_location_span(
