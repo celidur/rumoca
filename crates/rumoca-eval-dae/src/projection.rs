@@ -86,6 +86,124 @@ impl ProjectionError {
     }
 }
 
+/// Errors from the public exact static-index projection helpers.
+///
+/// Kept separate from [`ProjectionError`] so adding these API-shape failures
+/// does not make existing exhaustive `ProjectionError` matches non-exhaustive.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum StaticProjectionError {
+    #[error("expression {expression_id} does not exist in this DAE")]
+    MissingExpression { expression_id: u32 },
+    #[error("expression is not an array index")]
+    NotIndexExpression { span: Span },
+    #[error("structured domain point is not valid for this DAE")]
+    InvalidDomainPoint { span: Span },
+    #[error(transparent)]
+    Projection(#[from] ProjectionError),
+}
+
+/// Evaluate one scalar integer using checked i64 arithmetic and bindings.
+///
+/// This is intentionally a static projection: it has no runtime override
+/// provider. A caller that permits tunable overrides of index dependencies
+/// must resolve those indices through a separate exact-integer policy.
+pub fn project_static_integer<'dae>(
+    view: dae::DaeView<'dae>,
+    expression: dae::ExprId<'dae>,
+    scalar_index: usize,
+    domain_point: Option<(dae::DomainId<'dae>, &[i64])>,
+) -> Result<i64, StaticProjectionError> {
+    let node = view
+        .expression(expression)
+        .ok_or(StaticProjectionError::MissingExpression {
+            expression_id: expression.index(),
+        })?;
+    let domain_points = checked_domain_points(view, node.provenance().span(), domain_point)?;
+    let mut cache = ScalarCoordinateProjectionCache::default();
+    let mut visit = |_: dae::CoordinateView<'dae>, _: usize| {};
+    let mut projection = new_projection(view, domain_points, &mut cache, &mut visit);
+    Ok(projection.integer(expression, scalar_index)?)
+}
+
+/// Resolve an indexed expression's selected base expression and flat scalar.
+///
+/// The subscript is evaluated exactly as an i64 and checked against the
+/// Modelica one-based axis bounds. Dynamic subscripts are returned as errors;
+/// this function does not use the conservative incidence-union fallback.
+pub fn project_indexed_scalar<'dae>(
+    view: dae::DaeView<'dae>,
+    indexed: dae::ExprId<'dae>,
+    result_scalar: usize,
+    domain_point: Option<(dae::DomainId<'dae>, &[i64])>,
+) -> Result<(dae::ExprId<'dae>, usize), StaticProjectionError> {
+    let node = view
+        .expression(indexed)
+        .ok_or(StaticProjectionError::MissingExpression {
+            expression_id: indexed.index(),
+        })?;
+    let (base, subscripts) = match node.operation() {
+        dae::ExpressionOperation::Index { base, subscripts } => (base, subscripts),
+        _ => {
+            return Err(StaticProjectionError::NotIndexExpression {
+                span: node.provenance().span(),
+            });
+        }
+    };
+    let domain_points = checked_domain_points(view, node.provenance().span(), domain_point)?;
+    let mut cache = ScalarCoordinateProjectionCache::default();
+    let mut visit = |_: dae::CoordinateView<'dae>, _: usize| {};
+    let mut projection = new_projection(view, domain_points, &mut cache, &mut visit);
+    projection.expect_scalar_index(node, result_scalar)?;
+    let scalar = projection.indexed_base_scalar(
+        base,
+        subscripts,
+        node.value_type().dimensions(),
+        result_scalar,
+    )?;
+    Ok((base, scalar))
+}
+
+fn checked_domain_points<'dae>(
+    view: dae::DaeView<'dae>,
+    span: Span,
+    domain_point: Option<(dae::DomainId<'dae>, &[i64])>,
+) -> Result<Vec<(dae::DomainId<'dae>, Vec<i64>)>, StaticProjectionError> {
+    let Some((domain, indices)) = domain_point else {
+        return Ok(Vec::new());
+    };
+    let valid = view.domain(domain).is_some_and(|domain_view| {
+        matches!(domain_view.structured().ordinal_of(indices), Ok(Some(_)))
+    });
+    if !valid {
+        return Err(StaticProjectionError::InvalidDomainPoint { span });
+    }
+    Ok(vec![(domain, indices.to_vec())])
+}
+
+fn new_projection<'visit, 'dae>(
+    view: dae::DaeView<'dae>,
+    domain_points: Vec<(dae::DomainId<'dae>, Vec<i64>)>,
+    cache: &'visit mut ScalarCoordinateProjectionCache<'dae>,
+    visit: &'visit mut dyn FnMut(dae::CoordinateView<'dae>, usize),
+) -> Projection<'visit, 'dae> {
+    Projection {
+        activation: Activation::Guaranteed,
+        view,
+        domain_contexts: domain_context::DomainContexts::new(domain_points),
+        integer_stack: HashSet::default(),
+        function_frames: Vec::new(),
+        function_call_active: HashSet::default(),
+        function_fold_active: HashSet::default(),
+        function_summary_captures: Vec::new(),
+        model_visited: std::mem::take(&mut cache.model_visited),
+        frame_memos: Vec::new(),
+        cache,
+        visit,
+        relevant: None,
+        omitted: None,
+    }
+}
+
 /// Report an MLS §12.9 external body that projection cannot look through.
 ///
 /// Projection resolves a call by continuing into the callee's result

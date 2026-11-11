@@ -785,6 +785,277 @@ fn function_index_parameter_preserves_call_site_specialization() {
     });
 }
 
+/// `x[2^53 + 1 - 2^53]`, a dynamic index, overflow and out-of-range indices.
+fn exact_index_model() -> (dae::Dae, [u32; 6]) {
+    let mut sources = SourceMap::new();
+    let source = sources.add(
+        "exact_index.mo",
+        "Real x[1]; input Integer runtimeIndex; x[9007199254740993 - 9007199254740992]; x[runtimeIndex];",
+    );
+    let declaration = provenance(source, 0, 10);
+    let input_at = provenance(source, 12, 36);
+    let use_at = provenance(source, 38, 94);
+    let mut expression_ids = [0_u32; 6];
+    let model = dae::Dae::construct(sources, |model| {
+        let (real_array, integer) = model.types(|types| {
+            Ok((
+                types.intern(
+                    TypeId::new(0),
+                    dae::ValueType::array(dae::ScalarType::Real, [1]),
+                    declaration,
+                )?,
+                types.intern(
+                    TypeId::new(1),
+                    dae::ValueType::scalar(dae::ScalarType::Integer),
+                    input_at,
+                )?,
+            ))
+        })?;
+        let (x, runtime_index) = model.variables(|variables| {
+            Ok((
+                variables.algebraic(
+                    VarName::new("x"),
+                    real_array,
+                    declaration,
+                    dae::VariableAttributes::default(),
+                )?,
+                variables.input(
+                    VarName::new("runtimeIndex"),
+                    integer,
+                    dae::InputVariability::Discrete,
+                    input_at,
+                    dae::VariableAttributes::default(),
+                )?,
+            ))
+        })?;
+        expression_ids = model.expressions(|expressions| {
+            let lhs = expressions
+                .at(use_at)
+                .literal(dae::DaeLiteral::Integer(9_007_199_254_740_993))?;
+            let rhs = expressions
+                .at(use_at)
+                .literal(dae::DaeLiteral::Integer(9_007_199_254_740_992))?;
+            let difference =
+                expressions
+                    .at(use_at)
+                    .binary(dae::BinaryOperator::Subtract, lhs, rhs)?;
+            let base = expressions
+                .at(use_at)
+                .coordinate(dae::CoordinateInput::Algebraic(x))?;
+            let dynamic = expressions
+                .at(use_at)
+                .coordinate(dae::CoordinateInput::Input(runtime_index))?;
+            let negative = expressions
+                .at(use_at)
+                .literal(dae::DaeLiteral::Integer(-1))?;
+            let past_end = expressions
+                .at(use_at)
+                .literal(dae::DaeLiteral::Integer(2))?;
+            let maximum = expressions
+                .at(use_at)
+                .literal(dae::DaeLiteral::Integer(i64::MAX))?;
+            let one = expressions
+                .at(use_at)
+                .literal(dae::DaeLiteral::Integer(1))?;
+            let overflow = expressions
+                .at(use_at)
+                .binary(dae::BinaryOperator::Add, maximum, one)?;
+            let mut indexed = [0_u32; 4];
+            for (slot, index) in indexed
+                .iter_mut()
+                .zip([difference, dynamic, negative, past_end])
+            {
+                let subscript = dae::Subscript::Index {
+                    expression: index,
+                    provenance: use_at,
+                };
+                *slot = expressions.at(use_at).index(base, [subscript])?.index();
+            }
+            Ok([
+                indexed[0],
+                difference.index(),
+                indexed[1],
+                overflow.index(),
+                indexed[2],
+                indexed[3],
+            ])
+        })?;
+        Ok(())
+    })
+    .unwrap();
+
+    (model, expression_ids)
+}
+
+#[test]
+fn exact_static_index_projection_preserves_i64_arithmetic() {
+    let (model, expression_ids) = exact_index_model();
+    model.inspect(|view| {
+        let first = view.expression_id(expression_ids[0] as usize).unwrap();
+        let difference = view.expression_id(expression_ids[1] as usize).unwrap();
+        let integer = project_static_integer(view, difference, 0, None).unwrap();
+        assert_eq!(integer, 1);
+        let (base, flat) = project_indexed_scalar(view, first, 0, None).unwrap();
+        assert_eq!(flat, 0);
+        assert_eq!(base.index(), view.expression_id(3).unwrap().index());
+
+        let dynamic = view.expression_id(expression_ids[2] as usize).unwrap();
+        assert!(matches!(
+            project_indexed_scalar(view, dynamic, 0, None),
+            Err(StaticProjectionError::Projection(
+                ProjectionError::DynamicSubscript { .. }
+            ))
+        ));
+        let overflow = view.expression_id(expression_ids[3] as usize).unwrap();
+        assert!(matches!(
+            project_static_integer(view, overflow, 0, None),
+            Err(StaticProjectionError::Projection(
+                ProjectionError::IntegerOverflow { .. }
+            ))
+        ));
+        for (expression_id, index) in [(expression_ids[4], -1), (expression_ids[5], 2)] {
+            let invalid = view.expression_id(expression_id as usize).unwrap();
+            assert!(matches!(
+                project_indexed_scalar(view, invalid, 0, None),
+                Err(StaticProjectionError::Projection(
+                    ProjectionError::IndexOutOfBounds {
+                        index: found,
+                        extent: 1,
+                        ..
+                    }
+                )) if found == index
+            ));
+        }
+        assert_eq!(difference.index(), 2);
+    });
+}
+
+#[test]
+fn exact_index_projection_requires_a_valid_domain_point_for_binders() {
+    let mut sources = SourceMap::new();
+    let source = sources.add(
+        "domain_index.mo",
+        "Real R[3]; for phase in 1:3 loop R[phase]",
+    );
+    let at = provenance(source, 0, 41);
+    let mut domain_id = 0_u32;
+    let mut indexed_id = 0_u32;
+    let model = dae::Dae::construct(sources, |model| {
+        let real_array = model.types(|types| {
+            types.intern(
+                TypeId::new(0),
+                dae::ValueType::array(dae::ScalarType::Real, [3]),
+                at,
+            )
+        })?;
+        let x = model.variables(|variables| {
+            variables.algebraic(
+                VarName::new("R"),
+                real_array,
+                at,
+                dae::VariableAttributes::default(),
+            )
+        })?;
+        let domain = model.domains(|domains| {
+            domains.structured(
+                StructuredIndexDomain {
+                    binders: vec![StructuredIndexBinder {
+                        provenance: rumoca_core::IndexBinderProvenance::Generated,
+                        id: 0,
+                        display_name: "phase".to_owned(),
+                        lower: 1,
+                        upper: 3,
+                        step: 1,
+                    }],
+                },
+                at,
+            )
+        })?;
+        let binder = model.domains(|domains| domains.binder(domain, 0, at))?;
+        let indexed = model.expressions(|expressions| {
+            let base = expressions
+                .at(at)
+                .coordinate(dae::CoordinateInput::Algebraic(x))?;
+            let phase = expressions.at(at).binder(binder)?;
+            expressions.at(at).index(
+                base,
+                [dae::Subscript::Index {
+                    expression: phase,
+                    provenance: at,
+                }],
+            )
+        })?;
+        domain_id = domain.index();
+        indexed_id = indexed.index();
+        Ok(())
+    })
+    .unwrap();
+    model.inspect(|view| {
+        let domain = view.domain_id(domain_id as usize).unwrap();
+        let indexed = view.expression_id(indexed_id as usize).unwrap();
+        let (base, flat) = project_indexed_scalar(view, indexed, 0, Some((domain, &[2]))).unwrap();
+        assert_eq!(base.index(), view.expression_id(0).unwrap().index());
+        assert_eq!(flat, 1);
+        assert!(matches!(
+            project_indexed_scalar(view, indexed, 0, None),
+            Err(StaticProjectionError::Projection(
+                ProjectionError::DynamicSubscript { .. }
+            ))
+        ));
+        assert!(matches!(
+            project_indexed_scalar(view, indexed, 0, Some((domain, &[4]))),
+            Err(StaticProjectionError::InvalidDomainPoint { .. })
+        ));
+    });
+}
+
+#[test]
+fn enumeration_integer_subscripts_remain_supported() {
+    let mut sources = SourceMap::new();
+    let source_text = "enumeration subscript x[2]";
+    let source = sources.add("enumeration_index.mo", source_text);
+    let at = provenance(source, 0, source_text.len());
+    let mut indexed_id = 0_u32;
+    let model = dae::Dae::construct(sources, |model| {
+        let target_type = model.types(|types| {
+            types.intern(
+                TypeId::new(0),
+                dae::ValueType::array(dae::ScalarType::Real, [3]),
+                at,
+            )
+        })?;
+        let target = model.variables(|variables| {
+            variables.algebraic(
+                VarName::new("x"),
+                target_type,
+                at,
+                dae::VariableAttributes::default(),
+            )
+        })?;
+        let indexed = model.expressions(|expressions| {
+            let base = expressions
+                .at(at)
+                .coordinate(dae::CoordinateInput::Algebraic(target))?;
+            let index = expressions.at(at).enumeration_literal(2)?;
+            expressions.at(at).index(
+                base,
+                [dae::Subscript::Index {
+                    expression: index,
+                    provenance: at,
+                }],
+            )
+        })?;
+        indexed_id = indexed.index();
+        Ok(())
+    })
+    .unwrap();
+
+    model.inspect(|view| {
+        let indexed = view.expression_id(indexed_id as usize).unwrap();
+        assert_eq!(project_indexed_scalar(view, indexed, 0, None).unwrap().1, 1);
+    });
+}
+
 #[test]
 fn integer_matrix_products_and_scalar_broadcasts_select_exact_index_slices() {
     let mut sources = SourceMap::new();
@@ -877,6 +1148,8 @@ fn integer_matrix_products_and_scalar_broadcasts_select_exact_index_slices() {
                 let record = |_, base_scalar| visited.push(base_scalar);
                 for_each_scalar_coordinate(view, indexed, scalar, None, record).unwrap();
                 assert_eq!(visited, [expected_flat]);
+                let (_, flat) = project_indexed_scalar(view, indexed, scalar, None).unwrap();
+                assert_eq!(flat, expected_flat);
             }
         }
     });
