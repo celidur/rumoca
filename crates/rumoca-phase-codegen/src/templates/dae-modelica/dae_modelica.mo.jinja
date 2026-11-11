@@ -120,7 +120,7 @@
   {%- if op.value.real is defined -%}{{ op.value.real }}
   {%- elif op.value.integer is defined -%}{{ op.value.integer }}
   {%- elif op.value.enumeration is defined -%}{{ op.value.enumeration }}
-  {%- elif op.value.boolean is defined -%}{{ op.value.boolean }}
+  {%- elif op.value.boolean is defined -%}{% if op.value.boolean %}true{% else %}false{% endif %}
   {%- elif op.value.string is defined -%}{{ op.value.string | modelica_string }}
   {%- else -%}{{ fail_at("unsupported-feature:dae-modelica-literal", e.provenance) }}
   {%- endif -%}
@@ -261,7 +261,7 @@ end {{ function.name }};
   {%- if a.minimum is not none -%}{%- set parts = parts + [mod("min", expr(a.minimum))] -%}{%- endif -%}
   {%- if a.maximum is not none -%}{%- set parts = parts + [mod("max", expr(a.maximum))] -%}{%- endif -%}
   {%- if a.nominal is not none -%}{%- set parts = parts + [mod("nominal", expr(a.nominal))] -%}{%- endif -%}
-  {%- if a.fixed is not none -%}{%- set parts = parts + [mod("fixed", a.fixed | string)] -%}{%- endif -%}
+  {%- if a.fixed is not none -%}{%- set parts = parts + [mod("fixed", "true" if a.fixed else "false")] -%}{%- endif -%}
   {%- if a.unit is not none -%}{%- set parts = parts + ["unit = " ~ (a.unit | modelica_string)] -%}{%- endif -%}
   {{- parts | join(", ") -}}
 )

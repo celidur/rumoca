@@ -108,7 +108,7 @@ mod tests {
         assert_eq!(
             environment
                 .render_str(
-                    "{{ c is mapping }}|{{ c | list | join(',') }}",
+                    "{{ 'true' if c is mapping else 'false' }}|{{ c | list | join(',') }}",
                     minijinja::context! { c => value.clone() }
                 )
                 .unwrap(),

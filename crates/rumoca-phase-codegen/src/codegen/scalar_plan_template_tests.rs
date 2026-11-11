@@ -382,13 +382,13 @@ fn scalar_plan_objects_enumerate_only_keys_they_resolve() {
         &derivative_problem(program),
         &solve::SolveArtifacts::default(),
         r#"{% set plan = solve_blocks.continuous.derivative_rhs.scalar_plan -%}
-plan:{{ plan is mapping }}:{{ plan|list|join(",") }}
-programs:{{ plan.programs is sequence }}:{{ plan.programs|length }}
+plan:{{ 'true' if plan is mapping else 'false' }}:{{ plan|list|join(",") }}
+programs:{{ 'true' if plan.programs is sequence else 'false' }}:{{ plan.programs|length }}
 {% for program in plan.programs -%}
-program:{{ program is mapping }}:{{ program|list|join(",") }}
-ops:{{ program.ops is sequence }}:{{ program.ops|length }}
+program:{{ 'true' if program is mapping else 'false' }}:{{ program|list|join(",") }}
+ops:{{ 'true' if program.ops is sequence else 'false' }}:{{ program.ops|length }}
 {% for op in program.ops -%}
-op:{{ op is mapping }}:{% for key in op %}{{ key }}={{ op[key] is defined }},{% endfor %}
+op:{{ 'true' if op is mapping else 'false' }}:{% for key in op %}{{ key }}={{ 'true' if op[key] is defined else 'false' }},{% endfor %}
 {% endfor %}{% endfor %}"#,
         "Introspection",
     )
