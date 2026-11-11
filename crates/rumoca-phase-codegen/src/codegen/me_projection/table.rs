@@ -77,7 +77,7 @@ impl<K: Ord> FunctionFamily<K> {
     }
 
     /// The emitted plan: every program stores its outputs at local positions.
-    pub(super) fn into_plan(self) -> Result<Value, CodegenError> {
+    pub(super) fn into_plan(self, family: &'static str) -> Result<Value, CodegenError> {
         let mut targets = Vec::new();
         let mut operations = Vec::with_capacity(self.programs.len());
         let mut spans = Vec::with_capacity(self.programs.len());
@@ -87,7 +87,9 @@ impl<K: Ord> FunctionFamily<K> {
             spans.push(span);
         }
         let block = solve::ScalarProgramBlock::with_output_indices(operations, spans, targets)
-            .map_err(|error| CodegenError::template(error.to_string()))?;
+            .map_err(|error| {
+                CodegenError::template(format!("{family} projection program family: {error}"))
+            })?;
         Ok(Value::from_object(ScalarProgramPlan::new(Arc::new(block))?))
     }
 }
@@ -217,13 +219,13 @@ impl ProgramTable {
             self.pool
         };
         Ok(minijinja::context! {
-            rows => self.rows.into_plan()?,
-            jvp => self.jvp.into_plan()?,
+            rows => self.rows.into_plan("rows")?,
+            jvp => self.jvp.into_plan("jvp")?,
             lanes => self.lanes.into_plan()?,
-            inv => self.inv.into_plan()?,
-            dep => self.dep.into_plan()?,
-            isolators => isolators.into_plan()?,
-            causal => self.causal.into_plan()?,
+            inv => self.inv.into_plan("inv")?,
+            dep => self.dep.into_plan("dep")?,
+            isolators => isolators.into_plan("isolators")?,
+            causal => self.causal.into_plan("causal")?,
             isolator_group => isolator_group,
             isolator_slot => isolator_slot,
             iso_max_outputs => iso_max_outputs,
@@ -327,4 +329,29 @@ fn group_program(
         .program_span(program)
         .ok_or_else(|| CodegenError::template("a target isolator has no source provenance"))?;
     Ok((operations, span))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn outputless_invariant_program_keeps_refusal_and_names_its_family() {
+        let span = Span::from_offsets(
+            rumoca_core::SourceId::from_source_name("invariant.mo"),
+            0,
+            0,
+        );
+        let mut invariant = FunctionFamily::default();
+        invariant
+            .intern(0, || Ok((Vec::new(), span)))
+            .expect("program is interned before checked block construction");
+
+        let error = invariant
+            .into_plan("invariant")
+            .expect_err("an outputless invariant program must remain rejected");
+        let message = error.to_string();
+        assert!(message.contains("invariant projection program family"));
+        assert!(message.contains("stores no output"), "{message}");
+    }
 }

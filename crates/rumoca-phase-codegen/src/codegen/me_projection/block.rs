@@ -304,6 +304,13 @@ fn record_splits(
         split
             .check(ops, &block.y_indices)
             .map_err(|_| refuse(canonical, "has a residual split its checker rejects"))?;
+        // An invariant fragment with no live-outs cannot form a checked
+        // value-producing program. Keep the whole original row, including
+        // the invariant operations and their errors, on the unsplit path.
+        if split.live_out().is_empty() {
+            dependent_of.insert(program, 0);
+            continue;
+        }
         let span = program_span(source, canonical, program)?;
         let offset = record.inv_len;
         let invariant = table.inv.intern((sources.chart, canonical, program), || {
@@ -980,5 +987,137 @@ impl BlockRecord {
             + 64;
         let sizes = 9 * n + 6 * (k + 1) + 16;
         (doubles, sizes)
+    }
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::*;
+    use rumoca_eval_solve::PreparedScalarProgramBlock;
+    use rumoca_ir_solve::{BinaryOp, LinearOp, ScalarProgramBlock, UnaryOp};
+
+    fn record_split(ops: Vec<LinearOp>) -> (ProgramTable, BlockRecord, PreparedScalarProgramBlock) {
+        let span = Span::from_offsets(
+            rumoca_core::SourceId::from_source_name("empty-liveout-test.mo"),
+            0,
+            0,
+        );
+        let source = ScalarProgramBlock::with_program_spans(vec![ops], vec![span])
+            .expect("synthetic row is a checked scalar program");
+        let implicit =
+            PreparedScalarProgramBlock::new(source).expect("synthetic row can be prepared");
+        let problem = solve::SolveProblem::default();
+        let artifacts = solve::SolveArtifacts::default();
+        let tangent_jvp = ScalarProgramBlock::default();
+        let sources = BlockSources {
+            problem: &problem,
+            artifacts: &artifacts,
+            implicit: &implicit,
+            seed_len: 0,
+            chart: 0,
+            tangent_jvp: &tangent_jvp,
+        };
+        let block = solve::AlgebraicProjectionBlock {
+            rows: vec![0],
+            y_indices: vec![0, 1],
+            ..solve::AlgebraicProjectionBlock::default()
+        };
+        let positions = [(0, 0)];
+        let mut table = ProgramTable::default();
+        let mut record = BlockRecord::default();
+        record_rows(&sources, &mut table, 0, &positions, &mut record)
+            .expect("the original row is recorded");
+        record_splits(&sources, &mut table, 0, (&block, &positions), &mut record)
+            .expect("the checked split is recorded");
+        (table, record, implicit)
+    }
+
+    fn emitted_table(
+        table: ProgramTable,
+        record: &BlockRecord,
+        implicit: PreparedScalarProgramBlock,
+    ) -> (Vec<usize>, Vec<String>) {
+        let value = table
+            .into_value(&[implicit])
+            .expect("the emitted program table remains valid");
+        let pool = value
+            .get_attr("pool")
+            .expect("table exposes its index pool")
+            .try_iter()
+            .expect("pool is iterable")
+            .map(|item| item.as_usize().expect("pool item is an index"))
+            .collect::<Vec<_>>();
+        assert!(record.row_split < pool.len());
+
+        let rows = value.get_attr("rows").expect("table exposes row programs");
+        let program = rows
+            .get_attr("programs")
+            .expect("row family exposes its programs")
+            .try_iter()
+            .expect("row programs are iterable")
+            .next()
+            .expect("the original row program remains emitted");
+        let kinds = program
+            .get_attr("ops")
+            .expect("row program exposes its operations")
+            .try_iter()
+            .expect("row operations are iterable")
+            .map(|op| {
+                op.get_attr("kind")
+                    .expect("operation exposes its kind")
+                    .as_str()
+                    .expect("operation kind is a string")
+                    .to_owned()
+            })
+            .collect();
+        (pool, kinds)
+    }
+
+    #[test]
+    fn checked_split_without_live_out_keeps_original_row_and_zero_sentinel() {
+        let (table, record, implicit) = record_split(vec![
+            LinearOp::Const { dst: 0, value: 4.0 },
+            LinearOp::Unary {
+                dst: 1,
+                op: UnaryOp::Sqrt,
+                arg: 0,
+            },
+            LinearOp::LoadY { dst: 2, index: 0 },
+            LinearOp::StoreOutput { src: 2 },
+        ]);
+
+        assert_eq!(record.nsplit, 0);
+        assert_eq!(record.inv_len, 0);
+        assert_eq!(record.row_program, 0);
+        assert_eq!(table.rows.output_count(record.row_program), 1);
+        let (pool, kinds) = emitted_table(table, &record, implicit);
+        assert_eq!(pool[record.row_split], 0);
+        assert_eq!(
+            kinds,
+            vec!["Const", "Unary", "LoadY", "StoreOutput"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn checked_split_with_live_out_still_interns_invariant_and_dependent() {
+        let (table, record, implicit) = record_split(vec![
+            LinearOp::Const { dst: 0, value: 4.0 },
+            LinearOp::LoadY { dst: 1, index: 0 },
+            LinearOp::Binary {
+                dst: 2,
+                op: BinaryOp::Add,
+                lhs: 0,
+                rhs: 1,
+            },
+            LinearOp::StoreOutput { src: 2 },
+        ]);
+
+        assert_eq!(record.nsplit, 1);
+        assert_eq!(record.inv_len, 1);
+        let (pool, _) = emitted_table(table, &record, implicit);
+        assert_eq!(pool[record.row_split], 1);
     }
 }
