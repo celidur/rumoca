@@ -33,6 +33,7 @@ pub(crate) mod array_family;
 mod assert_equations;
 mod cheapen;
 mod conditional_and_eval;
+mod delay_families;
 mod der_divergent_branches;
 mod if_equation_alignment;
 mod parameter_selections;
@@ -1105,6 +1106,12 @@ fn expand_for_equation(
     // stays symbolic. Needed BEFORE the cheapen decision: a parameter-variability
     // family is only cheapenable when its template can rebuild the promoted value.
     let template = capture_comprehension_template(ctx, indices, equations, prefix, def_map);
+    // Delay ownership requires a concrete source and timing expression at each
+    // occurrence (MLS §3.7.2). Preserve the family domain, but keep its scalar
+    // rows complete and authoritative until delay plans support symbolic family
+    // binders.
+    let contains_delay = delay_families::contains_delay(template.as_ref(), equations);
+    let template = template.filter(|_| !contains_delay);
 
     // A regular family lowered with materialization off keeps only its corner cells
     // (base + one neighbor per binder) with full bodies; the interior cells get a
@@ -1128,7 +1135,7 @@ fn expand_for_equation(
         regular.is_some(),
         template.as_ref(),
     );
-    let cheapen_plan = if placeholder.materialized() {
+    let cheapen_plan = if contains_delay || placeholder.materialized() {
         None
     } else {
         build_cheapen_plan(ctx, indices, prefix, span)?
