@@ -78,6 +78,9 @@ mod stencil_codegen_tests;
 mod symbol_alloc;
 #[cfg(test)]
 mod template_function_tests;
+// Compiles and runs emitted C with the host `cc`, on Linux only.
+#[cfg(all(test, target_os = "linux"))]
+mod typed_integer_codegen_tests;
 #[cfg(test)]
 mod wgsl_ode_tests;
 
