@@ -19,11 +19,15 @@
 // reproduces be_harness_btf.cpp built with -DPROBE_EVERY=0 -DMAX_FAIL_PROBES=0
 // bit for bit.
 //
-// GPU (CUDA 12/13; -O3 makes ptxas run out of memory on the 39-bus):
-//   nvcc -O1 -Xcicc -O1 -Xptxas -O1 -std=c++17 -arch=native 
-//     -DMODEL_SRC='"<M>_ode.cu"' -DM=<M> -DU=<U> gpu_btf.cu -o gpu_btf
+// GPU (CUDA 12/13; -O3 makes ptxas run out of memory on the 39-bus). The
+// model is compiled twice: for the device, and for the host (-DHOST_TU) to
+// initialize and probe once on the CPU.
+//   g++ -O1 -std=c++17 -w -x c++ -DHOST_TU -DMODEL_SRC='"<M>_ode.cu"'
+//     -DM=<M> -DU=<U> -c gpu_btf.cu -o gpu_btf_host.o
+//   nvcc -O1 -Xcicc -O1 -Xptxas -O1 -std=c++17 -arch=native
+//     -DMODEL_SRC='"<M>_ode.cu"' -DM=<M> -DU=<U> gpu_btf.cu gpu_btf_host.o -o gpu_btf
 // CPU emulation:
-//   g++ -O1 -std=c++17 -w -x c++ -DCPU_EMU -DMODEL_SRC='"<M>_ode.cu"' 
+//   g++ -O1 -std=c++17 -w -x c++ -DCPU_EMU -DMODEL_SRC='"<M>_ode.cu"'
 //     -DM=<M> -DU=<U> gpu_btf.cu -o gpu_btf_cpu
 // Run: ./gpu_btf <t_end> <h> <lanes> [csv_prefix] [out_lanes]
 //   writes <csv_prefix>_lane<k>.csv (t, all states every OUT_EVERY steps) for
@@ -64,7 +68,7 @@
 #define K(n) CAT(M, n)
 #define C(n) CAT(U, n)
 
-#ifdef CPU_EMU
+#if defined(CPU_EMU) || defined(HOST_TU)
 struct Dim3 { int x; };
 static Dim3 blockIdx{0}, blockDim{1}, threadIdx{0};
 using std::isfinite;
@@ -73,6 +77,28 @@ using std::isfinite;
 #define __device__
 static void rmc_debug_block(int, int, double) {}
 #include MODEL_SRC
+// Host side of the model: initialization and the t=0 probe run here, once.
+// On the GPU the inlined initialization needs about 1.3 MB of stack per
+// thread, more than a launch accepts. In the CUDA build this part is compiled
+// by the host compiler from the same file with -DHOST_TU and linked in.
+extern "C" void host_init(double *y, double *p, double *hist, int *status) {
+    const int hs = C(_DELAY_HISTORY_STRIDE) > 0 ? C(_DELAY_HISTORY_STRIDE) : 1;
+    *status = 0;
+    K(_load_starts_batch)(y, p, C(_Y_LEN), C(_P_LEN), 1);
+    K(_initialize_batch)(0.0, y, p, status, C(_Y_LEN), C(_P_LEN), 1);
+    K(_delay_init_batch)(0.0, y, p, hist, C(_Y_LEN), C(_P_LEN), hs, 1);
+}
+extern "C" int host_rhs(double t, double *y, double *p, double *hist, double *out) {
+    const int hs = C(_DELAY_HISTORY_STRIDE) > 0 ? C(_DELAY_HISTORY_STRIDE) : 1;
+    int status = 0;
+    K(_delay_apply_batch)(t, y, p, hist, C(_Y_LEN), C(_P_LEN), hs, 1);
+    K(_rhs_batch)(t, y, p, out, &status, C(_Y_LEN), C(_P_LEN), C(_STATE_COUNT), 1);
+    return status;
+}
+#endif
+
+#ifndef HOST_TU
+#ifdef CPU_EMU
 #define HD
 #define LAUNCH(kernel, lanes, ...) \
     for (int rmc_l = 0; rmc_l < (lanes); ++rmc_l) kernel(rmc_l, __VA_ARGS__)
@@ -81,6 +107,8 @@ static void rmc_debug_block(int, int, double) {}
 #define CHECK(call) (call)
 #else
 #include <cuda_runtime.h>
+extern "C" void host_init(double *y, double *p, double *hist, int *status);
+extern "C" int host_rhs(double t, double *y, double *p, double *hist, double *out);
 struct RmcIdx { unsigned int x, y, z; };
 static __device__ constexpr RmcIdx rmc_idx_zero{0u, 0u, 0u};
 static __device__ constexpr RmcIdx rmc_idx_one{1u, 1u, 1u};
@@ -307,41 +335,6 @@ struct Buffers {
     Work w; int lanes, out_lanes, out_rows;
 };
 
-#ifdef CPU_EMU
-static void k_init(int lane, Buffers B) {
-#else
-__global__ void k_init(Buffers B) {
-    int lane = LANE_ID;
-#endif
-    if (lane >= B.lanes) return;
-    double *a = B.arena + (size_t)lane * B.w.len, *y = a + B.w.y, *p = B.p + (size_t)lane * NP, *hist = B.hist + (size_t)lane * HS;
-    LaneState &s = B.state[lane];
-    int status = 0;
-    K(_load_starts_batch)(y, p, NY, NP, 1);
-    K(_initialize_batch)(0.0, y, p, &status, NY, NP, 1);
-    K(_delay_init_batch)(0.0, y, p, hist, NY, NP, HS, 1);
-    s = LaneState{}; s.t = 0; s.fact_h = -1; s.fact_theta = -1; s.theta = 0.5; s.jac_age = 1 << 30;
-    s.failed = status != 0 ? 2 : 0;
-}
-
-// Dense finite-difference probe of lane 0 at t=0 into J (NS*NS, row-major).
-#ifdef CPU_EMU
-static void k_probe(int lane, Buffers B, double *J) {
-#else
-__global__ void k_probe(Buffers B, double *J) {
-    int lane = LANE_ID;
-#endif
-    if (lane != 0) return;
-    double *a = B.arena, *y = a + B.w.y, *xp = a + B.w.xp, *f1 = a + B.w.f1, *fp = a + B.w.fp;
-    Lane L{a, B.p, B.hist, B.piv, B.state, nullptr, B.w};
-    copy(xp, y, NY); lane_rhs(L, 0.0, xp, f1);
-    for (int k = 0; k < NS; ++k) {
-        copy(xp, y, NY); double d = 1e-7 * fmax(1.0, fabs(y[k])); xp[k] += d;
-        lane_rhs(L, 0.0, xp, fp);
-        for (int i = 0; i < NS; ++i) J[i*NS+k] = fp[i] - f1[i];
-    }
-}
-
 // First RHS (f0 at t=0), then `steps` top-level steps, recording lanes below
 // out_lanes every OUT_EVERY steps.
 #ifdef CPU_EMU
@@ -456,6 +449,13 @@ template <class T> static T *alloc(size_t n) {
     T *d = nullptr; CHECK(cudaMalloc(&d, sizeof(T) * n)); CHECK(cudaMemset(d, 0, sizeof(T) * n)); return d;
 #endif
 }
+template <class T> static void upload_to(T *dst, const std::vector<T> &v) {
+#ifdef CPU_EMU
+    std::copy(v.begin(), v.end(), dst);
+#else
+    CHECK(cudaMemcpy(dst, v.data(), sizeof(T) * v.size(), cudaMemcpyHostToDevice));
+#endif
+}
 template <class T> static void download(std::vector<T> &dst, const T *src, size_t n) {
     dst.resize(n);
 #ifdef CPU_EMU
@@ -479,7 +479,14 @@ int main(int argc, char **argv) {
     int steps = (int)(t_end / h + 0.5), out_rows = steps / OUT_EVERY;
     auto wall0 = std::chrono::steady_clock::now();
 #ifndef CPU_EMU
-    CHECK(cudaDeviceSetLimit(cudaLimitStackSize, 64 * 1024));
+    {
+        // Stack per thread: what k_run needs, plus a margin. The driver
+        // reserves it for every resident thread, so do not ask for more.
+        cudaFuncAttributes fa; CHECK(cudaFuncGetAttributes(&fa, k_run));
+        size_t stack = fa.localSizeBytes + 4096;
+        CHECK(cudaDeviceSetLimit(cudaLimitStackSize, stack));
+        printf("k_run: %d registers, %zu bytes local, stack limit %zu\n", fa.numRegs, (size_t)fa.localSizeBytes, stack);
+    }
     cudaDeviceProp prop; CHECK(cudaGetDeviceProperties(&prop, 0));
     printf("device: %s\n", prop.name);
 #else
@@ -495,13 +502,22 @@ int main(int argc, char **argv) {
     B.w = make_work(NS * NS, 0);
     B.p = alloc<double>((size_t)NP * lanes + 1); B.hist = alloc<double>((size_t)HS * lanes);
     B.piv = alloc<int>((size_t)NS * lanes); B.state = alloc<LaneState>(lanes);
-    B.arena = alloc<double>((size_t)B.w.len * 1);  // lane 0 only for the probe
+    // Initialization on the host (identical for every lane).
+    std::vector<double> y0(NY, 0.0), p0(NP + 1, 0.0), hist0(HS, 0.0);
+    int init_status = 0;
+    host_init(y0.data(), p0.data(), hist0.data(), &init_status);
+    if (init_status) printf("initialize status=%d\n", init_status);
     {
-        Buffers P1 = B; P1.lanes = 1;
-        LAUNCH(k_init, 1, P1);
-        double *J = alloc<double>((size_t)NS * NS);
-        LAUNCH(k_probe, 1, P1, J); sync();
-        std::vector<double> hJ; download(hJ, J, (size_t)NS * NS);
+        // Dense finite-difference probe at t=0, same steps as be_harness_btf.
+        std::vector<double> xp(NY), f1(NS), fp(NS), hJ((size_t)NS * NS);
+        std::copy(y0.begin(), y0.end(), xp.begin());
+        host_rhs(0.0, xp.data(), p0.data(), hist0.data(), f1.data());
+        for (int k = 0; k < NS; ++k) {
+            std::copy(y0.begin(), y0.end(), xp.begin());
+            double d = 1e-7 * fmax(1.0, fabs(y0[k])); xp[k] += d;
+            host_rhs(0.0, xp.data(), p0.data(), hist0.data(), fp.data());
+            for (int i = 0; i < NS; ++i) hJ[(size_t)i*NS+k] = fp[i] - f1[i];
+        }
         std::vector<unsigned char> pat(NS * NS, 0); int nnz = 0;
         for (int i = 0; i < NS; ++i) for (int j = 0; j < NS; ++j) { pat[i*NS+j] = (i == j) || hJ[i*NS+j] != 0.0; nnz += pat[i*NS+j]; }
         HostStructure H = build(pat);
@@ -521,7 +537,19 @@ int main(int argc, char **argv) {
     B.out = alloc<double>((size_t)std::max(1, out_lanes) * std::max(1, out_rows) * (NS + 1));
     printf("memory per lane: %.1f KiB work + %.1f KiB p + %.1f KiB history\n",
            B.w.len * 8.0 / 1024, NP * 8.0 / 1024, HS * 8.0 / 1024);
-    LAUNCH(k_init, lanes, B); sync();
+    {
+        std::vector<double> ha((size_t)B.w.len * lanes, 0.0), hp((size_t)NP * lanes + 1, 0.0), hh((size_t)HS * lanes, 0.0);
+        std::vector<LaneState> hs0(lanes);
+        LaneState s0{}; s0.t = 0; s0.fact_h = -1; s0.fact_theta = -1; s0.theta = 0.5; s0.jac_age = 1 << 30;
+        s0.failed = init_status != 0 ? 2 : 0;
+        for (int l = 0; l < lanes; ++l) {
+            std::copy(y0.begin(), y0.end(), ha.begin() + (size_t)l * B.w.len + B.w.y);
+            std::copy(p0.begin(), p0.begin() + NP, hp.begin() + (size_t)l * NP);
+            std::copy(hist0.begin(), hist0.end(), hh.begin() + (size_t)l * HS);
+            hs0[l] = s0;
+        }
+        upload_to(B.arena, ha); upload_to(B.p, hp); upload_to(B.hist, hh); upload_to(B.state, hs0);
+    }
     auto run0 = std::chrono::steady_clock::now();
     for (int start = 0; start < steps; start += CHUNK_STEPS) {
         int n = std::min(CHUNK_STEPS, steps - start);
@@ -564,3 +592,4 @@ int main(int argc, char **argv) {
     }
     return failed ? 1 : 0;
 }
+#endif  // HOST_TU
