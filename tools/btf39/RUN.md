@@ -29,4 +29,4 @@ sha256sum be_harness_btf.cpp IEEE39Bus_cuda/${M}_ode.cu | tee $D/SHA256SUMS
 
 Options : `-DREUSE_JF=1` réutilise le Jacobien quand h change (par défaut 0, la règle d'origine, 13 % plus rapide sur le 39 bus).
 `-DPROBE_EVERY=N` (400 par défaut, soit 10 ms à 25 µs) espace les sondes denses.
-`-DBTF=0 -DREUSE_JF=0` redonne exactement `be_harness.cpp`, vérifié bit à bit sur le modèle `mock_ode.cu`.
+`-DBTF=0 -DREUSE_JF=0 -DNEWTON_ATOL=1e-6 -DNEWTON_RTOL=1e-5` redonne exactement `be_harness.cpp`, vérifié bit à bit sur le modèle `mock_ode.cu`.

@@ -29,8 +29,11 @@
 //      that needs a short step no longer shortens the step of the others.
 //      With a single group it is the original iteration, bit for bit.
 //
-// Newton step tolerance: |dx_i| < NEWTON_ATOL + NEWTON_RTOL*|x_i| (defaults
-// 1e-6 and 1e-5, as in be_harness.cpp).
+// Newton step tolerance: |dx_i| < NEWTON_ATOL + NEWTON_RTOL*|x_i|. Defaults
+// 1e-9 and 1e-8: on the 39-bus over 0.1 s at 25 us they were 3.3 times faster
+// than the 1e-6/1e-5 of be_harness.cpp (2045 halvings instead of 7013) and
+// halved the error against a 12.5 us tight run. -DNEWTON_ATOL=1e-6
+// -DNEWTON_RTOL=1e-5 restores be_harness.cpp.
 //
 // -DBTF=0 runs the same code with a full pattern (NS colors, one block), which
 // is the original dense method with the same instrumentation, for A/B timing.
@@ -69,10 +72,10 @@ static void rmc_debug_block(int b, int s, double t) { static int n = 0; if (n++ 
 #define BLOCK_NEWTON 0
 #endif
 #ifndef NEWTON_ATOL
-#define NEWTON_ATOL 1e-6
+#define NEWTON_ATOL 1e-9
 #endif
 #ifndef NEWTON_RTOL
-#define NEWTON_RTOL 1e-5
+#define NEWTON_RTOL 1e-8
 #endif
 #ifndef PROBE_EVERY
 #define PROBE_EVERY 400
