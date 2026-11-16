@@ -161,6 +161,7 @@ struct LaneState {
     int jac_age, jf_valid, failed, steps;
     long long rhs_calls, rhs_failures, jac_rhs_calls;
     int jacobians, factorizations, halvings, relaxed, be_steps, unconverged;
+    long long cyc[4];  // clock cycles (ns on the CPU): rhs (all calls), jacobian, factor, solve
 };
 struct Work {
     // offsets (in doubles) into one lane's arena
@@ -182,7 +183,18 @@ struct Lane {
     Work w;
 };
 
+#ifdef CPU_EMU
+static long long prof_clock() { return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+#else
+__device__ static long long prof_clock() { return clock64(); }
+#endif
+#define PROF(L, k, stmt) do { long long prof_t0 = prof_clock(); stmt; (L).s->cyc[k] += prof_clock() - prof_t0; } while (0)
+
+HD static int lane_rhs_raw(Lane &L, double t, double *y, double *out);
 HD static int lane_rhs(Lane &L, double t, double *y, double *out) {
+    int r; PROF(L, 0, r = lane_rhs_raw(L, t, y, out)); return r;
+}
+HD static int lane_rhs_raw(Lane &L, double t, double *y, double *out) {
     int status = 0; ++L.s->rhs_calls;
     K(_delay_apply_batch)(t, y, L.p, L.hist, NY, NP, HS, 1);
     K(_rhs_batch)(t, y, L.p, out, &status, NY, NP, NS, 1);
@@ -271,16 +283,17 @@ HD static bool attempt(Lane &L, double hh) {
             // xt is free here: keep a copy of the point, as the RHS settles
             // the algebraics in place.
             copy(xt, refresh == 0 ? y : x, NY);
-            jacobian(L, t1, xt);
+            PROF(L, 1, jacobian(L, t1, xt));
             s.jac_age = 0; s.jf_valid = 1; ++s.jacobians;
         }
         if (new_jf || s.fact_h != hh || s.fact_theta != s.theta) {
-            if (!factor(L, s.theta, hh)) { s.fact_h = -1; return false; }
+            bool fok; PROF(L, 2, fok = factor(L, s.theta, hh));
+            if (!fok) { s.fact_h = -1; return false; }
             s.fact_h = hh; s.fact_theta = s.theta; ++s.factorizations;
         }
         lane_rhs(L, t1, x, f1); double n2 = residual(L, x, f1, hh, r);
         for (int it = 0; it < 10; ++it) {
-            copy(dx, r, NS); solve(L, s.theta, hh, dx);
+            copy(dx, r, NS); PROF(L, 3, solve(L, s.theta, hh, dx));
             double lambda = 1.0, n2new = 0;
             for (int trial = 0; trial < 8; ++trial) {
                 copy(xt, x, NY); for (int j = 0; j < NS; ++j) xt[j] = x[j] + lambda * dx[j];
@@ -604,6 +617,17 @@ int main(int argc, char **argv) {
     const LaneState &s = hs[0];
     printf("lane0: t=%g steps=%d unconverged=%d halvings=%d relaxed=%d be_steps=%d jacobians=%d factorizations=%d rhs_calls=%lld (jacobian %lld) rhs_failures=%lld\n",
            s.t, s.steps, s.unconverged, s.halvings, s.relaxed, s.be_steps, s.jacobians, s.factorizations, s.rhs_calls, s.jac_rhs_calls, s.rhs_failures);
+    {
+        double tot = (double)s.cyc[0] + 1e-30;
+        double rj = (double)s.jac_rhs_calls / fmax(1.0, (double)s.rhs_calls);
+        printf("lane0 profile (%s): rhs %.3g (%.0f%% of it inside jacobians), jacobian %.3g, factor %.3g, solve %.3g; per rhs call %.3g\n",
+#ifdef CPU_EMU
+               "ns",
+#else
+               "cycles",
+#endif
+               tot, 100 * rj, (double)s.cyc[1], (double)s.cyc[2], (double)s.cyc[3], tot / fmax(1.0, (double)s.rhs_calls));
+    }
     printf("lanes: %d, failed=%d, min t=%g, rhs_calls min=%lld max=%lld\n", lanes, failed, t_min, rhs_min, rhs_max);
     // All lanes start identical: they must end identical.
     std::vector<double> arena; download(arena, B.arena, (size_t)B.w.len * lanes);
