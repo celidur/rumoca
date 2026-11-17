@@ -167,6 +167,7 @@ struct Structure {
     const int *off_ptr, *off_k, *off_j, *off_e;  // off-block entries per block
     int nlevels;
     const int *lvl_ptr, *lvl_blk;           // blocks of each solve level
+    const int *blk_kl, *blk_ku;             // lower and upper bandwidth of each block
 };
 
 // ---- Per-lane memory -------------------------------------------------------
@@ -290,18 +291,30 @@ HD static void jac_colors(Lane &L, int tid) {
     }
 }
 
-HD static bool lu(double *a, int *piv, int n) {
+// LU with partial pivoting of a dense row-major block whose entries lie
+// within kl subdiagonals and ku superdiagonals. Pivoting keeps the lower
+// bandwidth and widens U to kl + ku (LAPACK gbtrf), so every loop stops at
+// the band; outside it the dense loops would only add zero products, so the
+// result is the same as the dense factorization bit for bit.
+HD static bool lu(double *a, int *piv, int n, int kl, int ku) {
     for (int c = 0; c < n; ++c) {
-        int m = c; for (int i = c + 1; i < n; ++i) if (fabs(a[i*n+c]) > fabs(a[m*n+c])) m = i;
+        int ie = c + kl + 1 < n ? c + kl + 1 : n, je = c + kl + ku + 1 < n ? c + kl + ku + 1 : n;
+        int m = c; for (int i = c + 1; i < ie; ++i) if (fabs(a[i*n+c]) > fabs(a[m*n+c])) m = i;
         if (a[m*n+c] == 0.0) return false;
-        piv[c] = m; if (m != c) for (int j = c; j < n; ++j) { double s = a[c*n+j]; a[c*n+j] = a[m*n+j]; a[m*n+j] = s; }
-        for (int i = c + 1; i < n; ++i) { double f = a[i*n+c] /= a[c*n+c]; if (f != 0.0) for (int j = c + 1; j < n; ++j) a[i*n+j] -= f * a[c*n+j]; }
+        piv[c] = m; if (m != c) for (int j = c; j < je; ++j) { double s = a[c*n+j]; a[c*n+j] = a[m*n+j]; a[m*n+j] = s; }
+        for (int i = c + 1; i < ie; ++i) { double f = a[i*n+c] /= a[c*n+c]; if (f != 0.0) for (int j = c + 1; j < je; ++j) a[i*n+j] -= f * a[c*n+j]; }
     }
     return true;
 }
-HD static void lu_solve(const double *a, const int *piv, int n, double *b) {
-    for (int c = 0; c < n; ++c) { double s = b[c]; b[c] = b[piv[c]]; b[piv[c]] = s; for (int i = c + 1; i < n; ++i) b[i] -= a[i*n+c] * b[c]; }
-    for (int i = n - 1; i >= 0; --i) { double s = b[i]; for (int j = i + 1; j < n; ++j) s -= a[i*n+j] * b[j]; b[i] = s / a[i*n+i]; }
+HD static void lu_solve(const double *a, const int *piv, int n, int kl, int ku, double *b) {
+    for (int c = 0; c < n; ++c) {
+        int ie = c + kl + 1 < n ? c + kl + 1 : n;
+        double s = b[c]; b[c] = b[piv[c]]; b[piv[c]] = s; for (int i = c + 1; i < ie; ++i) b[i] -= a[i*n+c] * b[c];
+    }
+    for (int i = n - 1; i >= 0; --i) {
+        int je = i + kl + ku + 1 < n ? i + kl + ku + 1 : n;
+        double s = b[i]; for (int j = i + 1; j < je; ++j) s -= a[i*n+j] * b[j]; b[i] = s / a[i*n+i];
+    }
 }
 
 HD static bool factor_blocks(Lane &L, double theta, double hh, int b0, int stride) {
@@ -313,7 +326,7 @@ HD static bool factor_blocks(Lane &L, double theta, double hh, int b0, int strid
             int e = map[r*s+c];
             m[r*s+c] = (r == c ? 1.0 : 0.0) - theta * hh * (e >= 0 ? jf[e] : 0.0);
         }
-        if (!lu(m, L.piv + base, s)) return false;
+        if (!lu(m, L.piv + base, s, S.blk_kl[b], S.blk_ku[b])) return false;
     }
     return true;
 }
@@ -332,7 +345,7 @@ HD static void solve_block(Lane &L, int b, double theta, double hh, double *dx, 
     int base = S.blk_ptr[b], s = S.blk_ptr[b + 1] - base;
     for (int k = 0; k < s; ++k) rb[k] = dx[S.blk_idx[base + k]];
     for (int q = S.off_ptr[b]; q < S.off_ptr[b + 1]; ++q) rb[S.off_k[q]] += theta * hh * jf[S.off_e[q]] * dx[S.off_j[q]];
-    lu_solve(L.a + L.w.lu + S.blk_lu[b], L.piv + base, s, rb);
+    lu_solve(L.a + L.w.lu + S.blk_lu[b], L.piv + base, s, S.blk_kl[b], S.blk_ku[b], rb);
     for (int k = 0; k < s; ++k) dx[S.blk_idx[base + k]] = rb[k];
 }
 HD static void solve(Lane &L, double theta, double hh, double *dx) {
@@ -565,9 +578,40 @@ HD static void k_run_lane(Lane &L, const Buffers &B, int lane, int first, int st
 
 // ---- Host: structure from the probed pattern ------------------------------
 struct HostStructure {
-    std::vector<int> col_ptr, ent_row, color_ptr, color_cols, blk_ptr, blk_idx, blk_lu, blk_map, map, off_ptr, off_k, off_j, off_e, lvl_ptr, lvl_blk;
-    int ncolors = 0, nblocks = 0, lu_len = 0, largest = 0, nlevels = 0;
+    std::vector<int> col_ptr, ent_row, color_ptr, color_cols, blk_ptr, blk_idx, blk_lu, blk_map, map, off_ptr, off_k, off_j, off_e, lvl_ptr, lvl_blk, blk_kl, blk_ku;
+    int ncolors = 0, nblocks = 0, lu_len = 0, largest = 0, nlevels = 0, widest = 0;
 };
+// Bandwidths (kl, ku) of a block whose rows and columns are the states `ord`.
+static void bandwidth(const std::vector<int> &ord, const std::vector<unsigned char> &P, int &kl, int &ku) {
+    kl = ku = 0; int s = (int)ord.size();
+    for (int r = 0; r < s; ++r) for (int c = 0; c < s; ++c) if (P[ord[r]*NS+ord[c]]) { if (r > c) kl = std::max(kl, r - c); else ku = std::max(ku, c - r); }
+}
+// Order of a block's states: reverse Cuthill-McKee on the symmetrized
+// pattern when it gives a narrower band than the sorted order (kept on a
+// tie, so a block that does not gain keeps its arithmetic).
+static std::vector<int> block_order(const std::vector<int> &cb, const std::vector<unsigned char> &P, int &kl, int &ku) {
+    int s = (int)cb.size(); bandwidth(cb, P, kl, ku);
+    if (s < 3) return cb;
+    std::vector<std::vector<int>> adj(s);
+    for (int r = 0; r < s; ++r) for (int c = 0; c < s; ++c) if (r != c && (P[cb[r]*NS+cb[c]] || P[cb[c]*NS+cb[r]])) adj[r].push_back(c);
+    std::vector<char> seen(s, 0); std::vector<int> order;
+    auto deg = [&](int v) { return adj[v].size(); };
+    while ((int)order.size() < s) {
+        int start = -1; for (int v = 0; v < s; ++v) if (!seen[v] && (start < 0 || deg(v) < deg(start))) start = v;
+        size_t head = order.size(); order.push_back(start); seen[start] = 1;
+        while (head < order.size()) {
+            int v = order[head++]; std::vector<int> nb;
+            for (int w : adj[v]) if (!seen[w]) { seen[w] = 1; nb.push_back(w); }
+            std::stable_sort(nb.begin(), nb.end(), [&](int a, int b) { return deg(a) < deg(b); });
+            order.insert(order.end(), nb.begin(), nb.end());
+        }
+    }
+    std::reverse(order.begin(), order.end());
+    std::vector<int> ord(s); for (int k = 0; k < s; ++k) ord[k] = cb[order[k]];
+    int kl2, ku2; bandwidth(ord, P, kl2, ku2);
+    if (kl2 + ku2 < kl + ku) { kl = kl2; ku = ku2; return ord; }
+    return cb;
+}
 static HostStructure build(const std::vector<unsigned char> &P) {
     HostStructure H;
     std::vector<std::vector<int>> col_rows(NS), row_cols(NS);
@@ -620,6 +664,8 @@ static HostStructure build(const std::vector<unsigned char> &P) {
     for (int b = 0; b < H.nblocks; ++b) for (int i : comps[b]) blk_of[i] = b;
     int map_len = 0;
     for (int b = 0; b < H.nblocks; ++b) {
+        int kl, ku; comps[b] = block_order(comps[b], P, kl, ku);
+        H.blk_kl.push_back(kl); H.blk_ku.push_back(ku); H.widest = std::max(H.widest, kl + ku + 1);
         auto &cb = comps[b]; int s = (int)cb.size(); H.largest = std::max(H.largest, s);
         for (int i : cb) H.blk_idx.push_back(i);
         H.blk_ptr[b + 1] = (int)H.blk_idx.size();
@@ -746,7 +792,7 @@ int main(int argc, char **argv) {
         for (int i = 0; i < NS; ++i) for (int j = 0; j < NS; ++j) { pat[i*NS+j] = (i == j) || hJ[i*NS+j] != 0.0; nnz += pat[i*NS+j]; }
         HostStructure H = build(pat);
         long off = (long)H.off_k.size();
-        printf("structure: nnz=%d colors=%d blocks=%d largest=%d off_block_nnz=%ld levels=%d COOP=%d\n", nnz, H.ncolors, H.nblocks, H.largest, off, H.nlevels, COOP);
+        printf("structure: nnz=%d colors=%d blocks=%d largest=%d off_block_nnz=%ld levels=%d widest_band=%d COOP=%d\n", nnz, H.ncolors, H.nblocks, H.largest, off, H.nlevels, H.widest, COOP);
         Structure S{};
         S.nnz = nnz; S.ncolors = H.ncolors; S.nblocks = H.nblocks; S.lu_len = H.lu_len; S.map_len = (int)H.map.size(); S.noff = (int)off;
         S.col_ptr = upload(H.col_ptr); S.ent_row = upload(H.ent_row); S.color_ptr = upload(H.color_ptr); S.color_cols = upload(H.color_cols);
@@ -754,6 +800,7 @@ int main(int argc, char **argv) {
         S.map = upload(H.map); S.off_ptr = upload(H.off_ptr);
         S.off_k = upload(H.off_k); S.off_j = upload(H.off_j); S.off_e = upload(H.off_e);
         S.nlevels = H.nlevels; S.lvl_ptr = upload(H.lvl_ptr); S.lvl_blk = upload(H.lvl_blk);
+        S.blk_kl = upload(H.blk_kl); S.blk_ku = upload(H.blk_ku);
         B.st = upload(std::vector<Structure>{S});
         B.w = make_work(nnz, H.lu_len);
     }

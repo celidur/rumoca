@@ -99,18 +99,24 @@ static int rhs(double t, std::vector<double>& y, std::vector<double>& out) {
     t_rhs += secs_since(a);
     return st;
 }
-static bool lu(std::vector<double>& a, std::vector<int>& piv, int n) {
+// LU with partial pivoting of a dense row-major block whose entries lie
+// within kl subdiagonals and ku superdiagonals. Pivoting keeps the lower
+// bandwidth and widens U to kl + ku (LAPACK gbtrf), so every loop stops at
+// the band; outside it the dense loops would only add zero products, so the
+// result is the same as the dense factorization bit for bit.
+static bool lu(std::vector<double>& a, std::vector<int>& piv, int n, int kl, int ku) {
     for (int c = 0; c < n; ++c) {
-        int m = c; for (int i = c + 1; i < n; ++i) if (fabs(a[i*n+c]) > fabs(a[m*n+c])) m = i;
+        int ie = std::min(n, c + kl + 1), je = std::min(n, c + kl + ku + 1);
+        int m = c; for (int i = c + 1; i < ie; ++i) if (fabs(a[i*n+c]) > fabs(a[m*n+c])) m = i;
         if (a[m*n+c] == 0.0) return false;
-        piv[c] = m; if (m != c) for (int j = c; j < n; ++j) std::swap(a[c*n+j], a[m*n+j]);
-        for (int i = c + 1; i < n; ++i) { double f = a[i*n+c] /= a[c*n+c]; if (f != 0.0) for (int j = c + 1; j < n; ++j) a[i*n+j] -= f * a[c*n+j]; }
+        piv[c] = m; if (m != c) for (int j = c; j < je; ++j) std::swap(a[c*n+j], a[m*n+j]);
+        for (int i = c + 1; i < ie; ++i) { double f = a[i*n+c] /= a[c*n+c]; if (f != 0.0) for (int j = c + 1; j < je; ++j) a[i*n+j] -= f * a[c*n+j]; }
     }
     return true;
 }
-static void lu_solve(const std::vector<double>& a, const std::vector<int>& piv, int n, double* b) {
-    for (int c = 0; c < n; ++c) { std::swap(b[c], b[piv[c]]); for (int i = c + 1; i < n; ++i) b[i] -= a[i*n+c] * b[c]; }
-    for (int i = n - 1; i >= 0; --i) { double s = b[i]; for (int j = i + 1; j < n; ++j) s -= a[i*n+j] * b[j]; b[i] = s / a[i*n+i]; }
+static void lu_solve(const std::vector<double>& a, const std::vector<int>& piv, int n, int kl, int ku, double* b) {
+    for (int c = 0; c < n; ++c) { int ie = std::min(n, c + kl + 1); std::swap(b[c], b[piv[c]]); for (int i = c + 1; i < ie; ++i) b[i] -= a[i*n+c] * b[c]; }
+    for (int i = n - 1; i >= 0; --i) { int je = std::min(n, i + kl + ku + 1); double s = b[i]; for (int j = i + 1; j < je; ++j) s -= a[i*n+j] * b[j]; b[i] = s / a[i*n+i]; }
 }
 
 // ---- Sparse structure: pattern, coloring, block triangular form ----------
@@ -118,6 +124,8 @@ struct Block {
     std::vector<int> idx;                 // states of the block (global indices)
     std::vector<double> lu; std::vector<int> piv;
     std::vector<int> off_i, off_j;        // off-block entries J[i][j], i in block
+    std::vector<int> off_k;               // position of off_i in idx
+    int kl = 0, ku = 0;                   // bandwidths in the idx order
 };
 static std::vector<unsigned char> P(NS * NS, 0);  // P[i*NS+j]: J[i][j] may be nonzero
 static std::vector<std::vector<int>> col_rows;    // rows of each column
@@ -126,6 +134,38 @@ static std::vector<Block> blocks;                 // in solve order
 static std::vector<std::vector<int>> ngroups;     // states of each independent group
 static std::vector<double> Jf(NS * NS, 0.0);      // J = df/dx on the pattern
 static long pattern_nnz = 0; static int pattern_builds = 0;
+
+// Bandwidths (kl, ku) of a block whose rows and columns are the states `ord`.
+static void bandwidth(const std::vector<int>& ord, int& kl, int& ku) {
+    kl = ku = 0; int s = (int)ord.size();
+    for (int r = 0; r < s; ++r) for (int c = 0; c < s; ++c) if (P[ord[r]*NS+ord[c]]) { if (r > c) kl = std::max(kl, r - c); else ku = std::max(ku, c - r); }
+}
+// Order of a block's states: reverse Cuthill-McKee on the symmetrized
+// pattern when it gives a narrower band than the sorted order (kept on a
+// tie, so a block that does not gain keeps its arithmetic).
+static std::vector<int> block_order(const std::vector<int>& cb, int& kl, int& ku) {
+    int s = (int)cb.size(); bandwidth(cb, kl, ku);
+    if (s < 3) return cb;
+    std::vector<std::vector<int>> adj(s);
+    for (int r = 0; r < s; ++r) for (int c = 0; c < s; ++c) if (r != c && (P[cb[r]*NS+cb[c]] || P[cb[c]*NS+cb[r]])) adj[r].push_back(c);
+    std::vector<char> seen(s, 0); std::vector<int> order;
+    auto deg = [&](int v) { return adj[v].size(); };
+    while ((int)order.size() < s) {
+        int start = -1; for (int v = 0; v < s; ++v) if (!seen[v] && (start < 0 || deg(v) < deg(start))) start = v;
+        size_t head = order.size(); order.push_back(start); seen[start] = 1;
+        while (head < order.size()) {
+            int v = order[head++]; std::vector<int> nb;
+            for (int w : adj[v]) if (!seen[w]) { seen[w] = 1; nb.push_back(w); }
+            std::stable_sort(nb.begin(), nb.end(), [&](int a, int b) { return deg(a) < deg(b); });
+            order.insert(order.end(), nb.begin(), nb.end());
+        }
+    }
+    std::reverse(order.begin(), order.end());
+    std::vector<int> ord(s); for (int k = 0; k < s; ++k) ord[k] = cb[order[k]];
+    int kl2, ku2; bandwidth(ord, kl2, ku2);
+    if (kl2 + ku2 < kl + ku) { kl = kl2; ku = ku2; return ord; }
+    return cb;
+}
 
 static void build_structure() {
     ++pattern_builds;
@@ -185,10 +225,12 @@ static void build_structure() {
     blocks.assign(comps.size(), {});
     for (size_t b = 0; b < comps.size(); ++b) { blocks[b].idx = comps[b]; for (int i : comps[b]) blk_of[i] = (int)b; }
     long off = 0; size_t largest = 0;
+    int widest = 0;
     for (size_t b = 0; b < blocks.size(); ++b) {
         auto& B = blocks[b]; size_t s = B.idx.size(); largest = std::max(largest, s);
+        B.idx = block_order(B.idx, B.kl, B.ku); widest = std::max(widest, B.kl + B.ku + 1);
         B.lu.assign(s * s, 0.0); B.piv.assign(s, 0);
-        for (int i : B.idx) for (int j : row_cols[i]) if (blk_of[j] != (int)b) { B.off_i.push_back(i); B.off_j.push_back(j); ++off; }
+        for (size_t k = 0; k < s; ++k) { int i = B.idx[k]; for (int j : row_cols[i]) if (blk_of[j] != (int)b) { B.off_i.push_back(i); B.off_j.push_back(j); B.off_k.push_back((int)k); ++off; } }
     }
     // Independent groups: blocks joined by off-block entries (union-find).
     std::vector<int> parent(blocks.size());
@@ -205,8 +247,8 @@ static void build_structure() {
         for (int i : blocks[b].idx) ngroups[gid[root]].push_back(i);
     }
     size_t glargest = 0; for (auto& g : ngroups) glargest = std::max(glargest, g.size());
-    printf("structure #%d: nnz=%ld colors=%d blocks=%zu largest=%zu off_block_nnz=%ld groups=%zu largest_group=%zu\n",
-           pattern_builds, pattern_nnz, ncolors, blocks.size(), largest, off, ngroups.size(), glargest);
+    printf("structure #%d: nnz=%ld colors=%d blocks=%zu largest=%zu off_block_nnz=%ld groups=%zu largest_group=%zu widest_band=%d\n",
+           pattern_builds, pattern_nnz, ncolors, blocks.size(), largest, off, ngroups.size(), glargest, widest);
 }
 
 // Colored finite-difference Jacobian of f at `at` (time t1); f1 gets f(at).
@@ -232,7 +274,7 @@ static bool factor(double theta, double hh) {
             int i = B.idx[r], j = B.idx[c];
             B.lu[r*s+c] = (r == c ? 1.0 : 0.0) - theta * hh * (P[i*NS+j] ? Jf[i*NS+j] : 0.0);
         }
-        if (!lu(B.lu, B.piv, s)) { ok = false; break; }
+        if (!lu(B.lu, B.piv, s, B.kl, B.ku)) { ok = false; break; }
     }
     t_lu += secs_since(a);
     return ok;
@@ -249,11 +291,10 @@ static void solve(double theta, double hh, std::vector<double>& dx) {
         if (!B.off_i.empty()) {
             for (size_t e = 0; e < B.off_i.size(); ++e) {
                 int i = B.off_i[e], j = B.off_j[e];
-                int k = (int)(std::lower_bound(B.idx.begin(), B.idx.end(), i) - B.idx.begin());
-                rb[k] += theta * hh * Jf[i*NS+j] * dx[j];
+                rb[B.off_k[e]] += theta * hh * Jf[i*NS+j] * dx[j];
             }
         }
-        lu_solve(B.lu, B.piv, s, rb.data());
+        lu_solve(B.lu, B.piv, s, B.kl, B.ku, rb.data());
         for (int k = 0; k < s; ++k) dx[B.idx[k]] = rb[k];
     }
     t_solve += secs_since(a);
