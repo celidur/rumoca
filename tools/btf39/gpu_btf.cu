@@ -64,6 +64,18 @@
 #ifndef BLOCK_THREADS
 #define BLOCK_THREADS 32
 #endif
+// COOP: threads per simulation. 1 (default): one lane per thread,
+// BLOCK_THREADS lanes per block. 2..32: one simulation per block of COOP
+// threads (one warp). Thread 0 runs the integrator; the others wait at the
+// warp barrier and join the parallel sections (colored Jacobian, block
+// factorization, block solve by level, long copies). The arithmetic of every
+// entry is the same as with COOP=1, so the results are bit-identical.
+#ifndef COOP
+#define COOP 1
+#endif
+#if COOP < 1 || COOP > 32
+#error "COOP must be in 1..32"
+#endif
 
 #define CAT2(a, b) a##b
 #define CAT(a, b) CAT2(a, b)
@@ -153,6 +165,8 @@ struct Structure {
     const int *blk_lu, *blk_map;            // LU offset per block; map offset per block
     const int *map;                         // map[blk_map[b] + r*s + c] = CSC entry or -1
     const int *off_ptr, *off_k, *off_j, *off_e;  // off-block entries per block
+    int nlevels;
+    const int *lvl_ptr, *lvl_blk;           // blocks of each solve level
 };
 
 // ---- Per-lane memory -------------------------------------------------------
@@ -165,15 +179,24 @@ struct LaneState {
 };
 struct Work {
     // offsets (in doubles) into one lane's arena
-    int y, x, xt, xp, best, f0, f1, fp, r, rr, dx, d, jf, lu, len;
+    int y, x, xt, xp, best, f0, f1, fp, r, rr, dx, d, jf, lu, sx, len;
 };
 static Work make_work(int nnz, int lu_len) {
     Work w{}; int o = 0;
     w.y = o; o += NY; w.x = o; o += NY; w.xt = o; o += NY; w.xp = o; o += NY; w.best = o; o += NY;
     w.f0 = o; o += NS; w.f1 = o; o += NS; w.fp = o; o += NS; w.r = o; o += NS; w.rr = o; o += NS;
-    w.dx = o; o += NS; w.d = o; o += NS; w.jf = o; o += nnz; w.lu = o; o += lu_len; w.len = o;
+    w.dx = o; o += NS; w.d = o; o += NS; w.jf = o; o += nnz; w.lu = o; o += lu_len;
+    // per-thread scratch of the parallel sections: xp (NY) then fp (NS)
+    w.sx = o; o += COOP > 1 ? COOP * (NY + NS) : 0; w.len = o;
     return w;
 }
+// Command of a parallel section, written by thread 0 before the barrier.
+enum { P_EXIT, P_COPY, P_JAC, P_FACTOR, P_SOLVE };
+struct Par {
+    int cmd, arg, fail, n;
+    double t, theta, hh;
+    const double *src; double *dst;
+};
 struct Lane {
     double *a;        // arena
     double *p, *hist;
@@ -181,6 +204,7 @@ struct Lane {
     LaneState *s;
     const Structure *st;
     Work w;
+    Par *par;
 };
 
 #ifdef CPU_EMU
@@ -189,25 +213,50 @@ static long long prof_clock() { return std::chrono::duration_cast<std::chrono::n
 __device__ static long long prof_clock() { return clock64(); }
 #endif
 #define PROF(L, k, stmt) do { long long prof_t0 = prof_clock(); stmt; (L).s->cyc[k] += prof_clock() - prof_t0; } while (0)
+// Counters touched inside parallel sections.
+#if COOP > 1 && !defined(CPU_EMU)
+#define ADD(x, v) atomicAdd((unsigned long long *)&(x), (unsigned long long)(v))
+#define WARP_MASK (COOP == 32 ? 0xffffffffu : ((1u << COOP) - 1u))
+#else
+#define ADD(x, v) ((x) += (v))
+#endif
 
 HD static int lane_rhs_raw(Lane &L, double t, double *y, double *out);
 HD static int lane_rhs(Lane &L, double t, double *y, double *out) {
-    int r; PROF(L, 0, r = lane_rhs_raw(L, t, y, out)); return r;
+    int r; long long t0 = prof_clock(); r = lane_rhs_raw(L, t, y, out); ADD(L.s->cyc[0], prof_clock() - t0); return r;
 }
 HD static int lane_rhs_raw(Lane &L, double t, double *y, double *out) {
-    int status = 0; ++L.s->rhs_calls;
+    int status = 0; ADD(L.s->rhs_calls, 1);
     K(_delay_apply_batch)(t, y, L.p, L.hist, NY, NP, HS, 1);
     K(_rhs_batch)(t, y, L.p, out, &status, NY, NP, NS, 1);
-    if (status) ++L.s->rhs_failures;
+    if (status) ADD(L.s->rhs_failures, 1);
+    return status;
+}
+// RHS of a worker inside the colored Jacobian. Thread 0 has just applied the
+// delays at the same time t into p (the base call), so the workers only
+// read p. This assumes delayed values do not depend on the perturbed states
+// (constant delay times); the bit-identity check against COOP=1 catches a
+// model where that does not hold.
+HD static int lane_rhs_nodelay(Lane &L, double t, double *y, double *out) {
+    int status = 0; long long t0 = prof_clock(); ADD(L.s->rhs_calls, 1);
+    K(_rhs_batch)(t, y, L.p, out, &status, NY, NP, NS, 1);
+    if (status) ADD(L.s->rhs_failures, 1);
+    ADD(L.s->cyc[0], prof_clock() - t0);
     return status;
 }
 HD static void copy(double *dst, const double *src, int n) { for (int i = 0; i < n; ++i) dst[i] = src[i]; }
 
+HD static void jac_colors(Lane &L, int tid);
+HD static void par_run(Lane &L, int cmd);
 HD static void jacobian(Lane &L, double t1, const double *at) {
     const Structure &S = *L.st; double *A = L.a;
     long long c0 = L.s->rhs_calls;
-    double *xp = A + L.w.xp, *f1 = A + L.w.f1, *fp = A + L.w.fp, *d = A + L.w.d, *jf = A + L.w.jf;
+    double *xp = A + L.w.xp, *f1 = A + L.w.f1;
     copy(xp, at, NY); lane_rhs(L, t1, xp, f1);
+#if COOP > 1
+    L.par->t = t1; L.par->src = at; par_run(L, P_JAC);
+#else
+    double *fp = A + L.w.fp, *d = A + L.w.d, *jf = A + L.w.jf;
     for (int c = 0; c < S.ncolors; ++c) {
         copy(xp, at, NY);
         for (int q = S.color_ptr[c]; q < S.color_ptr[c + 1]; ++q) {
@@ -219,7 +268,26 @@ HD static void jacobian(Lane &L, double t1, const double *at) {
             for (int e = S.col_ptr[j]; e < S.col_ptr[j + 1]; ++e) jf[e] = (fp[S.ent_row[e]] - f1[S.ent_row[e]]) / d[j];
         }
     }
+#endif
     L.s->jac_rhs_calls += L.s->rhs_calls - c0;
+}
+// Colors tid, tid + COOP, ... of the Jacobian at P.src, time P.t, into jf.
+// Each thread perturbs its own copy of the point (its scratch xp).
+HD static void jac_colors(Lane &L, int tid) {
+    const Structure &S = *L.st; double *A = L.a; const Par &P = *L.par;
+    double *xp = A + L.w.sx + (size_t)tid * (NY + NS), *fp = xp + NY;
+    const double *at = P.src, *f1 = A + L.w.f1; double *d = A + L.w.d, *jf = A + L.w.jf;
+    for (int c = tid; c < S.ncolors; c += COOP) {
+        copy(xp, at, NY);
+        for (int q = S.color_ptr[c]; q < S.color_ptr[c + 1]; ++q) {
+            int j = S.color_cols[q]; d[j] = 1e-7 * fmax(1.0, fabs(at[j])); xp[j] += d[j];
+        }
+        lane_rhs_nodelay(L, P.t, xp, fp);
+        for (int q = S.color_ptr[c]; q < S.color_ptr[c + 1]; ++q) {
+            int j = S.color_cols[q];
+            for (int e = S.col_ptr[j]; e < S.col_ptr[j + 1]; ++e) jf[e] = (fp[S.ent_row[e]] - f1[S.ent_row[e]]) / d[j];
+        }
+    }
 }
 
 HD static bool lu(double *a, int *piv, int n) {
@@ -236,9 +304,9 @@ HD static void lu_solve(const double *a, const int *piv, int n, double *b) {
     for (int i = n - 1; i >= 0; --i) { double s = b[i]; for (int j = i + 1; j < n; ++j) s -= a[i*n+j] * b[j]; b[i] = s / a[i*n+i]; }
 }
 
-HD static bool factor(Lane &L, double theta, double hh) {
+HD static bool factor_blocks(Lane &L, double theta, double hh, int b0, int stride) {
     const Structure &S = *L.st; double *jf = L.a + L.w.jf;
-    for (int b = 0; b < S.nblocks; ++b) {
+    for (int b = b0; b < S.nblocks; b += stride) {
         int base = S.blk_ptr[b], s = S.blk_ptr[b + 1] - base;
         double *m = L.a + L.w.lu + S.blk_lu[b]; const int *map = S.map + S.blk_map[b];
         for (int r = 0; r < s; ++r) for (int c = 0; c < s; ++c) {
@@ -249,17 +317,71 @@ HD static bool factor(Lane &L, double theta, double hh) {
     }
     return true;
 }
+HD static bool factor(Lane &L, double theta, double hh) {
+#if COOP > 1
+    L.par->theta = theta; L.par->hh = hh; L.par->fail = 0; par_run(L, P_FACTOR);
+    return !L.par->fail;
+#else
+    return factor_blocks(L, theta, hh, 0, 1);
+#endif
+}
 
 // rb is a scratch of NS doubles (the fp slot is free during a solve).
+HD static void solve_block(Lane &L, int b, double theta, double hh, double *dx, double *rb) {
+    const Structure &S = *L.st; const double *jf = L.a + L.w.jf;
+    int base = S.blk_ptr[b], s = S.blk_ptr[b + 1] - base;
+    for (int k = 0; k < s; ++k) rb[k] = dx[S.blk_idx[base + k]];
+    for (int q = S.off_ptr[b]; q < S.off_ptr[b + 1]; ++q) rb[S.off_k[q]] += theta * hh * jf[S.off_e[q]] * dx[S.off_j[q]];
+    lu_solve(L.a + L.w.lu + S.blk_lu[b], L.piv + base, s, rb);
+    for (int k = 0; k < s; ++k) dx[S.blk_idx[base + k]] = rb[k];
+}
 HD static void solve(Lane &L, double theta, double hh, double *dx) {
-    const Structure &S = *L.st; double *jf = L.a + L.w.jf, *rb = L.a + L.w.fp;
-    for (int b = 0; b < S.nblocks; ++b) {
-        int base = S.blk_ptr[b], s = S.blk_ptr[b + 1] - base;
-        for (int k = 0; k < s; ++k) rb[k] = dx[S.blk_idx[base + k]];
-        for (int q = S.off_ptr[b]; q < S.off_ptr[b + 1]; ++q) rb[S.off_k[q]] += theta * hh * jf[S.off_e[q]] * dx[S.off_j[q]];
-        lu_solve(L.a + L.w.lu + S.blk_lu[b], L.piv + base, s, rb);
-        for (int k = 0; k < s; ++k) dx[S.blk_idx[base + k]] = rb[k];
+    const Structure &S = *L.st;
+#if COOP > 1
+    // Level by level: the blocks of a level only read dx of earlier levels.
+    // A level of one block is solved by thread 0 alone (no barrier).
+    double *rb = L.a + L.w.fp;
+    L.par->theta = theta; L.par->hh = hh; L.par->dst = dx;
+    for (int lv = 0; lv < S.nlevels; ++lv) {
+        int q0 = S.lvl_ptr[lv], q1 = S.lvl_ptr[lv + 1];
+        if (q1 - q0 == 1) solve_block(L, S.lvl_blk[q0], theta, hh, dx, rb);
+        else { L.par->arg = lv; par_run(L, P_SOLVE); }
     }
+#else
+    double *rb = L.a + L.w.fp;
+    for (int b = 0; b < S.nblocks; ++b) solve_block(L, b, theta, hh, dx, rb);
+#endif
+}
+// Copy of n doubles, shared by the threads of the simulation when n is long.
+HD static void pcopy(Lane &L, double *dst, const double *src, int n) {
+#if COOP > 1
+    if (n >= 64) { L.par->dst = dst; L.par->src = src; L.par->n = n; par_run(L, P_COPY); return; }
+#endif
+    copy(dst, src, n);
+}
+// Work of thread tid in the current parallel section.
+HD static void par_work(Lane &L, int tid) {
+    Par &P = *L.par; const Structure &S = *L.st;
+    switch (P.cmd) {
+    case P_COPY: for (int i = tid; i < P.n; i += COOP) P.dst[i] = P.src[i]; break;
+    case P_JAC: jac_colors(L, tid); break;
+    case P_FACTOR: if (!factor_blocks(L, P.theta, P.hh, tid, COOP)) P.fail = 1; break;
+    case P_SOLVE: {
+        double *rb = L.a + L.w.sx + (size_t)tid * (NY + NS) + NY;
+        for (int q = S.lvl_ptr[P.arg] + tid; q < S.lvl_ptr[P.arg + 1]; q += COOP) solve_block(L, S.lvl_blk[q], P.theta, P.hh, P.dst, rb);
+        break; }
+    default: break;
+    }
+}
+// Thread 0 runs a parallel section with the waiting threads. The barrier
+// orders the memory accesses before and after it within the warp.
+HD static void par_run(Lane &L, int cmd) {
+    L.par->cmd = cmd;
+#if COOP > 1 && !defined(CPU_EMU)
+    __syncwarp(WARP_MASK); par_work(L, 0); __syncwarp(WARP_MASK);
+#else
+    for (int tid = 0; tid < COOP; ++tid) par_work(L, tid);
+#endif
 }
 
 HD static double residual(Lane &L, const double *x, const double *f1, double hh, double *out) {
@@ -275,14 +397,14 @@ HD static bool attempt(Lane &L, double hh) {
     double *r = A + L.w.r, *rr = A + L.w.rr, *dx = A + L.w.dx, *best = A + L.w.best;
     s.best_err = INFINITY;
     double t1 = s.t + hh;
-    copy(x, y, NY); for (int j = 0; j < NS; ++j) x[j] = y[j] + hh * f0[j];
+    pcopy(L, x, y, NY); for (int j = 0; j < NS; ++j) x[j] = y[j] + hh * f0[j];
     for (int refresh = 0; refresh < 4; ++refresh) {
         bool new_jf = refresh > 0 || s.jac_age > 50 || !s.jf_valid || s.fact_h != hh || s.fact_theta != s.theta;
         if (new_jf) {
             // Jacobian at the start point first, then at the current iterate.
             // xt is free here: keep a copy of the point, as the RHS settles
             // the algebraics in place.
-            copy(xt, refresh == 0 ? y : x, NY);
+            pcopy(L, xt, refresh == 0 ? y : x, NY);
             PROF(L, 1, jacobian(L, t1, xt));
             s.jac_age = 0; s.jf_valid = 1; ++s.jacobians;
         }
@@ -296,7 +418,7 @@ HD static bool attempt(Lane &L, double hh) {
             copy(dx, r, NS); PROF(L, 3, solve(L, s.theta, hh, dx));
             double lambda = 1.0, n2new = 0;
             for (int trial = 0; trial < 8; ++trial) {
-                copy(xt, x, NY); for (int j = 0; j < NS; ++j) xt[j] = x[j] + lambda * dx[j];
+                pcopy(L, xt, x, NY); for (int j = 0; j < NS; ++j) xt[j] = x[j] + lambda * dx[j];
                 int st = lane_rhs(L, t1, xt, f1);
                 n2new = residual(L, xt, f1, hh, rr);
                 if (!st && isfinite(n2new) && (n2new < n2 || trial == 7)) { copy(r, rr, NS); break; }
@@ -304,8 +426,8 @@ HD static bool attempt(Lane &L, double hh) {
             }
             if (!isfinite(n2new)) break;
             double norm = 0; for (int j = 0; j < NS; ++j) norm = fmax(norm, fabs(lambda * dx[j]) / (NEWTON_ATOL + NEWTON_RTOL * fabs(xt[j])));
-            copy(x, xt, NY); n2 = n2new;
-            { double e = 0; for (int j = 0; j < NS; ++j) e = fmax(e, fabs(r[j]) / (1.0 + fabs(x[j]))); if (e < s.best_err) { s.best_err = e; copy(best, x, NY); } }
+            pcopy(L, x, xt, NY); n2 = n2new;
+            { double e = 0; for (int j = 0; j < NS; ++j) e = fmax(e, fabs(r[j]) / (1.0 + fabs(x[j]))); if (e < s.best_err) { s.best_err = e; pcopy(L, best, x, NY); } }
             if (norm < 1.0 && lambda == 1.0) return true;
         }
     }
@@ -314,7 +436,7 @@ HD static bool attempt(Lane &L, double hh) {
 
 HD static void accept(Lane &L, double hh, const double *x) {
     LaneState &s = *L.s; double *y = L.a + L.w.y;
-    copy(y, x, NY); s.t += hh; ++s.jac_age;
+    pcopy(L, y, x, NY); s.t += hh; ++s.jac_age;
     K(_delay_apply_batch)(s.t, y, L.p, L.hist, NY, NP, HS, 1);
     int passes = 0;
     K(_event_update_batch)(s.t, y, L.p, &passes, NY, NP, 1);
@@ -359,24 +481,72 @@ __global__ void k_rhs_check(Buffers B, double t) {
     int lane = LANE_ID;
 #endif
     if (lane != 0) return;
-    Lane L{B.arena, B.p, B.hist, B.piv, B.state, B.st, B.w};
+    Lane L{B.arena, B.p, B.hist, B.piv, B.state, B.st, B.w, nullptr};
     long long calls = L.s->rhs_calls, fails = L.s->rhs_failures;
     copy(L.a + L.w.xp, L.a + L.w.y, NY);
     lane_rhs(L, t, L.a + L.w.xp, L.a + L.w.fp);
     L.s->rhs_calls = calls; L.s->rhs_failures = fails;
 }
 
+// Timing of the model RHS alone: `reps` calls of lane 0 at its current state
+// (y copied to xp before each call), one thread. The in-kernel clock counters
+// do not bracket the inlined RHS reliably (the compiler moves code across
+// clock64), so the RHS cost per call is measured here with CUDA events.
+#ifndef CPU_EMU
+// shared != 0: the point lives in shared memory instead of global memory
+// (separates the data latency from the instruction fetch).
+__global__ void k_rhs_bench(Buffers B, double t, int reps, int shared) {
+    extern __shared__ double sh_y[];
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    Lane L{B.arena, B.p, B.hist, B.piv, B.state, B.st, B.w, nullptr};
+    double *xp = shared ? sh_y : L.a + L.w.xp;
+    for (int k = 0; k < reps; ++k) {
+        int status = 0;
+        copy(xp, L.a + L.w.y, NY);
+        K(_delay_apply_batch)(t, xp, L.p, L.hist, NY, NP, HS, 1);
+        K(_rhs_batch)(t, xp, L.p, L.a + L.w.fp, &status, NY, NP, NS, 1);
+    }
+}
+#endif
+
 // First RHS (f0 at t=0), then `steps` top-level steps, recording lanes below
 // out_lanes every OUT_EVERY steps.
+HD static void k_run_lane(Lane &L, const Buffers &B, int lane, int first, int steps, double h, int start);
 #ifdef CPU_EMU
 static void k_run(int lane, Buffers B, int first, int steps, double h, int start) {
 #else
 __global__ void k_run(Buffers B, int first, int steps, double h, int start) {
+#if COOP > 1
+    int lane = blockIdx.x;
+#else
     int lane = LANE_ID;
 #endif
+#endif
     if (lane >= B.lanes) return;
+#if COOP > 1 && !defined(CPU_EMU)
+    __shared__ Par par;
+#else
+    static Par par;
+#endif
     Lane L{B.arena + (size_t)lane * B.w.len, B.p + (size_t)lane * NP, B.hist + (size_t)lane * HS,
-           B.piv + (size_t)lane * NS, B.state + lane, B.st, B.w};
+           B.piv + (size_t)lane * NS, B.state + lane, B.st, B.w, &par};
+#if COOP > 1 && !defined(CPU_EMU)
+    if (threadIdx.x != 0) {
+        // Waiting threads: one barrier for the command, one after the work.
+        for (;;) {
+            __syncwarp(WARP_MASK);
+            if (par.cmd == P_EXIT) return;
+            par_work(L, threadIdx.x);
+            __syncwarp(WARP_MASK);
+        }
+    }
+#endif
+    k_run_lane(L, B, lane, first, steps, h, start);
+#if COOP > 1 && !defined(CPU_EMU)
+    par.cmd = P_EXIT; __syncwarp(WARP_MASK);
+#endif
+}
+HD static void k_run_lane(Lane &L, const Buffers &B, int lane, int first, int steps, double h, int start) {
     LaneState &s = *L.s;
     if (first) lane_rhs(L, s.t, L.a + L.w.y, L.a + L.w.f0);
     for (int n = 0; n < steps && !s.failed; ++n) {
@@ -395,8 +565,8 @@ __global__ void k_run(Buffers B, int first, int steps, double h, int start) {
 
 // ---- Host: structure from the probed pattern ------------------------------
 struct HostStructure {
-    std::vector<int> col_ptr, ent_row, color_ptr, color_cols, blk_ptr, blk_idx, blk_lu, blk_map, map, off_ptr, off_k, off_j, off_e;
-    int ncolors = 0, nblocks = 0, lu_len = 0, largest = 0;
+    std::vector<int> col_ptr, ent_row, color_ptr, color_cols, blk_ptr, blk_idx, blk_lu, blk_map, map, off_ptr, off_k, off_j, off_e, lvl_ptr, lvl_blk;
+    int ncolors = 0, nblocks = 0, lu_len = 0, largest = 0, nlevels = 0;
 };
 static HostStructure build(const std::vector<unsigned char> &P) {
     HostStructure H;
@@ -461,6 +631,12 @@ static HostStructure build(const std::vector<unsigned char> &P) {
         }
         H.off_ptr[b + 1] = (int)H.off_k.size();
     }
+    // Solve levels: a block comes one level after the deepest block it reads.
+    { std::vector<int> lvl(H.nblocks, 0);
+      for (int b = 0; b < H.nblocks; ++b) for (int q = H.off_ptr[b]; q < H.off_ptr[b + 1]; ++q) lvl[b] = std::max(lvl[b], lvl[blk_of[H.off_j[q]]] + 1);
+      for (int b = 0; b < H.nblocks; ++b) H.nlevels = std::max(H.nlevels, lvl[b] + 1);
+      H.lvl_ptr.assign(H.nlevels + 1, 0);
+      for (int L = 0; L < H.nlevels; ++L) { for (int b = 0; b < H.nblocks; ++b) if (lvl[b] == L) H.lvl_blk.push_back(b); H.lvl_ptr[L + 1] = (int)H.lvl_blk.size(); } }
     return H;
 }
 
@@ -570,13 +746,14 @@ int main(int argc, char **argv) {
         for (int i = 0; i < NS; ++i) for (int j = 0; j < NS; ++j) { pat[i*NS+j] = (i == j) || hJ[i*NS+j] != 0.0; nnz += pat[i*NS+j]; }
         HostStructure H = build(pat);
         long off = (long)H.off_k.size();
-        printf("structure: nnz=%d colors=%d blocks=%d largest=%d off_block_nnz=%ld\n", nnz, H.ncolors, H.nblocks, H.largest, off);
+        printf("structure: nnz=%d colors=%d blocks=%d largest=%d off_block_nnz=%ld levels=%d COOP=%d\n", nnz, H.ncolors, H.nblocks, H.largest, off, H.nlevels, COOP);
         Structure S{};
         S.nnz = nnz; S.ncolors = H.ncolors; S.nblocks = H.nblocks; S.lu_len = H.lu_len; S.map_len = (int)H.map.size(); S.noff = (int)off;
         S.col_ptr = upload(H.col_ptr); S.ent_row = upload(H.ent_row); S.color_ptr = upload(H.color_ptr); S.color_cols = upload(H.color_cols);
         S.blk_ptr = upload(H.blk_ptr); S.blk_idx = upload(H.blk_idx); S.blk_lu = upload(H.blk_lu); S.blk_map = upload(H.blk_map);
         S.map = upload(H.map); S.off_ptr = upload(H.off_ptr);
         S.off_k = upload(H.off_k); S.off_j = upload(H.off_j); S.off_e = upload(H.off_e);
+        S.nlevels = H.nlevels; S.lvl_ptr = upload(H.lvl_ptr); S.lvl_blk = upload(H.lvl_blk);
         B.st = upload(std::vector<Structure>{S});
         B.w = make_work(nnz, H.lu_len);
     }
@@ -602,7 +779,11 @@ int main(int argc, char **argv) {
     auto run0 = std::chrono::steady_clock::now();
     for (int start = 0; start < steps; start += CHUNK_STEPS) {
         int n = std::min(CHUNK_STEPS, steps - start);
+#if COOP > 1 && !defined(CPU_EMU)
+        k_run<<<lanes, COOP>>>(B, start == 0, n, h, start); sync();
+#else
         LAUNCH(k_run, lanes, B, start == 0, n, h, start); sync();
+#endif
         std::vector<LaneState> s0; download(s0, B.state, 1);
         printf("t=%.6g lane0: halvings=%d rhs_calls=%lld wall=%.1fs\n", s0[0].t, s0[0].halvings, s0[0].rhs_calls,
                std::chrono::duration<double>(std::chrono::steady_clock::now() - run0).count());
@@ -611,6 +792,22 @@ int main(int argc, char **argv) {
     }
     double run_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - run0).count();
 
+#ifndef CPU_EMU
+    {
+        // RHS cost per call, and per NY-copy, at the final state.
+        std::vector<LaneState> sf; download(sf, B.state, 1);
+        cudaEvent_t e0, e1; CHECK(cudaEventCreate(&e0)); CHECK(cudaEventCreate(&e1));
+        int reps = 50;
+        for (int sh = 0; sh < 2; ++sh) {
+            size_t bytes = sh ? sizeof(double) * NY : 0;
+            if (sh && (bytes > 99 * 1024 || cudaFuncSetAttribute(k_rhs_bench, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)bytes) != cudaSuccess)) { cudaGetLastError(); printf("rhs bench (y in shared): skipped, %zu bytes\n", bytes); continue; }
+            k_rhs_bench<<<1, 1, bytes>>>(B, sf[0].t, 2, sh); sync();
+            CHECK(cudaEventRecord(e0)); k_rhs_bench<<<1, 1, bytes>>>(B, sf[0].t, reps, sh); CHECK(cudaEventRecord(e1)); sync();
+            float ms = 0; CHECK(cudaEventElapsedTime(&ms, e0, e1));
+            printf("rhs bench (y in %s): %.3f us per call (copy of NY included), %d calls\n", sh ? "shared" : "global", 1e3 * ms / reps, reps);
+        }
+    }
+#endif
     std::vector<LaneState> hs; download(hs, B.state, lanes);
     int failed = 0; long long rhs_min = -1, rhs_max = 0; double t_min = 1e300;
     for (auto &s : hs) { failed += s.failed != 0; rhs_min = rhs_min < 0 ? s.rhs_calls : std::min(rhs_min, s.rhs_calls); rhs_max = std::max(rhs_max, s.rhs_calls); t_min = std::min(t_min, s.t); }
