@@ -240,6 +240,16 @@
 #if !defined(__CUDACC__) && !defined(__noinline__)
 #define __noinline__
 #endif
+// A block's row evaluator is inlined into its row switch: a source program
+// computes every row of an array equation, the block reads one or a few, and
+// the compiler drops the rest only once the program is inlined.
+#if !defined(__CUDACC__) && !defined(__CUDACC_RTC__) && !defined(__forceinline__)
+#if defined(__GNUC__) || defined(__clang__)
+#define __forceinline__ inline __attribute__((always_inline))
+#else
+#define __forceinline__ inline
+#endif
+#endif
 {%- set lane_functions = solve_blocks.lanes.functions %}
 {%- set has_functions = lane_functions.table.owners | length > 0 %}
 {{ real_extremum_prelude("cuda", has_functions) }}
@@ -348,7 +358,7 @@ __device__ int {{ name }}_lu_solve(double *a, double *b, int n)
 {#- One solved block: its residual-row evaluator over `y`/`p` and the row
     switch. `prefix` names the functions. -#}
 {%- macro residual_rows(prefix, rows, n, y_type="const double") %}
-__device__ void {{ prefix }}_programs(int program, double time, {{ y_type }} *batch_y, const double *batch_p, double *__res)
+__device__ static __forceinline__ void {{ prefix }}_programs(int program, double time, {{ y_type }} *batch_y, const double *batch_p, double *__res)
 {
     (void)time;
     (void)batch_y;
