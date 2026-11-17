@@ -454,7 +454,12 @@ int main(int argc, char** argv) {
         K(_delay_apply_batch)(t, y.data(), p.data(), hist.data(), NY, NP, HSTRIDE, 1);
         int passes = 0;
         K(_event_update_batch)(t, y.data(), p.data(), &passes, NY, NP, 1);
+        // Build with -DMANIFOLD_BLOCKS=<U>_MANIFOLD_BLOCKS: a model without
+        // constraint blocks only settles its algebraic slots here, which the
+        // derivative evaluation that follows does again.
+#if !defined(MANIFOLD_BLOCKS) || MANIFOLD_BLOCKS > 0
         K(_project_manifold_batch)(t, y.data(), p.data(), nullptr, NY, NP, 1);
+#endif
         rhs(t, y, f0);
         K(_delay_commit_batch)(t, y.data(), p.data(), hist.data(), NY, NP, HSTRIDE, 1);
         return true;

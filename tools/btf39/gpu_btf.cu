@@ -453,7 +453,12 @@ HD static void accept(Lane &L, double hh, const double *x) {
     K(_delay_apply_batch)(s.t, y, L.p, L.hist, NY, NP, HS, 1);
     int passes = 0;
     K(_event_update_batch)(s.t, y, L.p, &passes, NY, NP, 1);
+    // Build with -DMANIFOLD_BLOCKS=<U>_MANIFOLD_BLOCKS: a model without
+    // constraint blocks only settles its algebraic slots here, which the
+    // derivative evaluation that follows does again.
+#if !defined(MANIFOLD_BLOCKS) || MANIFOLD_BLOCKS > 0
     K(_project_manifold_batch)(s.t, y, L.p, nullptr, NY, NP, 1);
+#endif
     lane_rhs(L, s.t, y, L.a + L.w.f0);
     K(_delay_commit_batch)(s.t, y, L.p, L.hist, NY, NP, HS, 1);
 }
@@ -518,6 +523,33 @@ __global__ void k_rhs_bench(Buffers B, double t, int reps, int shared) {
         copy(xp, L.a + L.w.y, NY);
         K(_delay_apply_batch)(t, xp, L.p, L.hist, NY, NP, HS, 1);
         K(_rhs_batch)(t, xp, L.p, L.a + L.w.fp, &status, NY, NP, NS, 1);
+    }
+}
+#endif
+
+// Timing of one integrator phase alone, lane 0 at its final state, COOP=1
+// layout: 0 jacobian (with its RHS calls), 1 factor, 2 solve, 3 the model
+// kernels of accept (events, manifold projection, delay commit), 4 residual
+// plus one NY copy, 5 one attempt (a full implicit step without accept).
+// Built with -DPHASE_BENCH only: one more kernel that inlines the model
+// lengthens the device compile of large models.
+#if !defined(CPU_EMU) && COOP == 1 && defined(PHASE_BENCH)
+__global__ void k_phase_bench(Buffers B, int which, int reps) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    __shared__ Par par;
+    Lane L{B.arena, B.p, B.hist, B.piv, B.state, B.st, B.w, &par};
+    LaneState &s = *L.s; double *A = L.a; double hh = s.fact_h > 0 ? s.fact_h : 1e-6;
+    for (int k = 0; k < reps; ++k) {
+        switch (which) {
+        case 0: copy(A + L.w.xt, A + L.w.y, NY); jacobian(L, s.t + hh, A + L.w.xt); break;
+        case 1: factor(L, s.theta, hh); break;
+        case 2: copy(A + L.w.dx, A + L.w.r, NS); solve(L, s.theta, hh, A + L.w.dx); break;
+        case 3: { int passes = 0; copy(A + L.w.xp, A + L.w.y, NY);
+                  K(_event_update_batch)(s.t, A + L.w.xp, L.p, &passes, NY, NP, 1);
+                  K(_project_manifold_batch)(s.t, A + L.w.xp, L.p, nullptr, NY, NP, 1); break; }
+        case 4: copy(A + L.w.xt, A + L.w.y, NY); residual(L, A + L.w.xt, A + L.w.f1, hh, A + L.w.rr); break;
+        case 5: { double t0 = s.t; attempt(L, hh); s.t = t0; break; }
+        }
     }
 }
 #endif
@@ -754,6 +786,9 @@ int main(int argc, char **argv) {
         // reserves it for every resident thread, so do not ask for more.
         cudaFuncAttributes fa; CHECK(cudaFuncGetAttributes(&fa, k_run));
         size_t stack = fa.localSizeBytes + 4096;
+#if COOP == 1 && defined(PHASE_BENCH)
+        { cudaFuncAttributes fb; CHECK(cudaFuncGetAttributes(&fb, k_phase_bench)); stack = std::max(stack, (size_t)fb.localSizeBytes + 4096); }
+#endif
         CHECK(cudaDeviceSetLimit(cudaLimitStackSize, stack));
         printf("k_run: %d registers, %zu bytes local, stack limit %zu\n", fa.numRegs, (size_t)fa.localSizeBytes, stack);
     }
@@ -852,6 +887,21 @@ int main(int argc, char **argv) {
             CHECK(cudaEventRecord(e0)); k_rhs_bench<<<1, 1, bytes>>>(B, sf[0].t, reps, sh); CHECK(cudaEventRecord(e1)); sync();
             float ms = 0; CHECK(cudaEventElapsedTime(&ms, e0, e1));
             printf("rhs bench (y in %s): %.3f us per call (copy of NY included), %d calls\n", sh ? "shared" : "global", 1e3 * ms / reps, reps);
+        }
+    }
+#endif
+#if !defined(CPU_EMU) && COOP == 1 && defined(PHASE_BENCH)
+    {
+        // Phase costs per call at the final state (the arena is modified;
+        // this runs after the CSV rows were kept on the device).
+        const char *names[] = {"jacobian", "factor", "solve", "accept kernels", "residual+copy", "attempt"};
+        cudaEvent_t e0, e1; CHECK(cudaEventCreate(&e0)); CHECK(cudaEventCreate(&e1));
+        for (int which = 0; which < 6; ++which) {
+            int reps = which == 5 ? 5 : 20;
+            k_phase_bench<<<1, 1>>>(B, which, 1); sync();
+            CHECK(cudaEventRecord(e0)); k_phase_bench<<<1, 1>>>(B, which, reps); CHECK(cudaEventRecord(e1)); sync();
+            float ms = 0; CHECK(cudaEventElapsedTime(&ms, e0, e1));
+            printf("phase bench %-15s %10.3f us per call\n", names[which], 1e3 * ms / reps);
         }
     }
 #endif
