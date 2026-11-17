@@ -273,6 +273,9 @@
 #define {{ NAME }}_EVENT_INDICATORS {{ nroots }}
 #define {{ NAME }}_TIME_EVENTS {{ ev.time_events | length }}
 #define {{ NAME }}_DELAYS {{ delays.count }}
+// Constraint blocks of `{{ name }}_project_manifold_batch`. With none, it
+// only settles the algebraic slots, which every derivative evaluation does.
+#define {{ NAME }}_MANIFOLD_BLOCKS {{ lanes.manifold.blocks | length }}
 // Tolerances of the per-lane algebraic and initialization solves. Override
 // with -D before compiling.
 #ifndef {{ NAME }}_NEWTON_MAX_ITERATIONS
@@ -827,7 +830,11 @@ __device__ int {{ name }}_event_iterate(double time, double *batch_y, double *ba
 {%- endif %}
         settled = !changed;
     }
-    (void){{ name }}_refresh(time, batch_y, batch_p);
+    // A settled pass changed nothing after its own refresh, so the slots are
+    // settled already; refresh again only after the last unsettled pass.
+    if (!settled) {
+        (void){{ name }}_refresh(time, batch_y, batch_p);
+    }
 {%- if ev.discrete_count > 0 %}
     {{ name }}_discrete_rows(time, batch_y, batch_p, values);
 {%- for target in ev.discrete_targets %}
