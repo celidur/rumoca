@@ -294,7 +294,7 @@ HD static bool lu(double *a, int *piv, int n) {
     for (int c = 0; c < n; ++c) {
         int m = c; for (int i = c + 1; i < n; ++i) if (fabs(a[i*n+c]) > fabs(a[m*n+c])) m = i;
         if (a[m*n+c] == 0.0) return false;
-        piv[c] = m; if (m != c) for (int j = 0; j < n; ++j) { double s = a[c*n+j]; a[c*n+j] = a[m*n+j]; a[m*n+j] = s; }
+        piv[c] = m; if (m != c) for (int j = c; j < n; ++j) { double s = a[c*n+j]; a[c*n+j] = a[m*n+j]; a[m*n+j] = s; }
         for (int i = c + 1; i < n; ++i) { double f = a[i*n+c] /= a[c*n+c]; if (f != 0.0) for (int j = c + 1; j < n; ++j) a[i*n+j] -= f * a[c*n+j]; }
     }
     return true;
