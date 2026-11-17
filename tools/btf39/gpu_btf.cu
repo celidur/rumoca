@@ -421,7 +421,7 @@ HD static bool attempt(Lane &L, double hh) {
                 pcopy(L, xt, x, NY); for (int j = 0; j < NS; ++j) xt[j] = x[j] + lambda * dx[j];
                 int st = lane_rhs(L, t1, xt, f1);
                 n2new = residual(L, xt, f1, hh, rr);
-                if (!st && isfinite(n2new) && (n2new < n2 || trial == 7)) { copy(r, rr, NS); break; }
+                if (!st && isfinite(n2new) && (n2new <= n2 || trial == 7)) { copy(r, rr, NS); break; }
                 lambda *= 0.5;
             }
             if (!isfinite(n2new)) break;

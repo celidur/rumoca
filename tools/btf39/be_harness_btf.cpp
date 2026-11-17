@@ -373,7 +373,7 @@ int main(int argc, char** argv) {
                     xt = x; for (int j = 0; j < NS; ++j) xt[j] = x[j] + lambda * dx[j];
                     int st = rhs(t1, xt, f1);
                     n2new = residual(xt, f1, hh, rr);
-                    if (!st && std::isfinite(n2new) && (n2new < n2 || trial == 7)) { r = rr; break; }
+                    if (!st && std::isfinite(n2new) && (n2new <= n2 || trial == 7)) { r = rr; break; }
                     lambda *= 0.5;
                 }
                 if (!std::isfinite(n2new)) break;
