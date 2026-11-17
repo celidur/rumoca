@@ -176,6 +176,7 @@ struct LaneState {
     int jac_age, jf_valid, failed, steps;
     long long rhs_calls, rhs_failures, jac_rhs_calls;
     int jacobians, factorizations, halvings, relaxed, be_steps, unconverged;
+    long long newton_its;  // Newton iterations (linear solves), all attempts
     long long cyc[4];  // clock cycles (ns on the CPU): rhs (all calls), jacobian, factor, solve
 };
 struct Work {
@@ -188,7 +189,12 @@ static Work make_work(int nnz, int lu_len) {
     w.f0 = o; o += NS; w.f1 = o; o += NS; w.fp = o; o += NS; w.r = o; o += NS; w.rr = o; o += NS;
     w.dx = o; o += NS; w.d = o; o += NS; w.jf = o; o += nnz; w.lu = o; o += lu_len;
     // per-thread scratch of the parallel sections: xp (NY) then fp (NS)
+    // (with PHASE_BENCH and COOP=1: one n*n block copy for the LU timing)
+#ifdef PHASE_BENCH
+    w.sx = o; o += COOP > 1 ? COOP * (NY + NS) : NS * NS; w.len = o;
+#else
     w.sx = o; o += COOP > 1 ? COOP * (NY + NS) : 0; w.len = o;
+#endif
     return w;
 }
 // Command of a parallel section, written by thread 0 before the barrier.
@@ -296,35 +302,47 @@ HD static void jac_colors(Lane &L, int tid) {
 // bandwidth and widens U to kl + ku (LAPACK gbtrf), so every loop stops at
 // the band; outside it the dense loops would only add zero products, so the
 // result is the same as the dense factorization bit for bit.
-HD static bool lu(double *a, int *piv, int n, int kl, int ku) {
+HD static inline double abs_t(double x) { return fabs(x); }
+HD static inline float abs_t(float x) { return fabsf(x); }
+template <class T> HD static bool lu(T *a, int *piv, int n, int kl, int ku) {
     for (int c = 0; c < n; ++c) {
         int ie = c + kl + 1 < n ? c + kl + 1 : n, je = c + kl + ku + 1 < n ? c + kl + ku + 1 : n;
-        int m = c; for (int i = c + 1; i < ie; ++i) if (fabs(a[i*n+c]) > fabs(a[m*n+c])) m = i;
-        if (a[m*n+c] == 0.0) return false;
-        piv[c] = m; if (m != c) for (int j = c; j < je; ++j) { double s = a[c*n+j]; a[c*n+j] = a[m*n+j]; a[m*n+j] = s; }
-        for (int i = c + 1; i < ie; ++i) { double f = a[i*n+c] /= a[c*n+c]; if (f != 0.0) for (int j = c + 1; j < je; ++j) a[i*n+j] -= f * a[c*n+j]; }
+        int m = c; for (int i = c + 1; i < ie; ++i) if (abs_t(a[i*n+c]) > abs_t(a[m*n+c])) m = i;
+        if (a[m*n+c] == T(0)) return false;
+        piv[c] = m; if (m != c) for (int j = c; j < je; ++j) { T s = a[c*n+j]; a[c*n+j] = a[m*n+j]; a[m*n+j] = s; }
+        for (int i = c + 1; i < ie; ++i) { T f = a[i*n+c] /= a[c*n+c]; if (f != T(0)) for (int j = c + 1; j < je; ++j) a[i*n+j] -= f * a[c*n+j]; }
     }
     return true;
 }
-HD static void lu_solve(const double *a, const int *piv, int n, int kl, int ku, double *b) {
+template <class T> HD static void lu_solve(const T *a, const int *piv, int n, int kl, int ku, T *b) {
     for (int c = 0; c < n; ++c) {
         int ie = c + kl + 1 < n ? c + kl + 1 : n;
-        double s = b[c]; b[c] = b[piv[c]]; b[piv[c]] = s; for (int i = c + 1; i < ie; ++i) b[i] -= a[i*n+c] * b[c];
+        T s = b[c]; b[c] = b[piv[c]]; b[piv[c]] = s; for (int i = c + 1; i < ie; ++i) b[i] -= a[i*n+c] * b[c];
     }
     for (int i = n - 1; i >= 0; --i) {
         int je = i + kl + ku + 1 < n ? i + kl + ku + 1 : n;
-        double s = b[i]; for (int j = i + 1; j < je; ++j) s -= a[i*n+j] * b[j]; b[i] = s / a[i*n+i];
+        T s = b[i]; for (int j = i + 1; j < je; ++j) s -= a[i*n+j] * b[j]; b[i] = s / a[i*n+i];
     }
 }
+// LU_FP32: the Newton matrix I - theta*hh*J is factorized and solved in
+// single precision (the L40S runs FP64 at 1/64 of FP32). The residual, the
+// state and the update stay in double: an approximate Newton matrix only
+// changes the convergence rate, not the solution Newton converges to.
+#ifdef LU_FP32
+typedef float LuT;
+#else
+typedef double LuT;
+#endif
+HD static LuT *lu_of(Lane &L, int b) { return (LuT *)(L.a + L.w.lu) + L.st->blk_lu[b]; }
 
 HD static bool factor_blocks(Lane &L, double theta, double hh, int b0, int stride) {
     const Structure &S = *L.st; double *jf = L.a + L.w.jf;
     for (int b = b0; b < S.nblocks; b += stride) {
         int base = S.blk_ptr[b], s = S.blk_ptr[b + 1] - base;
-        double *m = L.a + L.w.lu + S.blk_lu[b]; const int *map = S.map + S.blk_map[b];
+        LuT *m = lu_of(L, b); const int *map = S.map + S.blk_map[b];
         for (int r = 0; r < s; ++r) for (int c = 0; c < s; ++c) {
             int e = map[r*s+c];
-            m[r*s+c] = (r == c ? 1.0 : 0.0) - theta * hh * (e >= 0 ? jf[e] : 0.0);
+            m[r*s+c] = (LuT)((r == c ? 1.0 : 0.0) - theta * hh * (e >= 0 ? jf[e] : 0.0));
         }
         if (!lu(m, L.piv + base, s, S.blk_kl[b], S.blk_ku[b])) return false;
     }
@@ -340,29 +358,40 @@ HD static bool factor(Lane &L, double theta, double hh) {
 }
 
 // rb is a scratch of NS doubles (the fp slot is free during a solve).
-HD static void solve_block(Lane &L, int b, double theta, double hh, double *dx, double *rb) {
+// rbd: scratch of NS doubles; rbf: scratch of NS LuT, distinct from rbd.
+HD static void solve_block(Lane &L, int b, double theta, double hh, double *dx, double *rbd, LuT *rbf) {
     const Structure &S = *L.st; const double *jf = L.a + L.w.jf;
     int base = S.blk_ptr[b], s = S.blk_ptr[b + 1] - base;
-    for (int k = 0; k < s; ++k) rb[k] = dx[S.blk_idx[base + k]];
-    for (int q = S.off_ptr[b]; q < S.off_ptr[b + 1]; ++q) rb[S.off_k[q]] += theta * hh * jf[S.off_e[q]] * dx[S.off_j[q]];
-    lu_solve(L.a + L.w.lu + S.blk_lu[b], L.piv + base, s, S.blk_kl[b], S.blk_ku[b], rb);
-    for (int k = 0; k < s; ++k) dx[S.blk_idx[base + k]] = rb[k];
+    // The right-hand side is gathered in double (off-block terms included),
+    // then rounded once to the factorization's precision.
+    for (int k = 0; k < s; ++k) rbd[k] = dx[S.blk_idx[base + k]];
+    for (int q = S.off_ptr[b]; q < S.off_ptr[b + 1]; ++q) rbd[S.off_k[q]] += theta * hh * jf[S.off_e[q]] * dx[S.off_j[q]];
+#ifdef LU_FP32
+    LuT *rb = rbf;
+    for (int k = 0; k < s; ++k) rb[k] = (LuT)rbd[k];
+    lu_solve(lu_of(L, b), L.piv + base, s, S.blk_kl[b], S.blk_ku[b], rb);
+    for (int k = 0; k < s; ++k) dx[S.blk_idx[base + k]] = (double)rb[k];
+#else
+    lu_solve(lu_of(L, b), L.piv + base, s, S.blk_kl[b], S.blk_ku[b], rbd);
+    for (int k = 0; k < s; ++k) dx[S.blk_idx[base + k]] = rbd[k];
+    (void)rbf;
+#endif
 }
 HD static void solve(Lane &L, double theta, double hh, double *dx) {
     const Structure &S = *L.st;
 #if COOP > 1
     // Level by level: the blocks of a level only read dx of earlier levels.
     // A level of one block is solved by thread 0 alone (no barrier).
-    double *rb = L.a + L.w.fp;
+    double *rb = L.a + L.w.fp; LuT *rbf = (LuT *)(L.a + L.w.rr);  // rr is free during a solve
     L.par->theta = theta; L.par->hh = hh; L.par->dst = dx;
     for (int lv = 0; lv < S.nlevels; ++lv) {
         int q0 = S.lvl_ptr[lv], q1 = S.lvl_ptr[lv + 1];
-        if (q1 - q0 == 1) solve_block(L, S.lvl_blk[q0], theta, hh, dx, rb);
+        if (q1 - q0 == 1) solve_block(L, S.lvl_blk[q0], theta, hh, dx, rb, rbf);
         else { L.par->arg = lv; par_run(L, P_SOLVE); }
     }
 #else
-    double *rb = L.a + L.w.fp;
-    for (int b = 0; b < S.nblocks; ++b) solve_block(L, b, theta, hh, dx, rb);
+    double *rb = L.a + L.w.fp; LuT *rbf = (LuT *)(L.a + L.w.rr);  // rr is free during a solve
+    for (int b = 0; b < S.nblocks; ++b) solve_block(L, b, theta, hh, dx, rb, rbf);
 #endif
 }
 // Copy of n doubles, shared by the threads of the simulation when n is long.
@@ -381,7 +410,8 @@ HD static void par_work(Lane &L, int tid) {
     case P_FACTOR: if (!factor_blocks(L, P.theta, P.hh, tid, COOP)) P.fail = 1; break;
     case P_SOLVE: {
         double *rb = L.a + L.w.sx + (size_t)tid * (NY + NS) + NY;
-        for (int q = S.lvl_ptr[P.arg] + tid; q < S.lvl_ptr[P.arg + 1]; q += COOP) solve_block(L, S.lvl_blk[q], P.theta, P.hh, P.dst, rb);
+        LuT *rbf = (LuT *)(L.a + L.w.sx + (size_t)tid * (NY + NS));  // the thread's xp, free during a solve (NY >= NS)
+        for (int q = S.lvl_ptr[P.arg] + tid; q < S.lvl_ptr[P.arg + 1]; q += COOP) solve_block(L, S.lvl_blk[q], P.theta, P.hh, P.dst, rb, rbf);
         break; }
     default: break;
     }
@@ -428,7 +458,7 @@ HD static bool attempt(Lane &L, double hh) {
         }
         lane_rhs(L, t1, x, f1); double n2 = residual(L, x, f1, hh, r);
         for (int it = 0; it < 10; ++it) {
-            copy(dx, r, NS); PROF(L, 3, solve(L, s.theta, hh, dx));
+            copy(dx, r, NS); PROF(L, 3, solve(L, s.theta, hh, dx)); ++s.newton_its;
             double lambda = 1.0, n2new = 0;
             for (int trial = 0; trial < 8; ++trial) {
                 pcopy(L, xt, x, NY); for (int j = 0; j < NS; ++j) xt[j] = x[j] + lambda * dx[j];
@@ -549,6 +579,19 @@ __global__ void k_phase_bench(Buffers B, int which, int reps) {
                   K(_project_manifold_batch)(s.t, A + L.w.xp, L.p, nullptr, NY, NP, 1); break; }
         case 4: copy(A + L.w.xt, A + L.w.y, NY); residual(L, A + L.w.xt, A + L.w.f1, hh, A + L.w.rr); break;
         case 5: { double t0 = s.t; attempt(L, hh); s.t = t0; break; }
+        case 6: case 7: {
+            // LU of the largest block on a copy in global memory (6) or in
+            // shared memory (7): separates the memory latency from the work.
+            extern __shared__ double sh_a[];
+            const Structure &S = *L.st; int b = 0;
+            for (int q = 1; q < S.nblocks; ++q) if (S.blk_ptr[q + 1] - S.blk_ptr[q] > S.blk_ptr[b + 1] - S.blk_ptr[b]) b = q;
+            int n = S.blk_ptr[b + 1] - S.blk_ptr[b];
+            LuT *m = which == 7 ? (LuT *)sh_a : (LuT *)(A + L.w.sx);  // sx: scratch of n*n doubles, see the launch
+            const LuT *src = lu_of(L, b);
+            static __shared__ int sh_piv[512];
+            for (int q = 0; q < n * n; ++q) m[q] = src[q];
+            lu(m, sh_piv, n, S.blk_kl[b], S.blk_ku[b]);
+            break; }
         }
     }
 }
@@ -803,6 +846,7 @@ int main(int argc, char **argv) {
 
     // Pass 1: a provisional work layout (dense pattern sizes) for the probe.
     Buffers B{};
+    int largest_block = 0; (void)largest_block;
     B.lanes = lanes; B.out_lanes = out_lanes; B.out_rows = out_rows;
     B.w = make_work(NS * NS, 0);
     B.p = alloc<double>((size_t)NP * lanes + 1); B.hist = alloc<double>((size_t)HS * lanes);
@@ -825,7 +869,7 @@ int main(int argc, char **argv) {
         }
         std::vector<unsigned char> pat(NS * NS, 0); int nnz = 0;
         for (int i = 0; i < NS; ++i) for (int j = 0; j < NS; ++j) { pat[i*NS+j] = (i == j) || hJ[i*NS+j] != 0.0; nnz += pat[i*NS+j]; }
-        HostStructure H = build(pat);
+        HostStructure H = build(pat); largest_block = H.largest;
         long off = (long)H.off_k.size();
         printf("structure: nnz=%d colors=%d blocks=%d largest=%d off_block_nnz=%ld levels=%d widest_band=%d COOP=%d\n", nnz, H.ncolors, H.nblocks, H.largest, off, H.nlevels, H.widest, COOP);
         Structure S{};
@@ -894,12 +938,22 @@ int main(int argc, char **argv) {
     {
         // Phase costs per call at the final state (the arena is modified;
         // this runs after the CSV rows were kept on the device).
-        const char *names[] = {"jacobian", "factor", "solve", "accept kernels", "residual+copy", "attempt"};
+        const char *names[] = {"jacobian", "factor", "solve", "accept kernels", "residual+copy", "attempt", "lu big global", "lu big shared"};
         cudaEvent_t e0, e1; CHECK(cudaEventCreate(&e0)); CHECK(cudaEventCreate(&e1));
-        for (int which = 0; which < 6; ++which) {
+        int nbig = largest_block;
+        size_t bytes = sizeof(double) * (size_t)nbig * nbig;
+        double *scratch_save = nullptr;
+        for (int which = 0; which < 8; ++which) {
             int reps = which == 5 ? 5 : 20;
-            k_phase_bench<<<1, 1>>>(B, which, 1); sync();
-            CHECK(cudaEventRecord(e0)); k_phase_bench<<<1, 1>>>(B, which, reps); CHECK(cudaEventRecord(e1)); sync();
+            size_t sh = 0;
+            if (which == 6 && (size_t)B.w.len - B.w.sx < (size_t)nbig * nbig) { printf("phase bench lu big global: no scratch\n"); continue; }
+            if (which == 7) {
+                if (bytes > 99 * 1024 || nbig > 512) { printf("phase bench lu big shared: skipped (%zu bytes)\n", bytes); continue; }
+                CHECK(cudaFuncSetAttribute(k_phase_bench, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)bytes)); sh = bytes;
+            }
+            (void)scratch_save;
+            k_phase_bench<<<1, 1, sh>>>(B, which, 1); sync();
+            CHECK(cudaEventRecord(e0)); k_phase_bench<<<1, 1, sh>>>(B, which, reps); CHECK(cudaEventRecord(e1)); sync();
             float ms = 0; CHECK(cudaEventElapsedTime(&ms, e0, e1));
             printf("phase bench %-15s %10.3f us per call\n", names[which], 1e3 * ms / reps);
         }
@@ -909,8 +963,13 @@ int main(int argc, char **argv) {
     int failed = 0; long long rhs_min = -1, rhs_max = 0; double t_min = 1e300;
     for (auto &s : hs) { failed += s.failed != 0; rhs_min = rhs_min < 0 ? s.rhs_calls : std::min(rhs_min, s.rhs_calls); rhs_max = std::max(rhs_max, s.rhs_calls); t_min = std::min(t_min, s.t); }
     const LaneState &s = hs[0];
-    printf("lane0: t=%g steps=%d unconverged=%d halvings=%d relaxed=%d be_steps=%d jacobians=%d factorizations=%d rhs_calls=%lld (jacobian %lld) rhs_failures=%lld\n",
-           s.t, s.steps, s.unconverged, s.halvings, s.relaxed, s.be_steps, s.jacobians, s.factorizations, s.rhs_calls, s.jac_rhs_calls, s.rhs_failures);
+    printf("lane0: t=%g steps=%d unconverged=%d halvings=%d relaxed=%d be_steps=%d jacobians=%d factorizations=%d newton_its=%lld rhs_calls=%lld (jacobian %lld) rhs_failures=%lld\n",
+           s.t, s.steps, s.unconverged, s.halvings, s.relaxed, s.be_steps, s.jacobians, s.factorizations, s.newton_its, s.rhs_calls, s.jac_rhs_calls, s.rhs_failures);
+#ifdef LU_FP32
+    printf("newton matrix: float (LU_FP32)\n");
+#else
+    printf("newton matrix: double\n");
+#endif
     {
         double tot = (double)s.cyc[0] + 1e-30;
         double rj = (double)s.jac_rhs_calls / fmax(1.0, (double)s.rhs_calls);
