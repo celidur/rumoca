@@ -38,6 +38,7 @@ mod galec_golden_tests;
 #[cfg(test)]
 mod galec_manifest_template_tests;
 mod lane_execution;
+mod lane_refresh_reroll;
 mod lazy_scalar_projection;
 mod me_projection;
 mod native_fmi_renderer;

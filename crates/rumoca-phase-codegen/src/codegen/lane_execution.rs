@@ -326,6 +326,55 @@ fn assignment_step(
     Ok(minijinja::context! { kind => "assign", rows => rows, output_count => count })
 }
 
+/// The programs of one exact-assignment schedule, each with its stored
+/// `y` targets and provenance, in checked order.
+fn assignment_programs(
+    problem: &solve::SolveProblem,
+    schedule: &solve::ExactRefreshAssignmentSchedule,
+) -> Result<Vec<(Vec<solve::LinearOp>, rumoca_core::Span, Vec<usize>)>, CodegenError> {
+    const FEATURE: &str = "exact_algebraic_assignments";
+    let owners = &problem.continuous.refresh_owners;
+    let mut out = Vec::new();
+    for id in schedule.program_ids() {
+        let program = owners
+            .exact_assignment_program(*id)
+            .ok_or_else(|| refuse(FEATURE, "a schedule names an unissued program"))?;
+        let block = program
+            .final_scalar_program(&problem.continuous.implicit_rhs)
+            .map_err(|error| refuse(FEATURE, error))?;
+        let [ops] = block.programs() else {
+            return Err(refuse(FEATURE, "an assignment materializes as several programs"));
+        };
+        let span = block
+            .program_span(0)
+            .ok_or_else(|| refuse(FEATURE, "an assignment has no provenance"))?;
+        out.push((ops.clone(), span, program.target_indices().to_vec()));
+    }
+    Ok(out)
+}
+
+/// The `y` footprint of one projection block: (written, read) slots, or
+/// `None` when a residual program hides its reads.
+fn block_footprint(
+    problem: &solve::SolveProblem,
+    implicit: &PreparedScalarProgramBlock,
+    canonical: usize,
+) -> Option<(std::collections::BTreeSet<usize>, std::collections::BTreeSet<usize>)> {
+    let block = problem
+        .continuous
+        .algebraic_projection_plan
+        .blocks
+        .scalar_blocks()
+        .get(canonical)?;
+    let rows = RowSet::new(implicit, &block.rows, "algebraic_projection").ok()?;
+    let writes: std::collections::BTreeSet<usize> = block.y_indices.iter().copied().collect();
+    let mut reads = writes.clone();
+    for program in &rows.programs {
+        reads.extend(super::lane_refresh_reroll::y_reads(program)?);
+    }
+    Some((writes, reads))
+}
+
 /// The ordered algebraic refresh of every continuous evaluation.
 fn refresh_value(
     problem: &solve::SolveProblem,
@@ -355,32 +404,98 @@ fn refresh_value(
         Ok(id)
     };
     let mut rendered = Vec::new();
+    // The same refresh as units for the level-scheduled rerolling: one unit
+    // per assignment program and per projection block call.
+    use super::lane_refresh_reroll::{Unit, y_reads};
+    let mut units: Vec<Unit> = Vec::new();
+    let mut opaque: Vec<Value> = Vec::new();
+    let mut singles: BTreeMap<usize, Value> = BTreeMap::new();
+    let mut push_assignments = |schedule: &solve::ExactRefreshAssignmentSchedule,
+                                units: &mut Vec<Unit>,
+                                opaque: &mut Vec<Value>,
+                                singles: &mut BTreeMap<usize, Value>|
+     -> Result<(), CodegenError> {
+        for (ops, span, targets) in assignment_programs(problem, schedule)? {
+            let single = minijinja::context! {
+                kind => "assign",
+                rows => scalar_block_value(vec![ops.clone()], vec![span], targets.clone(), pure_calls, "exact_algebraic_assignments")?,
+            };
+            match lower_scalar_ops(&ops, pure_calls) {
+                Some(lowered) => {
+                    singles.insert(units.len(), single);
+                    units.push(Unit::Assign { ops: lowered, targets });
+                }
+                None => {
+                    let footprint = y_reads(&ops).map(|reads| (targets.iter().copied().collect(), reads));
+                    units.push(Unit::Opaque { id: opaque.len(), footprint });
+                    opaque.push(single);
+                }
+            }
+        }
+        Ok(())
+    };
+    let mut push_project = |canonical: usize,
+                            id: usize,
+                            units: &mut Vec<Unit>,
+                            opaque: &mut Vec<Value>| {
+        units.push(Unit::Opaque {
+            id: opaque.len(),
+            footprint: block_footprint(problem, &implicit, canonical),
+        });
+        opaque.push(minijinja::context! { kind => "project", block => id });
+    };
     for step in &steps {
         match step {
             solve::StagedRefreshStep::Assignments(schedule) => {
                 rendered.push(assignment_step(problem, schedule, pure_calls)?);
+                push_assignments(schedule, &mut units, &mut opaque, &mut singles)?;
             }
             solve::StagedRefreshStep::Project {
                 block_index, seeds, ..
             } => {
                 if let Some(schedule) = seeds {
                     rendered.push(assignment_step(problem, schedule, pure_calls)?);
+                    push_assignments(schedule, &mut units, &mut opaque, &mut singles)?;
                 }
                 let id = intern(*block_index, &mut blocks)?;
                 rendered.push(minijinja::context! { kind => "project", block => id });
+                push_project(*block_index, id, &mut units, &mut opaque);
             }
             solve::StagedRefreshStep::ProjectComplete => {
                 for &canonical in &plan.simultaneous_block_indices {
                     let id = intern(canonical, &mut blocks)?;
                     rendered.push(minijinja::context! { kind => "project", block => id });
+                    push_project(canonical, id, &mut units, &mut opaque);
                 }
             }
         }
     }
+    // The level-scheduled rerolling is opt-in (RUMOCA_REFRESH_REROLL set):
+    // it shrinks the refresh source but adds a table load per literal, which
+    // costs about 10% on a single GPU thread. By default the refresh stays in
+    // program order.
+    let no_reroll = std::env::var_os("RUMOCA_REFRESH_REROLL").is_none();
+    let (reroll_steps, reroll_tables) = if no_reroll {
+        (Vec::new(), String::new())
+    } else {
+        super::lane_refresh_reroll::reroll(&units, "rumoca_refresh_tab", 2)
+    };
+    let rolled: Vec<Value> = if no_reroll { rendered.clone() } else { reroll_steps
+        .into_iter()
+        .map(|step| match step {
+            super::lane_refresh_reroll::Step::Opaque(id) => opaque[id].clone(),
+            super::lane_refresh_reroll::Step::Single(u) => singles[&u].clone(),
+            super::lane_refresh_reroll::Step::Rolled(code) => {
+                minijinja::context! { kind => "rolled", code => code }
+            }
+        })
+        .collect() };
     let state_count = problem.solve_layout.state_scalar_count();
     let algebraic_count = problem.solve_layout.algebraic_scalar_count();
     Ok(minijinja::context! {
         steps => rendered,
+        rolled_steps => rolled,
+        rolled_tables => reroll_tables,
         blocks => blocks,
         state_count => state_count,
         algebraic_count => algebraic_count,
