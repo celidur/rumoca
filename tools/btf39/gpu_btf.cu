@@ -520,6 +520,10 @@ struct Buffers {
     Work w; int lanes, out_lanes, out_rows;
 };
 
+// -DNO_AUX leaves out the two diagnostic kernels below (device/host RHS
+// check, RHS timing): each inlines a full copy of the model, so without them
+// the device compile handles the model once instead of three times.
+#ifndef NO_AUX
 // One RHS of lane 0 at its current y and history, on the device, into fp
 // (y copied to xp first). Used to compare device and host model arithmetic.
 #ifdef CPU_EMU
@@ -556,6 +560,7 @@ __global__ void k_rhs_bench(Buffers B, double t, int reps, int shared) {
     }
 }
 #endif
+#endif  // NO_AUX
 
 // Timing of one integrator phase alone, lane 0 at its final state, COOP=1
 // layout: 0 jacobian (with its RHS calls), 1 factor, 2 solve, 3 the model
@@ -795,6 +800,9 @@ template <class T> static void download(std::vector<T> &dst, const T *src, size_
 static void sync();
 // Device RHS against host RHS at lane 0's current state.
 static void rhs_check(const Buffers &B, double t, const char *when) {
+#ifdef NO_AUX
+    (void)B; (void)t; (void)when; return;
+#else
     LAUNCH(k_rhs_check, 1, B, t); sync();
     std::vector<double> a, hp, hh; download(a, B.arena, (size_t)B.w.len);
     download(hp, B.p, (size_t)NP + 1); download(hh, B.hist, (size_t)HS);
@@ -808,6 +816,7 @@ static void rhs_check(const Buffers &B, double t, const char *when) {
     }
     printf("rhs check %s (t=%g, host status %d): %d of %d derivatives differ, worst relative %.3g at %d (host %.17g device %.17g), max |f|=%.3g\n",
            when, t, st, nd, NS, worst, at, at >= 0 ? f[at] : 0.0, at >= 0 ? a[B.w.fp + at] : 0.0, scale);
+#endif
 }
 static void sync() {
 #ifndef CPU_EMU
@@ -918,7 +927,7 @@ int main(int argc, char **argv) {
     }
     double run_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - run0).count();
 
-#ifndef CPU_EMU
+#if !defined(CPU_EMU) && !defined(NO_AUX)
     {
         // RHS cost per call, and per NY-copy, at the final state.
         std::vector<LaneState> sf; download(sf, B.state, 1);
