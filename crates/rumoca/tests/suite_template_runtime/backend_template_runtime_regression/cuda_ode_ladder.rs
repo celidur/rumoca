@@ -117,3 +117,24 @@ int main() {{
         "execute CUDA ODE ladder emulation",
     );
 }
+
+#[test]
+fn cuda_ode_ladder_inlines_each_block_row_program() {
+    // A block that owns one row of an array equation reads one output of the
+    // equation's source program; inlined, the compiler drops the others.
+    let (_directory, _path, content) = ladder_source();
+    let programs = content
+        .lines()
+        .filter(|line| line.contains("_programs(int program,"))
+        .collect::<Vec<_>>();
+    assert!(
+        programs.len() > 1,
+        "the ladder must emit several block row programs for this test to bite"
+    );
+    for program in programs {
+        assert!(
+            program.starts_with("__device__ static __forceinline__ void "),
+            "a block row program must be inlined into its row switch: {program}"
+        );
+    }
+}
