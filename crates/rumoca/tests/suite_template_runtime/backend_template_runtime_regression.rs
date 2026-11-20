@@ -1,3 +1,4 @@
+mod cuda_ode_ladder;
 mod cuda_ode_newton;
 mod jax_compact_stencils;
 mod jax_lazy_conditionals;
