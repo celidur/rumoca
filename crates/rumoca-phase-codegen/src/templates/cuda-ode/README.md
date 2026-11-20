@@ -34,6 +34,12 @@ and integration (including event location and stopping at time events).
   observed as an event root; a domain error makes that lane's results NaN.
 - Tolerances: `<model>_NEWTON_MAX_ITERATIONS`, `<model>_NEWTON_STEP_TOLERANCE`
   and `<model>_EVENT_MAX_PASSES` can be overridden with `-D`.
+- Build options: `-DRUMOCA_OMIT_INITIALIZATION` leaves out what only
+  initialization uses (parameter and start initialization, start tables,
+  bindings, initial-equation blocks, `<model>_initialize_batch`), for a device
+  build whose host initializes the lanes. `-DRUMOCA_BLOCK_ATTR=__noinline__`
+  keeps each algebraic block's projection its own device function, which
+  bounds the functions the device assembler optimizes on large models.
 
 ## Unsupported
 

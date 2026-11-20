@@ -240,6 +240,13 @@
 #if !defined(__CUDACC__) && !defined(__noinline__)
 #define __noinline__
 #endif
+// Attribute of every algebraic block's projection function. Empty: the
+// compiler may inline the blocks into the refresh. -DRUMOCA_BLOCK_ATTR=__noinline__
+// keeps each block its own device function, which bounds the size of the
+// functions the device assembler optimizes on large models.
+#ifndef RUMOCA_BLOCK_ATTR
+#define RUMOCA_BLOCK_ATTR
+#endif
 {%- set lane_functions = solve_blocks.lanes.functions %}
 {%- set has_functions = lane_functions.table.owners | length > 0 %}
 {{ real_extremum_prelude("cuda", has_functions) }}
@@ -451,7 +458,7 @@ __device__ int {{ b }}_sweep(double time, double *batch_y, const double *batch_p
 }
 
 // Returns 0 when converged, nonzero when the Newton iteration failed.
-__device__ int {{ b }}_project(double time, double *batch_y, const double *batch_p)
+__device__ RUMOCA_BLOCK_ATTR int {{ b }}_project(double time, double *batch_y, const double *batch_p)
 {
     const int iterated[{{ k }}] = {{ int_list(blk.iterated) }};
     const int residual[{{ k }}] = {{ int_list(blk.residual) }};
@@ -579,6 +586,11 @@ __device__ __noinline__ void {{ name }}_derivative_rows(double time, const doubl
 {%- endfor %}
 }
 
+// RUMOCA_OMIT_INITIALIZATION: leave out what only initialization uses
+// (parameter and start-value initialization, start tables, bindings,
+// initial-equation blocks, initialize_batch). A device build whose host
+// initializes the lanes compiles only the step kernels.
+#ifndef RUMOCA_OMIT_INITIALIZATION
 // Compute the parameters defined by other parameters in place, for each batch
 // slot of p (stride p_stride), from the base parameters already there. Launch
 // after changing any parameter, before the derivative kernel.
@@ -621,6 +633,7 @@ extern "C" __global__ void {{ name }}_init_state_batch(
 {{ programs(sinit, y="batch_y", out="batch_y") }}
 {%- endif %}
 }
+#endif  // RUMOCA_OMIT_INITIALIZATION
 
 // The derivative of the states of every lane. Only the state slots of `y`
 // are read: the algebraic slots are settled on a per-thread copy first.
@@ -710,6 +723,7 @@ extern "C" __global__ void {{ name }}_refresh_batch(
         status[batch] = failures;
     }
 }
+#ifndef RUMOCA_OMIT_INITIALIZATION
 
 {%- if starts %}
 
@@ -755,6 +769,7 @@ extern "C" __global__ void {{ name }}_load_starts_batch(
     }
 }
 {%- endif %}
+#endif  // RUMOCA_OMIT_INITIALIZATION
 
 // ---------------------------------------------------------------------------
 // Events. Relations of the continuous rows read frozen relation memories in
@@ -906,6 +921,7 @@ extern "C" __global__ void {{ name }}_event_update_batch(
     }
 }
 
+#ifndef RUMOCA_OMIT_INITIALIZATION
 // ---------------------------------------------------------------------------
 // Initialization (MLS 8.6): parameter and start bindings, the initial
 // equations solved for their unknowns, the algebraic refresh, and the
@@ -1041,6 +1057,7 @@ extern "C" __global__ void {{ name }}_initialize_batch(
         status[batch] = failures;
     }
 }
+#endif  // RUMOCA_OMIT_INITIALIZATION
 
 // ---------------------------------------------------------------------------
 // State manifold: lower-order constraints that index reduction replaced by
