@@ -117,3 +117,25 @@ int main() {{
         "execute CUDA ODE ladder emulation",
     );
 }
+
+#[test]
+fn cuda_ode_ladder_refreshes_once_after_a_settled_event_pass() {
+    // Without events or manifold blocks, a settled event pass leaves the
+    // slots settled, and the manifold projection is only a refresh.
+    let (_directory, _path, content) = ladder_source();
+    assert!(
+        content.contains("#define RLCLADDER_LADDER_MANIFOLD_BLOCKS 0"),
+        "the ladder has no manifold blocks, so a caller may skip the projection"
+    );
+    let start = content
+        .find("int RlcLadder_Ladder_event_iterate(")
+        .expect("cuda-ode emits the event iteration");
+    let body = &content[start..];
+    let body = &body[..body.find("\n}\n").expect("the event iteration ends")];
+    let refreshes = body.matches("RlcLadder_Ladder_refresh(time").count();
+    assert_eq!(refreshes, 2, "one refresh per pass and one after the loop");
+    assert!(
+        body.contains("if (!settled) {\n        (void)RlcLadder_Ladder_refresh(time"),
+        "the refresh after the loop runs only after an unsettled last pass"
+    );
+}
