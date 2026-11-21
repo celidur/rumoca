@@ -15,6 +15,10 @@ mod dead_constants;
 mod dead_operations;
 mod defined_registers;
 mod fault_class;
+mod output_slice;
+#[cfg(test)]
+mod random_programs;
+mod register_packing;
 mod seed_invariance;
 mod shared_values;
 
@@ -23,6 +27,8 @@ pub(crate) use shared_values::{check_same_output, check_same_output_transformed}
 pub use block_split::{BlockResidualSplit, BlockResidualSplitError};
 pub use dead_constants::prune_dead_constants;
 pub use dead_operations::prune_unread_pure_operations;
+pub use output_slice::slice_to_output;
+pub use register_packing::pack_registers;
 pub use shared_values::{
     AssignmentProgram, CappedValue, SHARED_VALUE_REGISTER_CAP, SharedValueError,
     SharedValueSegment, SharedValueSegments, share_program_values, shared_value_proof_failures,
