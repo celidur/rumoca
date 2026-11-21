@@ -547,12 +547,14 @@ pub(super) fn me_refresh_value(
     let init_sizes = init.get_attr("sizes")?.as_usize().unwrap_or(0);
     let kernel = !records.is_empty() || init_doubles > 0;
     let table = table.into_value(&implicits)?;
-    // The initialization frames hold the algebraic refresh, whose deepest
-    // block frame and isolator outputs nest inside them; a chart
-    // conditioning or transfer frame holds no other.
-    let doubles =
-        (block_doubles + table.get_attr("iso_max_outputs")?.as_usize().unwrap_or(1) + init_doubles)
-            .max(chart_doubles);
+    // The algebraic refresh takes its incoming coordinate (the `Y_LEN`
+    // doubles the C allocates), its deepest block frame and its isolator
+    // outputs. It nests inside the initialization frames and inside a chart
+    // transfer, which keeps its row outputs while it refreshes the target;
+    // the chart frames' bound covers the transfer's.
+    let iso_doubles = table.get_attr("iso_max_outputs")?.as_usize().unwrap_or(1);
+    let refresh_doubles = problem.layout.y_scalars().max(1) + block_doubles + iso_doubles;
+    let doubles = refresh_doubles + init_doubles.max(chart_doubles);
     let sizes = block_sizes + init_sizes;
     Ok(minijinja::context! {
         derivative => charts[0].get_attr("derivative")?,

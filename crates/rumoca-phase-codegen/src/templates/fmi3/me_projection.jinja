@@ -1364,14 +1364,34 @@ RMC_COLD RMC_API int rmc_bad_program(ModelInstance* m, size_t program) {
 {%- set assigns = me.assign.plan.programs|length > 0 %}
 {%- if me.derivative.steps|length > 0 or me.algebraic.steps|length > 0 %}
 enum { RMC_STEP_ASSIGN, RMC_STEP_COMPLETE, RMC_STEP_PROJECT };
+/* The coordinate copy of the refresh. A device `memcpy` of an unknown
+   alignment may move single bytes, so a device compiler copies one double
+   per access; a host compiler keeps `memcpy`, which its library moves in
+   vector words. Either copies the same values. */
+static inline void rmc_copy_y(double* dst, const double* src) {
+#if defined(__CUDACC__)
+    for (size_t i = 0; i < Y_LEN; ++i) dst[i] = src[i];
+#else
+    memcpy(dst, src, Y_LEN * sizeof(double));
+#endif
+}
 typedef struct { unsigned char kind; size_t first; size_t count; size_t block; size_t seed_first; size_t seed_count; size_t rescue; size_t nrescue; } RmcStep;
 static {{ prefix }}Status rmc_refresh(ModelInstance* m, const RmcStep* steps, size_t nsteps, const size_t* complete, size_t ncomplete) {
+{%- if not me.kernel %}
     double incoming[Y_LEN];
+{%- endif %}
 {%- if blocks %}
     RmcBlock step_view;
 {%- endif %}
     if (refresh_parameters(m) != {{ prefix }}OK) return {{ prefix }}Error;
-    memcpy(incoming, m->y, sizeof(incoming));
+{%- if me.kernel %}
+    /* The incoming coordinate lives in the arena, below every frame the
+       steps open, so no caller holds a Y-sized stack array. */
+    RMC_MARK;
+    double* incoming = rmc_dalloc_raw(m, Y_LEN);
+    if (!incoming) { (void)rmc_exhausted(m); return {{ prefix }}Error; }
+{%- endif %}
+    rmc_copy_y(incoming, m->y);
     (void)complete; (void)ncomplete;
 {%- if blocks and assigns %}
     size_t failed_site = RMC_FB_PLAN; (void)failed_site;
@@ -1421,19 +1441,19 @@ static {{ prefix }}Status rmc_refresh(ModelInstance* m, const RmcStep* steps, si
     m->rmc_fb_active[RMC_FB_PLAN] = false;
 {%- endif %}
     if (m->rmc_fatal) goto fail;
-    return {{ prefix }}OK;
+    {% if me.kernel %}RMC_RELEASE; {% endif %}return {{ prefix }}OK;
 {%- if assigns %}
 failure:
     if (m->rmc_fatal) goto fail;
 {%- if blocks %}
     if (complete) {
         rmc_fb_note(m, failed_site); m->rmc_fb_active[RMC_FB_PLAN] = false;
-        memcpy(m->y, incoming, sizeof(incoming));
+        rmc_copy_y(m->y, incoming);
         const int rescued = rmc_project_complete(m, complete, ncomplete);
         /* A program fault during the rescue is neither a convergence failure
            nor a non-finite trial value. */
         if (m->rmc_fatal) goto fail;
-        if (rescued == 0) return {{ prefix }}OK;
+        if (rescued == 0) { {% if me.kernel %}RMC_RELEASE; {% endif %}return {{ prefix }}OK; }
         RMC_LOG(m, "complete algebraic projection did not establish coordinate convergence");
         /* An evaluation error during the rescue (a failed pure call, or an
            exhausted workspace) is not a non-finite trial value. */
@@ -1445,11 +1465,11 @@ failure:
     m->rmc_nonfinite = true;
 {%- endif %}
 fail:
-    memcpy(m->y, incoming, sizeof(incoming));
+    rmc_copy_y(m->y, incoming);
 {%- if blocks and assigns %}
     m->rmc_fb_active[RMC_FB_PLAN] = false;
 {%- endif %}
-    return {{ prefix }}Error;
+    {% if me.kernel %}RMC_RELEASE; {% endif %}return {{ prefix }}Error;
 }
 {%- endif %}
 {%- endmacro %}
