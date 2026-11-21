@@ -125,7 +125,8 @@ pub use linear_op::{
     FunctionFoldProgram, LinearOp, MAX_TENSOR_LANES, MatrixProductShape, RandomGenerator, Reg,
     ScalarProgramRegisterError, ScalarProgramRegisterFlow, StridedOperand, TargetAssignmentShape,
     TensorConcatenateSource, TensorIndex, TensorInputKind, TensorUpdateSubscript, UnaryOp,
-    prune_dead_constants, prune_unread_pure_operations, resolve_indexed_slot,
+    pack_registers, prune_dead_constants, prune_unread_pure_operations, resolve_indexed_slot,
+    slice_to_output,
 };
 pub use model::*;
 pub use parameter_classification::{ExcludedParameter, ExclusionReason, ParameterClassification};

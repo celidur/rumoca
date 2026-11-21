@@ -15,6 +15,9 @@
 //! - `DenseSeeded`: a mixed loop (its derivative row drops the tearing) solved
 //!   by the dense block Newton from a start where `log(u)` is undefined, so
 //!   the first refresh seeds the block through its row isolations.
+//! - `ArrayLoop`: one nonlinear array equation whose rows are singleton
+//!   blocks; each row runs the slice of the residual program that computes
+//!   its own output (`slice_to_output`), so four row programs are emitted.
 //! - `SeededLoop`: a projection stage warm-started by a constant-coefficient
 //!   seed (`t + s = 1 + sqrt(y)` for `t`); a seed that isolates through a
 //!   solver value is never issued.
@@ -50,6 +53,24 @@ fn affine_chain() -> String {
     }
     source.push_str("  v20 + 0.5*v1 = x;\nend AffineChain;\n");
     source
+}
+
+/// Rows of one nonlinear array equation, each a singleton block that runs
+/// the slice of the residual program computing its own output.
+fn array_loop() -> Fixture {
+    Fixture {
+        model: "ArrayLoop",
+        source: "model ArrayLoop
+  Real x[4](start={1, 1.5, 2, 2.5}, each fixed=true);
+  output Real u[4](each start=0.5);
+equation
+  der(x) = -u;
+  u + 0.1*u.*u.*u = x;
+end ArrayLoop;"
+            .to_string(),
+        outputs: &["x[1]", "u[1]", "u[2]", "u[4]"],
+        marker: Some("rmc_row_p3("),
+    }
 }
 
 fn fixtures() -> Vec<Fixture> {
@@ -165,7 +186,7 @@ fn packaged_fmi_projection_paths_match_the_linked_me_kernel() {
     let work = tempdir().expect("projection FMI work directory");
     let driver = work.path().join("projection_trace.py");
     fs::write(&driver, DRIVER).expect("write projection trace driver");
-    for fixture in fixtures() {
+    for fixture in fixtures().into_iter().chain([array_loop()]) {
         let compiled = rumoca::Compiler::new()
             .model(fixture.model)
             .compile_str(&fixture.source, &format!("{}.mo", fixture.model))
