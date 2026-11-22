@@ -560,7 +560,7 @@ pub(super) fn me_refresh_value(
         charts => charts,
         switching => switching.then(|| Value::from_serialize(&switch_records)),
         blocks => Value::from_serialize(&records),
-        block_folds => block_folds(problem, &records),
+        block_folds => block_folds(&records),
         table => table,
         kernel => kernel,
         assign => assignments.into_value()?,
@@ -594,19 +594,18 @@ fn policy_value() -> Value {
     }
 }
 
-/// Each recorded block's ES016 fold message: the Solve IR fact
-/// (`UnlocalizableGuard`) whose unknowns the block solves, rendered as the
-/// typed failure the linked runtime reports (SPEC_0044 ME-EVENT-008). The
-/// distinct messages form one pool (`texts`, each followed by a NUL), and each
-/// block holds its message's byte offset in that pool, or `None`.
-fn block_folds(problem: &solve::SolveProblem, records: &[BlockRecord]) -> Value {
+/// Each recorded block's ES016 fold message, read from its own chart's
+/// problem when the block was recorded. The distinct messages form one pool
+/// (`texts`, each followed by a NUL), and each block holds its message's byte
+/// offset in that pool, or `None`.
+fn block_folds(records: &[BlockRecord]) -> Value {
     let mut texts: Vec<Vec<u8>> = Vec::new();
     let mut offset_of: BTreeMap<Vec<u8>, usize> = BTreeMap::new();
     let mut end = 0usize;
     let offsets: Vec<Option<usize>> = records
         .iter()
         .map(|record| {
-            let text = block_fold(problem, record)?;
+            let text = record.fold()?.to_vec();
             Some(*offset_of.entry(text.clone()).or_insert_with(|| {
                 let offset = end;
                 end += text.len() + 1;
@@ -634,19 +633,6 @@ fn block_folds(problem: &solve::SolveProblem, records: &[BlockRecord]) -> Value 
         pool.push("0".to_owned());
     }
     minijinja::context! { pool => pool, offsets => offsets }
-}
-
-fn block_fold(problem: &solve::SolveProblem, record: &BlockRecord) -> Option<Vec<u8>> {
-    let block = problem
-        .continuous
-        .algebraic_projection_plan
-        .blocks
-        .scalar_blocks()
-        .get(record.canonical())?;
-    let guard = block.y_indices.iter().find_map(|&y_index| {
-        solve::UnlocalizableGuard::covering(&problem.continuous.unlocalizable_guards, y_index)
-    })?;
-    Some(format!("[ES016] {}", guard.fold()).into_bytes())
 }
 
 /// The warm-start rule the generated C translates: its component is
