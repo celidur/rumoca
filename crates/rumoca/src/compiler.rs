@@ -82,6 +82,10 @@ pub struct CompilationResult {
     /// template entry.
     solve_template_renderer_without_dae:
         std::sync::OnceLock<Result<SolveTemplateRenderer, CompilerError>>,
+    /// Cached renderer over the complete lowered model (problem plus start
+    /// values), for targets that seed their own lanes (`solve_model`).
+    solve_model_template_renderer:
+        std::sync::OnceLock<Result<SolveTemplateRenderer, CompilerError>>,
 }
 
 #[derive(Clone, Copy)]
@@ -146,6 +150,21 @@ fn build_solve_template_renderer(dae_model: &Dae) -> Result<SolveTemplateRendere
     .map_err(CompilerError::TemplateError)
 }
 
+/// A renderer over the complete lowered model: the same checked problem a
+/// solve target renders, plus the model's start values (`solve_model`).
+fn build_solve_model_template_renderer(
+    dae_model: &Dae,
+) -> Result<SolveTemplateRenderer, CompilerError> {
+    let lowered = rumoca_sim::lower_correlated_for_simulation_with_overrides(
+        dae_model,
+        &rumoca_sim::SimOptions::default(),
+    )
+    .map_err(|err| CompilerError::TemplateError(CodegenError::template(err.to_string())))?;
+    let prepared = lowered.prepared_dae();
+    SolveTemplateRenderer::new_owned_model_with_dae(Arc::new(lowered.model().clone()), prepared)
+        .map_err(CompilerError::TemplateError)
+}
+
 fn build_solve_template_renderer_without_dae(
     dae_model: &Dae,
 ) -> Result<SolveTemplateRenderer, CompilerError> {
@@ -174,6 +193,7 @@ impl CompilationResult {
             resolved,
             solve_template_renderer: std::sync::OnceLock::new(),
             solve_template_renderer_without_dae: std::sync::OnceLock::new(),
+            solve_model_template_renderer: std::sync::OnceLock::new(),
         }
     }
 
@@ -245,6 +265,21 @@ impl CompilationResult {
         model_name: &str,
     ) -> Result<String, CompilerError> {
         self.solve_renderer_without_dae()?
+            .render_with_name(template, model_name)
+            .map_err(CompilerError::TemplateError)
+    }
+
+    /// Render a solve template against the complete lowered model, whose
+    /// `solve_model` entry carries the start values of every Y and P slot.
+    pub fn render_solve_model_template_str(
+        &self,
+        template: &str,
+        model_name: &str,
+    ) -> Result<String, CompilerError> {
+        self.solve_model_template_renderer
+            .get_or_init(|| build_solve_model_template_renderer(&self.dae))
+            .as_ref()
+            .map_err(Clone::clone)?
             .render_with_name(template, model_name)
             .map_err(CompilerError::TemplateError)
     }
