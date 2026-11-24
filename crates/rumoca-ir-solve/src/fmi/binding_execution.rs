@@ -84,6 +84,62 @@ impl BindingExecution {
     }
 }
 
+/// The parameter bindings of a Solve target that runs the shared C kernel
+/// without an FMI component (a per-lane CUDA initialization): the same
+/// admission, dependency order, and lifecycle rows as the FMI C profile
+/// ([`super::FmiCCodegenView::parameter_binding_execution`]), derived from the
+/// Solve model alone. None of them reads FMI metadata.
+///
+/// Unlike the FMI C profile under parameter-determined events, no discrete
+/// equation settles with the bindings: the runtime's
+/// `apply_initialization_updates` applies the bindings alone, and the
+/// target's initial event iteration settles the discrete rows afterwards.
+#[derive(Debug)]
+pub struct SolveBindingExecution {
+    execution: BindingExecution,
+    levels: usize,
+}
+
+impl SolveBindingExecution {
+    /// Admit the model to the C kernel as the generated C component does,
+    /// without the checks of the component's own variables
+    /// (`c_codegen::admit_kernel`), and issue the execution rows of its
+    /// parameter bindings.
+    pub fn checked(model: &crate::SolveModel) -> Result<Self, &'static str> {
+        let (order, levels) =
+            super::c_codegen::admit_kernel(model, None).map_err(|error| error.0)?;
+        let init = &model.problem.initialization;
+        let execution =
+            BindingExecution::checked(init.update_rhs(), init.update_targets(), &order)?;
+        Ok(Self { execution, levels })
+    }
+
+    /// Whole programs in dependency order, with constructor-issued commit rows.
+    pub fn programs(&self) -> &[FmiBindingProgram] {
+        self.execution.programs()
+    }
+
+    /// The dependency levels of the bindings: the simultaneous sweeps the
+    /// runtime needs to settle them, plus one to observe that nothing changed.
+    #[must_use]
+    pub const fn levels(&self) -> usize {
+        self.levels
+    }
+}
+
+/// The keys the shared kernel's binding template reads from an FMI C view:
+/// `binding_execution` and `discrete_equations` (empty, see above).
+impl Serialize for SolveBindingExecution {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut entries = serializer.serialize_map(Some(3))?;
+        entries.serialize_entry("binding_execution", self.programs())?;
+        entries.serialize_entry("discrete_equations", &[] as &[usize])?;
+        entries.serialize_entry("binding_levels", &self.levels)?;
+        entries.end()
+    }
+}
+
 fn program(
     source: &ScalarProgramBlock,
     targets: &[ScalarSlot],
