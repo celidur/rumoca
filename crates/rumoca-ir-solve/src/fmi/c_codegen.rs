@@ -96,7 +96,7 @@ impl FmiCCodegenView {
         deployment: super::FmiDeploymentView,
     ) -> Result<Self, FmiCCodegenError> {
         let (view, deployment) = deployment.into_parts();
-        let (update_order, update_levels) = admit_kernel(&view.model, Some(&view.metadata))?;
+        let (update_order, update_levels) = admit_kernel(&view.model, Some(&view.metadata), false)?;
         let binding_execution = super::binding_execution::BindingExecution::checked(
             view.model.problem.initialization.update_rhs(),
             view.model.problem.initialization.update_targets(),
@@ -125,7 +125,8 @@ impl TryFrom<FmiEventFreeCodegenView> for FmiCCodegenView {
         let deployment = super::FmiDeploymentCapabilities::default()
             .admit(&value.metadata)
             .map_err(|error| FmiCCodegenError(error.0))?;
-        let (update_order, update_levels) = admit_kernel(&value.model, Some(&value.metadata))?;
+        let (update_order, update_levels) =
+            admit_kernel(&value.model, Some(&value.metadata), false)?;
         let binding_execution = super::binding_execution::BindingExecution::checked(
             value.model.problem.initialization.update_rhs(),
             value.model.problem.initialization.update_targets(),
@@ -149,10 +150,12 @@ impl TryFrom<FmiEventFreeCodegenView> for FmiCCodegenView {
 
 /// What the C kernel requires of a lowered model, and the dependency order
 /// and levels of its parameter bindings. `metadata` is the FMI component's;
-/// a kernel compiled without a component has none to check.
+/// a kernel compiled without a component has none to check, and its target
+/// certifies the retained state manifold itself (`certifies_state_manifold`).
 pub(super) fn admit_kernel(
     model: &crate::SolveModel,
     metadata: Option<&FmiMetadata>,
+    certifies_state_manifold: bool,
 ) -> Result<(Vec<usize>, usize), FmiCCodegenError> {
     super::initial_mode::validate(model).map_err(FmiCCodegenError)?;
     validate_initial_values(model)?;
@@ -161,7 +164,9 @@ pub(super) fn admit_kernel(
     }
     refuse_recursive_groups(&model.pure_calls)?;
     typed_capabilities::admit(&model.pure_calls)?;
-    super::parameter_updates::validate(&model.problem, &model.pure_calls).map_err(FmiCCodegenError)
+    // The C component never projects onto a retained state manifold.
+    super::parameter_updates::validate(&model.problem, &model.pure_calls, certifies_state_manifold)
+        .map_err(FmiCCodegenError)
 }
 
 fn validate_initial_values(model: &crate::SolveModel) -> Result<(), FmiCCodegenError> {
