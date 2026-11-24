@@ -22,6 +22,10 @@ pub(crate) trait RefreshSource {
     fn instantiation_point(&self) -> (&[f64], &[f64]);
     /// The dependency levels of the parameter bindings the kernel settles.
     fn parameter_binding_levels(&self) -> usize;
+    /// Whether the target of this source projects its accepted states onto
+    /// the retained state manifold (`manifold_kernel`), so the refresh admits
+    /// a model that retains one and its arena also holds that projection.
+    fn projects_state_manifold(&self) -> bool;
 }
 
 impl RefreshSource for solve::fmi::FmiCCodegenView {
@@ -43,11 +47,18 @@ impl RefreshSource for solve::fmi::FmiCCodegenView {
     fn parameter_binding_levels(&self) -> usize {
         Self::parameter_binding_levels(self)
     }
+    /// FMI 3 Model Exchange has no call that moves the continuous states at
+    /// an accepted point, so the C component never projects them.
+    fn projects_state_manifold(&self) -> bool {
+        false
+    }
 }
 
 /// A complete lowered model, without an FMI component, admitted to the C
 /// kernel (SPEC_0044 ME-PROJ-001). Only an admitted model is a refresh source,
-/// so no view is built from a model the kernel refuses.
+/// so no view is built from a model the kernel refuses. Its target runs its
+/// own steps, so it projects each accepted state onto the retained manifold
+/// (`manifold_kernel` over `solve_blocks.state_manifold`).
 pub(crate) struct AdmittedSolveModel<'a> {
     model: &'a solve::SolveModel,
     bindings: solve::fmi::SolveBindingExecution,
@@ -89,5 +100,8 @@ impl RefreshSource for AdmittedSolveModel<'_> {
     }
     fn parameter_binding_levels(&self) -> usize {
         self.bindings.levels()
+    }
+    fn projects_state_manifold(&self) -> bool {
+        true
     }
 }
