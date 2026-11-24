@@ -149,7 +149,9 @@ fn admit_kernel(
     validate_variables(metadata)?;
     refuse_recursive_groups(&model.pure_calls)?;
     typed_capabilities::admit(&model.pure_calls)?;
-    super::parameter_updates::validate(&model.problem, &model.pure_calls).map_err(FmiCCodegenError)
+    // The C component never projects onto a retained state manifold.
+    super::parameter_updates::validate(&model.problem, &model.pure_calls, false)
+        .map_err(FmiCCodegenError)
 }
 
 fn validate_initial_values(model: &crate::SolveModel) -> Result<(), FmiCCodegenError> {
