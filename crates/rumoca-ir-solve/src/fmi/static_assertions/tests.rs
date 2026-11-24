@@ -171,10 +171,28 @@ fn tensor_kernels_settle_from_their_complete_operand_ranges() {
             axis: 0,
             lanes: 1,
         },
+        LinearOp::TensorTranspose {
+            dst_start: 19,
+            src_start: 0,
+            rows: 1,
+            columns: 3,
+            element_width: 1,
+            lanes: 1,
+        },
+        LinearOp::TensorTranspose {
+            dst_start: 22,
+            src_start: 3,
+            rows: 3,
+            columns: 1,
+            element_width: 1,
+            lanes: 1,
+        },
         LinearOp::StoreOutput { src: 6 },
         LinearOp::StoreOutput { src: 9 },
         LinearOp::StoreOutput { src: 12 },
         LinearOp::StoreOutput { src: 13 },
+        LinearOp::StoreOutput { src: 21 },
+        LinearOp::StoreOutput { src: 24 },
     ];
     let settled = scalar_dependencies::program_outputs(
         &crate::SolvePureCallTable::default(),
@@ -182,7 +200,7 @@ fn tensor_kernels_settle_from_their_complete_operand_ranges() {
         &[false],
         &[true; 5],
     );
-    assert_eq!(settled, Some(vec![false, true, true, false]));
+    assert_eq!(settled, Some(vec![false, true, true, false, true, false]));
 }
 
 /// What the early-exit predicate of `counted_fold` reads each pass.
