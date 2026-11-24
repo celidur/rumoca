@@ -53,6 +53,11 @@ until the bindings stop changing, each residual row evaluated after the
 algebraic refresh) through the shared projection kernel at the FMI tolerance.
 Initialization rows over declaration seeds, homotopy continuation, delay
 histories, and retained state-manifold rows are refused.
+A retained state-manifold projection is refused too: FMI 3 Model Exchange has
+no call that moves the continuous states at an accepted point. The shared
+kernel's `manifold_kernel` projects onto that manifold for a target that drives
+it after its own accepted steps; with `device=true` it builds for a lane target
+beside `device_kernel`.
 
 The current profile executes state, input, and time events and periodic clocks
 through the event iteration of SPEC_0044 ME-EVENT-002 and rejects dynamic time
