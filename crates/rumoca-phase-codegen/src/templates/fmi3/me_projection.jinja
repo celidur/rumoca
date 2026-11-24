@@ -74,23 +74,13 @@
 {%- endmacro %}
 
 {#- ── generic kernel ─────────────────────────────────────────────────────── -#}
-{%- macro projection_kernel(me, device=false) %}{%- set q = "static __device__" if device else "static" %}{%- set api = "static __device__" if device else "RMC_API" %}
-{%- if me.kernel %}
-#define RMC_TOL {{ me.policy.tolerance }}
-#define RMC_REFRESH_ITERS {{ me.policy.refresh_iters }}
-#define RMC_REFINE_ITERS {{ me.policy.refine_iters }}
-#define RMC_TRUST_FRACTION {{ me.policy.trust_fraction }}
-#define RMC_TORN_ITERS {{ me.policy.torn_iters }}
-#define RMC_TORN_BACKTRACKS {{ me.policy.torn_backtracks }}
-#define RMC_TORN_DECREASE {{ me.policy.torn_decrease }}
-#define RMC_SEED_LEN {{ me.seed_len if me.seed_len > 0 else 1 }}
-#define RMC_DWORK {{ me.work.doubles }}
-#define RMC_SWORK {{ me.work.sizes }}
-#define RMC_ISOLATION_UNAVAILABLE 0
-#define RMC_ISOLATION_OUTPUT_VALUE 1
-#define RMC_ISOLATION_PROGRAM 2
-#define RMC_RUN_ISOLATOR 1
-{{ c_array("rmc_variable_scale", "double", me.variable_scales, device=device) }}
+{#- The arena, the scaled convergence tests and the scaled dense Newton
+    solve every projection of the kernel shares: the refresh blocks, the
+    initialization and the state manifold. `work` sizes the per-instance
+    arena (`doubles`, `sizes`). -#}
+{%- macro projection_numerics(work, device=false) %}{%- set q = "static __device__" if device else "static" %}{%- set api = "static __device__" if device else "RMC_API" %}
+#define RMC_DWORK {{ work.doubles }}
+#define RMC_SWORK {{ work.sizes }}
 typedef struct { bool changed; bool settled; } RmcUpdate;
 
 /* ── workspace: one per-instance arena, released on every return ─────── */
@@ -139,11 +129,6 @@ RMC_COLD {{ q }} int rmc_exhausted(ModelInstance* m) { RMC_LOG(m, "algebraic pro
         norm = rmc_max(norm, quotient);
     }
     return norm;
-}
-/* scaling.rs: model_variable_scale over SolveModel::solver_variable_scale */
-{{ q }} double rmc_model_scale(size_t index, double value) {
-    double magnitude = isfinite(value) ? fabs(value) : 0.0;
-    return rmc_max(rmc_valid_scale(rmc_variable_scale[index]), magnitude);
 }
 {{ q }} bool rmc_all_finite(const double* values, size_t n) {
     for (size_t i = 0; i < n; ++i) if (!isfinite(values[i])) return false;
@@ -219,6 +204,29 @@ typedef struct { size_t n; double* scaled; double* lu; size_t* ipiv; const doubl
     int result = rmc_dense_factor(m, jac, n, rscale, vscale, &factor);
     if (result == 0) result = rmc_dense_solve(m, &factor, residual, delta);
     RMC_RELEASE; return result;
+}
+{%- endmacro %}
+
+{%- macro projection_kernel(me, device=false) %}{%- set q = "static __device__" if device else "static" %}{%- set api = "static __device__" if device else "RMC_API" %}
+{%- if me.kernel %}
+#define RMC_TOL {{ me.policy.tolerance }}
+#define RMC_REFRESH_ITERS {{ me.policy.refresh_iters }}
+#define RMC_REFINE_ITERS {{ me.policy.refine_iters }}
+#define RMC_TRUST_FRACTION {{ me.policy.trust_fraction }}
+#define RMC_TORN_ITERS {{ me.policy.torn_iters }}
+#define RMC_TORN_BACKTRACKS {{ me.policy.torn_backtracks }}
+#define RMC_TORN_DECREASE {{ me.policy.torn_decrease }}
+#define RMC_SEED_LEN {{ me.seed_len if me.seed_len > 0 else 1 }}
+#define RMC_ISOLATION_UNAVAILABLE 0
+#define RMC_ISOLATION_OUTPUT_VALUE 1
+#define RMC_ISOLATION_PROGRAM 2
+#define RMC_RUN_ISOLATOR 1
+{{- projection_numerics(me.work, device=device) }}
+{{ c_array("rmc_variable_scale", "double", me.variable_scales, device=device) }}
+/* scaling.rs: model_variable_scale over SolveModel::solver_variable_scale */
+{{ q }} double rmc_model_scale(size_t index, double value) {
+    double magnitude = isfinite(value) ? fabs(value) : 0.0;
+    return rmc_max(rmc_valid_scale(rmc_variable_scale[index]), magnitude);
 }
 {%- if me.blocks|length > 0 %}
 /* The view the kernel reads a block through: its id and its descriptor.
@@ -1255,6 +1263,280 @@ RMC_COLD {{ q }} int rmc_plan_converged(ModelInstance* m, const size_t* entries,
 {%- endif %}
 {%- endmacro %}
 
+{#- Projection onto the retained state manifold (`solve_blocks.state_manifold`):
+    manifold.rs `project_state_manifold` and `certify_state_manifold`. The
+    including unit emits `projection_numerics` first (with an arena at least
+    `mf.work`) and defines `ModelInstance` with `y` (the states first), `p`,
+    `rmc_tol`, the arena fields, `RMC_LOG(m, message)` and `rmc_now(m)`. A
+    target calls `rmc_project_state_manifold` after each accepted step and
+    `rmc_certify_state_manifold` on a settled initialization point. With
+    `device=true` every function and table is `static __device__`: a lane
+    target emits it after `device_kernel`, whose numerics already size the
+    arena for it (the refresh view of a lowered model holds `mf.work`); a
+    smaller arena fails the build. -#}
+{%- macro manifold_kernel(mf, device=false) %}{%- set q = "static __device__" if device else "static" %}{%- set api = "static __device__" if device else "RMC_API" %}
+{%- if mf.blocks|length > 0 %}
+#define RMC_MF_ROWS {{ mf.rows }}
+#define RMC_MF_STATES {{ mf.state_count }}
+#define RMC_MF_ITERS {{ mf.max_iters }}
+#define RMC_MF_MAX_M {{ mf.max_m }}
+#define RMC_MF_MAX_N {{ mf.max_n }}
+/* The including unit's arena holds this projection (a negative array size
+   otherwise fails the build, in C and in C++ alike). */
+typedef char rmc_mf_arena_check[(RMC_DWORK >= {{ mf.work.doubles }} && RMC_SWORK >= {{ mf.work.sizes }}) ? 1 : -1];
+/* One block: `m` residual rows over `n` state coordinates (m <= n), and the
+   `rmc_mf_pool` offsets of its rows and coordinates. */
+typedef struct { size_t m; size_t n; size_t rows; size_t y; } RmcManifoldBlock;
+{{ q }} const size_t rmc_mf_pool[{{ mf.pool|length }}] = {
+{%- for chunk in mf.pool|batch(24) %}
+    {% for value in chunk %}{{ value }},{% endfor %}
+{%- endfor %}
+};
+{{ q }} const RmcManifoldBlock rmc_mf_blocks[] = {
+{%- for b in mf.blocks %}
+    { {{ b.m }}, {{ b.n }}, {{ b.rows }}, {{ b.y }} },
+{%- endfor %}
+};
+#define RMC_MF_BLOCKS (sizeof(rmc_mf_blocks) / sizeof(rmc_mf_blocks[0]))
+/* ManifoldProjectionModel::manifold_variable_scale: each state's solver
+   variable scale */
+{{ q }} const double rmc_mf_scale[RMC_MF_STATES] = { {% for value in mf.state_scales %}{{ value }},{% endfor %} };
+/* manifold_execution.rs: eval_residual, every retained row. -1 error */
+{{ q }} int rmc_mf_residual(ModelInstance* m, double* o) {
+    (void)m;
+{%- for program in mf.residual.programs %}
+    {
+    double r[{{ program.temporary_count if program.temporary_count > 0 else 1 }}]; (void)r;
+{%- for op in program.ops %}
+{{ scalar_op(op, "o", "-1", device=device) }}
+{%- endfor %}
+    }
+{%- endfor %}
+    return 0;
+}
+/* manifold_execution.rs: eval_directional, every retained row's derivative
+   along the state direction `seed`. -1 error */
+{{ q }} int rmc_mf_jvp(ModelInstance* m, const double* seed, double* o) {
+    (void)m; (void)seed;
+{%- for program in mf.jvp.programs %}
+    {
+    double r[{{ program.temporary_count if program.temporary_count > 0 else 1 }}]; (void)r;
+{%- for op in program.ops %}
+{{ scalar_op(op, "o", "-1", device=device) }}
+{%- endfor %}
+    }
+{%- endfor %}
+    return 0;
+}
+/* manifold.rs: manifold_block_jacobian, column by column from the complete
+   directional rows (`seed` is all zero on entry and on return), into the
+   row-major m x n matrix `jac`. -1 error */
+{{ q }} int rmc_mf_jacobian(ModelInstance* m, const RmcManifoldBlock* b, double* seed, double* jvp, double* jac) {
+    const size_t* rows = rmc_mf_pool + b->rows; const size_t* y = rmc_mf_pool + b->y;
+    for (size_t col = 0; col < b->n; ++col) {
+        seed[y[col]] = 1.0;
+        for (size_t i = 0; i < RMC_MF_ROWS; ++i) jvp[i] = 0.0;
+        int evaluated = rmc_mf_jvp(m, seed, jvp);
+        seed[y[col]] = 0.0;
+        if (evaluated != 0) return -1;
+        for (size_t row = 0; row < b->m; ++row) jac[row * b->n + col] = jvp[rows[row]];
+    }
+    return 0;
+}
+/* manifold.rs: manifold_block_scales: the states' own scales and
+   scaling.rs: jacobian_row_scales with unit fallbacks */
+{{ q }} void rmc_mf_scales(const RmcManifoldBlock* b, const double* jac, double* rscale, double* vscale) {
+    const size_t* y = rmc_mf_pool + b->y;
+    for (size_t col = 0; col < b->n; ++col) vscale[col] = rmc_mf_scale[y[col]];
+    for (size_t row = 0; row < b->m; ++row) {
+        double scale = 0.0;
+        for (size_t col = 0; col < b->n; ++col) {
+            double contribution = fabs(jac[row * b->n + col]) * rmc_valid_scale(vscale[col]);
+            if (isfinite(contribution)) scale = rmc_max(scale, contribution);
+        }
+        rscale[row] = scale > 0.0 ? scale : 1.0;
+    }
+}
+/* nalgebra SVD::solve of a wide system (m < n): one-sided Jacobi on the
+   transpose, A^T V = W with orthogonal columns of norms sigma, so the
+   minimum-norm solution is W diag(1/sigma^2) V^T rhs, dropping singular
+   values at or below `eps`. -1 error */
+RMC_COLD {{ q }} int rmc_mf_wide_solve(ModelInstance* m, const double* a, size_t rows, size_t cols, const double* rhs, double eps, double* x) {
+    RMC_MARK;
+    double* w = rmc_dalloc(m, cols * rows); double* v = rmc_dalloc(m, rows * rows);
+    if (!w || !v) { RMC_RELEASE; return rmc_exhausted(m); }
+    for (size_t i = 0; i < cols; ++i) for (size_t j = 0; j < rows; ++j) w[i * rows + j] = a[j * cols + i];
+    for (size_t j = 0; j < rows; ++j) v[j * rows + j] = 1.0;
+    for (int sweep = 0; sweep < 64; ++sweep) {
+        bool rotated = false;
+        for (size_t p = 0; p + 1 < rows; ++p) for (size_t q = p + 1; q < rows; ++q) {
+            double alpha = 0.0, beta = 0.0, gamma = 0.0;
+            for (size_t i = 0; i < cols; ++i) { alpha += w[i * rows + p] * w[i * rows + p]; beta += w[i * rows + q] * w[i * rows + q]; gamma += w[i * rows + p] * w[i * rows + q]; }
+            if (fabs(gamma) <= DBL_EPSILON * sqrt(alpha * beta)) continue;
+            rotated = true;
+            double zeta = (beta - alpha) / (2.0 * gamma);
+            double t = (zeta >= 0.0 ? 1.0 : -1.0) / (fabs(zeta) + sqrt(1.0 + zeta * zeta));
+            double c = 1.0 / sqrt(1.0 + t * t), s = c * t;
+            for (size_t i = 0; i < cols; ++i) { double wp = w[i * rows + p], wq = w[i * rows + q]; w[i * rows + p] = c * wp - s * wq; w[i * rows + q] = s * wp + c * wq; }
+            for (size_t i = 0; i < rows; ++i) { double vp = v[i * rows + p], vq = v[i * rows + q]; v[i * rows + p] = c * vp - s * vq; v[i * rows + q] = s * vp + c * vq; }
+        }
+        if (!rotated) break;
+    }
+    for (size_t i = 0; i < cols; ++i) x[i] = 0.0;
+    for (size_t j = 0; j < rows; ++j) {
+        double sigma2 = 0.0, projection = 0.0;
+        for (size_t i = 0; i < cols; ++i) sigma2 += w[i * rows + j] * w[i * rows + j];
+        for (size_t i = 0; i < rows; ++i) projection += v[i * rows + j] * rhs[i];
+        if (!(sqrt(sigma2) > eps)) continue;
+        double coefficient = projection / sigma2;
+        for (size_t i = 0; i < cols; ++i) x[i] += coefficient * w[i * rows + j];
+    }
+    RMC_RELEASE; return 0;
+}
+/* scaling.rs: scaled_newton_delta of a manifold block: the square system
+   through the dense LU and its SVD fallback, a wide one through its
+   minimum-norm SVD solution, both with the rank tolerance `tol`. -1 error,
+   1 solved */
+{{ q }} int rmc_mf_newton_delta(ModelInstance* m, const RmcManifoldBlock* b, const double* jac, const double* residual, const double* rscale, const double* vscale, double tol, double* delta) {
+    if (b->m == b->n) {
+        double saved = m->rmc_tol; m->rmc_tol = tol;
+        int result = rmc_scaled_newton_delta(m, jac, b->n, residual, rscale, vscale, delta);
+        m->rmc_tol = saved; return result;
+    }
+    RMC_MARK; int result = 1;
+    double* scaled = rmc_dalloc(m, b->m * b->n); double* rhs = rmc_dalloc(m, b->m); double* x = rmc_dalloc(m, b->n);
+    if (!scaled || !rhs || !x) { RMC_RELEASE; return rmc_exhausted(m); }
+    for (size_t row = 0; row < b->m; ++row) {
+        rhs[row] = -residual[row] / rmc_valid_scale(rscale[row]);
+        for (size_t col = 0; col < b->n; ++col) scaled[row * b->n + col] = jac[row * b->n + col] * rmc_valid_scale(vscale[col]) / rmc_valid_scale(rscale[row]);
+    }
+    if (rmc_mf_wide_solve(m, scaled, b->m, b->n, rhs, tol, x) != 0) result = -1;
+    if (result == 1) for (size_t col = 0; col < b->n; ++col) delta[col] = x[col] * rmc_valid_scale(vscale[col]);
+    RMC_RELEASE; return result;
+}
+/* projection.rs: algebraic_step_at_resolution */
+{{ q }} bool rmc_mf_at_resolution(double current, double candidate) {
+    return candidate == current || candidate == nextafter(current, {{ "HUGE_VAL" if device else "INFINITY" }}) || candidate == nextafter(current, {{ "-HUGE_VAL" if device else "-INFINITY" }});
+}
+/* projection.rs: next_scaled_backtrack; false when no halved correction is
+   larger than its variable's scaled tolerance */
+{{ q }} bool rmc_mf_backtrack(double* alpha, const double* delta, const double* vscale, size_t n, double tol) {
+    double next = *alpha * 0.5;
+    if (!(next > 0.0 && next < *alpha)) return false;
+    for (size_t i = 0; i < n; ++i) if (fabs(next * delta[i]) > rmc_scaled_tolerance(tol, vscale[i])) { *alpha = next; return true; }
+    return false;
+}
+/* manifold.rs: evaluate_manifold_block: the complete residual `full`, the
+   block's rows, Jacobian and scales. -1 error */
+{{ q }} int rmc_mf_evaluate(ModelInstance* m, const RmcManifoldBlock* b, double* seed, double* full, double* residual, double* jac, double* rscale, double* vscale) {
+    const size_t* rows = rmc_mf_pool + b->rows;
+    if (rmc_mf_residual(m, full) != 0) return -1;
+    for (size_t row = 0; row < b->m; ++row) residual[row] = full[rows[row]];
+    double* jvp = residual + b->m;
+    if (rmc_mf_jacobian(m, b, seed, jvp, jac) != 0) return -1;
+    rmc_mf_scales(b, jac, rscale, vscale);
+    return 0;
+}
+/* manifold.rs: project_manifold_block: one scaled Newton correction of the
+   block states, halved until the scaled residual decreases; the states are
+   restored when no trial is accepted. -1 error */
+{{ q }} int rmc_mf_project_block(ModelInstance* m, const RmcManifoldBlock* b, double tol, double* seed, double* full, RmcUpdate* update) {
+    RMC_MARK; int result = 0;
+    const size_t* rows = rmc_mf_pool + b->rows; const size_t* y = rmc_mf_pool + b->y;
+    size_t mm = b->m, n = b->n;
+    double* residual = rmc_dalloc(m, mm + RMC_MF_ROWS); double* jac = rmc_dalloc(m, mm * n); double* rscale = rmc_dalloc(m, mm); double* vscale = rmc_dalloc(m, n); double* delta = rmc_dalloc(m, n); double* saved = rmc_dalloc(m, n);
+    if (!residual || !jac || !rscale || !vscale || !delta || !saved) { RMC_RELEASE; return rmc_exhausted(m); }
+    update->changed = false; update->settled = false;
+    if (rmc_mf_evaluate(m, b, seed, full, residual, jac, rscale, vscale) != 0) { RMC_RELEASE; return -1; }
+    if (rmc_scaled_converged(tol, residual, rscale, mm)) { update->settled = true; RMC_RELEASE; return 0; }
+    double before = rmc_scaled_norm(residual, rscale, mm);
+    int solved = rmc_mf_newton_delta(m, b, jac, residual, rscale, vscale, tol, delta);
+    if (solved != 1) { RMC_RELEASE; return solved < 0 ? -1 : 0; }
+    for (size_t i = 0; i < n; ++i) saved[i] = m->y[y[i]];
+    double alpha = 1.0;
+    for (;;) {
+        for (size_t i = 0; i < n; ++i) m->y[y[i]] = saved[i];
+        bool changed = false, at_resolution = true, finite_step = true;
+        for (size_t i = 0; i < n; ++i) {
+            double candidate = saved[i] + alpha * delta[i];
+            if (!isfinite(candidate)) { finite_step = false; break; }
+            changed = changed || candidate != saved[i];
+            at_resolution = at_resolution && rmc_mf_at_resolution(saved[i], candidate);
+            m->y[y[i]] = candidate;
+        }
+        if (finite_step && changed) {
+            if (rmc_mf_residual(m, full) != 0) { result = -1; break; }
+            for (size_t row = 0; row < mm; ++row) residual[row] = full[rows[row]];
+            double after = rmc_scaled_norm(residual, rscale, mm);
+            if (isfinite(after) && (after <= fabs(tol) || (!at_resolution && after < before))) {
+                update->changed = true; update->settled = after <= fabs(tol);
+                RMC_RELEASE; return 0;
+            }
+        }
+        if (at_resolution || !rmc_mf_backtrack(&alpha, delta, vscale, n, tol)) break;
+    }
+    for (size_t i = 0; i < n; ++i) m->y[y[i]] = saved[i];
+    RMC_RELEASE; return result;
+}
+/* manifold.rs: project_state_manifold: up to RMC_MF_ITERS sweeps over the
+   blocks until every block settles; on a failure the states are restored and
+   the worst retained row is reported. `*changed` tells whether a state
+   moved. -1 error */
+{{ api }} int rmc_project_state_manifold(ModelInstance* m, double tol, bool* changed) {
+    RMC_MARK; int result = -1;
+    *changed = false;
+    double* before = rmc_dalloc(m, RMC_MF_STATES); double* full = rmc_dalloc(m, RMC_MF_ROWS); double* seed = rmc_dalloc(m, RMC_MF_STATES);
+    if (!before || !full || !seed) { RMC_RELEASE; return rmc_exhausted(m); }
+    for (size_t i = 0; i < RMC_MF_STATES; ++i) before[i] = m->y[i];
+    bool failed = false;
+    for (int sweep = 0; sweep < RMC_MF_ITERS && !failed; ++sweep) {
+        bool settled = true, moved = false;
+        for (size_t k = 0; k < RMC_MF_BLOCKS; ++k) {
+            RmcUpdate update;
+            if (rmc_mf_project_block(m, &rmc_mf_blocks[k], tol, seed, full, &update) != 0) { failed = true; break; }
+            settled = settled && update.settled; moved = moved || update.changed;
+        }
+        if (failed) break;
+        if (settled) { result = 0; break; }
+        if (!moved) break;
+    }
+    if (result != 0 && !failed) {
+        if (rmc_mf_residual(m, full) == 0) {
+            size_t worst = 0;
+            for (size_t row = 1; row < RMC_MF_ROWS; ++row) if (!(fabs(full[row]) <= fabs(full[worst]))) worst = row;
+            char message[160];
+            snprintf(message, sizeof message, "index-reduction manifold projection did not converge; residual row %zu is %g", worst, full[worst]);
+            RMC_LOG(m, message);
+        } else {
+            RMC_LOG(m, "index-reduction manifold projection did not converge");
+        }
+    }
+    if (result != 0) for (size_t i = 0; i < RMC_MF_STATES; ++i) m->y[i] = before[i];
+    else for (size_t i = 0; i < RMC_MF_STATES; ++i) *changed = *changed || before[i] != m->y[i];
+    RMC_RELEASE; return result;
+}
+/* manifold.rs: certify_state_manifold: every block's rows within the scaled
+   tolerance at the current states, which it never changes. -1 error */
+{{ api }} int rmc_certify_state_manifold(ModelInstance* m, double tol) {
+    RMC_MARK;
+    double* full = rmc_dalloc(m, RMC_MF_ROWS); double* seed = rmc_dalloc(m, RMC_MF_STATES);
+    double* residual = rmc_dalloc(m, RMC_MF_MAX_M + RMC_MF_ROWS); double* jac = rmc_dalloc(m, RMC_MF_MAX_M * RMC_MF_MAX_N); double* rscale = rmc_dalloc(m, RMC_MF_MAX_M); double* vscale = rmc_dalloc(m, RMC_MF_MAX_N);
+    if (!full || !seed || !residual || !jac || !rscale || !vscale) { RMC_RELEASE; return rmc_exhausted(m); }
+    for (size_t k = 0; k < RMC_MF_BLOCKS; ++k) {
+        const RmcManifoldBlock* b = &rmc_mf_blocks[k];
+        if (rmc_mf_evaluate(m, b, seed, full, residual, jac, rscale, vscale) != 0) { RMC_RELEASE; return -1; }
+        if (!rmc_scaled_converged(tol, residual, rscale, b->m)) {
+            char message[160];
+            snprintf(message, sizeof message, "initial state manifold is inconsistent in constraint block %zu; settled initial states cannot be corrected", k);
+            RMC_LOG(m, message);
+            RMC_RELEASE; return -1;
+        }
+    }
+    RMC_RELEASE; return 0;
+}
+{%- endif %}
+{%- endmacro %}
+
 {#- Every issued exact-assignment program once: 0 stored, 1 a non-finite
     store, -1 a failed pure call. -#}
 {%- macro assignment_functions(me, device=false) %}{%- set q = "static __device__" if device else "static" %}{%- set api = "static __device__" if device else "RMC_API" %}
@@ -1469,7 +1751,12 @@ fail:
 }
 {%- endmacro %}
 
-{%- macro refresh_values(solve, me, prefix) %}
+{#- The parameter bindings as the runtime applies them, over the binding
+    execution `fmi` issues (`binding_execution`, `discrete_equations`): the
+    checked FMI C component, or a Solve target's `SolveBindingExecution`.
+    A device build (`device`) qualifies both functions for the device; it
+    defines `update_discrete_equations` itself. -#}
+{%- macro binding_updates(solve, fmi, prefix, device=false) %}{%- set q = "static __device__" if device else "static" %}
 {%- set targets = solve.initialization.update_targets %}
 /* relation_memory.rs: apply_initialization_updates. The checked parameter
    bindings run in dependency order, each reading only settled parameters and
@@ -1479,7 +1766,7 @@ fail:
    initial value). The parameter-determined discrete equations follow: they
    read only parameters, so they settle with them.
    -1 error, 0 unchanged, 1 changed */
-static int rmc_apply_updates(ModelInstance* m, bool initializing) {
+{{ q }} int rmc_apply_updates(ModelInstance* m, bool initializing) {
     (void)initializing;
 {%- if targets|length > 0 %}
     static const size_t targets[{{ targets|length }}] = {
@@ -1524,12 +1811,16 @@ static int rmc_apply_updates(ModelInstance* m, bool initializing) {
     return update_discrete_equations(m) == {{ prefix }}OK ? 0 : -1;
 {%- endif %}
 }
-static {{ prefix }}Status refresh_parameters(ModelInstance* m) {
+{{ q }} {{ prefix }}Status refresh_parameters(ModelInstance* m) {
     if (!m->parameters_dirty) return {{ prefix }}OK;
     if (rmc_apply_updates(m, false) < 0) return {{ prefix }}Error;
     m->parameters_dirty = false;
     return {{ prefix }}OK;
 }
+{%- endmacro %}
+
+{%- macro refresh_values(solve, me, prefix) %}
+{{- binding_updates(solve, fmi, prefix) }}
 {{ refresh_entries(solve, me, prefix) }}
 {%- endmacro %}
 
@@ -2190,9 +2481,14 @@ RMC_COLD {{ q }} int rmc_init_project(ModelInstance* m) {
     }
     RMC_RELEASE; return result;
 }
+{%- if me.state_manifold %}
+/* manifold_kernel, which the including unit emits after this kernel. */
+{{ api }} int rmc_certify_state_manifold(ModelInstance* m, double tol);
+{%- endif %}
 /* solve_runtime/initial_projection.rs: settle_initialization_system at the
-   FMI tolerance; the certified continuous refresh follows at the refresh
-   tolerance. */
+   FMI tolerance{% if me.state_manifold %}, then the settled states certified on the retained
+   manifold at that tolerance (the linked kernel's CertifyInitial){% endif %};
+   the certified continuous refresh follows at the refresh tolerance. */
 RMC_COLD {{ q }} {{ prefix }}Status rmc_initialize(ModelInstance* m, double tolerance) {
     {{ prefix }}Status status = {{ prefix }}Error;
     if (m->rmc_fatal) return status;
@@ -2205,6 +2501,12 @@ RMC_COLD {{ q }} {{ prefix }}Status rmc_initialize(ModelInstance* m, double tole
         if (changed < 0) break;
         if (changed == 0) { status = {{ prefix }}OK; break; }
     }
+{%- if me.state_manifold %}
+    if (status == {{ prefix }}OK && !m->rmc_fatal && rmc_certify_state_manifold(m, m->rmc_tol) != 0) {
+        m->rmc_tol = RMC_TOL; m->rmc_certify = true;
+        return {{ prefix }}Error;
+    }
+{%- endif %}
     m->rmc_tol = RMC_TOL; m->rmc_certify = true;
     if (m->rmc_fatal) return {{ prefix }}Error;
     if (status != {{ prefix }}OK) RMC_LOG(m, "initial algebraic/update projection did not converge");

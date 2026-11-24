@@ -290,24 +290,11 @@ fn require_lane_events(problem: &solve::SolveProblem) -> Result<(), CodegenError
     }
 }
 
-/// A retained state-manifold projection moves accepted states back onto the
-/// lower-order constraints index reduction replaced; no lane kernel does.
-fn require_no_state_manifold(problem: &solve::SolveProblem) -> Result<(), CodegenError> {
-    if problem.continuous.manifold_projection_plan.is_empty() {
-        return Ok(());
-    }
-    Err(refuse(
-        "manifold_projection",
-        "the model retains a state-manifold projection",
-    ))
-}
-
 fn events_value(
     problem: &solve::SolveProblem,
     pure_calls: Option<&solve::SolvePureCallTable>,
 ) -> Result<Value, CodegenError> {
     require_lane_events(problem)?;
-    require_no_state_manifold(problem)?;
     let events = &problem.events;
     let discrete = &problem.discrete;
     let (roots, root_count) = dense_rows_value(&events.root_conditions, pure_calls, "events")?;
@@ -433,7 +420,7 @@ fn initialization_value(
     if !init.projection_plan().blocks.is_empty() {
         return Err(refuse(
             FEATURE,
-            "the initialization retains residual blocks to solve",
+            "the initialization retains residual blocks, which only the shared projection kernel (`me_refresh`) solves",
         ));
     }
     // Ordered bindings, partitioned by the column they write: parameter

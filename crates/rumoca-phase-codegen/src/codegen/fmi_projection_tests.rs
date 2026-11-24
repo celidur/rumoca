@@ -378,6 +378,10 @@ fn a_state_manifold_projection_is_refused_before_any_byte() {
         .validate()
         .expect("the manifold-bearing fixture is a valid Solve problem");
     assert!(!super::me_projection::me_refresh_admissible(&model.problem));
+    assert!(
+        super::me_projection::me_refresh_admissible_with_state_manifold(&model.problem),
+        "a target that projects onto the retained manifold itself admits its refresh"
+    );
 
     let component = solve::fmi::FmiComponent::construct(model, vec![state_input()])
         .expect("the manifold-bearing fixture is a checked component");
@@ -396,6 +400,11 @@ fn a_state_manifold_projection_is_refused_before_any_byte() {
 /// A chain of `depth` parameter bindings `p[k] = p[k-1] + 1` over one run of
 /// `depth + 1` parameters, beside the state run.
 fn component_with_binding_chain(depth: usize) -> solve::fmi::FmiComponent {
+    chain_component(model_with_binding_chain(depth), depth)
+}
+
+/// The Solve model of [`component_with_binding_chain`].
+fn model_with_binding_chain(depth: usize) -> solve::SolveModel {
     let mut model = model_with_one_state_run(false);
     let count = depth + 1;
     model.problem.layout = solve::VarLayout::from_parts(IndexMap::new(), 2, count);
@@ -456,6 +465,11 @@ fn component_with_binding_chain(depth: usize) -> solve::fmi::FmiComponent {
         .collect();
     model.problem.initialization = solve::InitializationSolveSystem::construct(initialization)
         .expect("each binding owns its own target");
+    model
+}
+
+fn chain_component(model: solve::SolveModel, depth: usize) -> solve::fmi::FmiComponent {
+    let count = depth + 1;
     let parameter = solve::fmi::FmiVariableInput {
         name: "p".to_string(),
 
@@ -468,6 +482,30 @@ fn component_with_binding_chain(depth: usize) -> solve::fmi::FmiComponent {
     };
     solve::fmi::FmiComponent::construct(model, vec![state_input(), parameter])
         .expect("the binding chain is a checked component")
+}
+
+/// A Solve target without an FMI component (a per-lane CUDA initialization)
+/// runs the bindings in the order, with the levels and the lifecycle rows,
+/// the FMI C profile admits on the same model.
+#[test]
+fn the_solve_binding_execution_is_the_fmi_c_profile_one() {
+    for depth in [1, 3] {
+        let model = model_with_binding_chain(depth);
+        let lanes = solve::fmi::SolveBindingExecution::checked(&model)
+            .expect("an acyclic parameter chain is admitted");
+        let view = chain_component(model, depth)
+            .into_codegen_view()
+            .try_c()
+            .expect("an acyclic parameter chain is admitted");
+        assert_eq!(lanes.levels(), view.parameter_binding_levels());
+        assert_eq!(
+            serde_json::to_value(lanes.programs()).expect("programs serialize"),
+            serde_json::to_value(view.parameter_binding_execution()).expect("programs serialize"),
+        );
+        let keys = serde_json::to_value(&lanes).expect("the view serializes");
+        assert_eq!(keys["discrete_equations"], serde_json::json!([]));
+        assert_eq!(keys["binding_levels"], serde_json::json!(depth));
+    }
 }
 
 /// The runtime settles parameter bindings with at most

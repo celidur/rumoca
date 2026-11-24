@@ -27,6 +27,11 @@ and integration (including event location and stopping at time events).
   `blockIdx.x * blockDim.x + threadIdx.x`) names the calling thread's lane.
   `<model>_refresh_batch` and `<model>_rhs_batch` report a failed refresh in
   `status`.
+- State manifold: when index reduction retains constraints over the states
+  (`<model>_MANIFOLD_BLOCKS` is not 0), the same kernel certifies the
+  initialized states on them and `<model>_project_states_batch` moves the
+  accepted states of every lane back onto them. Launch it after each
+  accepted step; it reports a failed projection in `status`.
 - Events: `<model>_event_indicators_batch` returns the root functions,
   `<model>_event_update_batch` iterates relation memories and discrete
   equations to a fixed point. Static time events are listed in the host array
@@ -37,7 +42,12 @@ and integration (including event location and stopping at time events).
   and `<model>_delay_commit_batch` (after each accepted step).
 - Initialization: `<model>_load_starts_batch` writes the compiled start values,
   `<model>_initialize_batch` runs the parameter and start bindings and the
-  initial event.
+  initial event. Initial equations solved for states or `fixed = false`
+  parameters run through the shared kernel's `rmc_initialize`, per lane, as
+  the C FMI components do (`status` adds 2 when it does not converge;
+  `<MODEL>_INIT_TOLERANCE` can be overridden with `-D`). The shared kernel
+  admits the initial equations of the C profile: rows evaluated on the
+  settled algebraic refresh.
 - Functions: pure-function bodies that cannot be inlined (data-dependent
   loops, such as table interpolation or sorting) are emitted as typed
   `__device__` functions. A failed error-level assertion inside one is
@@ -51,8 +61,8 @@ and integration (including event location and stopping at time events).
 ## Unsupported
 
 This is not an NVRTC executor, an FMU, or a full simulator: there is no
-integrator. Initialization residual blocks, a retained state-manifold
-projection, linear-solve tensor ops, clocks, external
+integrator. Initial equations outside the C initialization profile (rows
+over state starts alone, homotopy, delays during initialization), linear-solve tensor ops, clocks, external
 functions, callbacks, and unsupported operations fail before source is
 written. No GPU availability
 is inferred from successful source generation.
@@ -63,12 +73,12 @@ is inferred from successful source generation.
   indexing and numerical outputs without requiring a GPU.
 - `cuda_ode_generated_kernel_compiles_with_required_nvcc` is a required CI source
   compilation with the pinned Nix CUDA compiler.
-- `cuda_ode_ladder_settles_its_nonlinear_nodes_per_lane` and
-  `cuda_ode_torn_block_settles_from_any_tear_guess` run the shared projection
-  kernel per lane in CPU emulation.
-- `cuda_ode_builtin_target_rejects_linsolve_before_writing_source` and
-  `cuda_ode_refuses_an_initialization_it_would_have_to_solve` are negative
-  controls.
+- `cuda_ode_ladder_settles_its_nonlinear_nodes_per_lane`,
+  `cuda_ode_torn_block_settles_from_any_tear_guess` and
+  `cuda_ode_lanes_solve_their_initial_equations_with_the_shared_kernel` run
+  the shared projection kernel per lane in CPU emulation.
+- `cuda_ode_builtin_target_rejects_linsolve_before_writing_source` is a
+  negative control.
 
 ## Example
 
