@@ -57,6 +57,14 @@ and integration (including event location and stopping at time events).
   loops, such as table interpolation or sorting) are emitted as typed
   `__device__` functions. A failed error-level assertion inside one is
   observed as an event root; a domain error makes that lane's results NaN.
+- Code size: the device build of the shared kernel keeps every function
+  that many entries reach out of line (`__noinline__`): its program
+  dispatchers, split into groups of consecutive programs; its runs of whole
+  programs (parameter bindings, initial residual, initial delay rows,
+  state-manifold rows), split into runs of a bounded number of operations;
+  and its typed pure functions. Past these bounds, only a single program
+  grows a function of the shared kernel with the model. The host C
+  components keep their own inlining.
 - `<model>_EVENT_MAX_PASSES` can be overridden with `-D`.
 - Build option: `-DRUMOCA_OMIT_INITIALIZATION` leaves out what only
   initialization uses (parameter and start initialization, start tables,
