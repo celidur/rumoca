@@ -119,6 +119,7 @@ end ExactAlgebraic;
         let files = rumoca::render_target_files(&compiled, "ExactAlgebraic", target, None)
             .expect("FMI consumes the checked exact-assignment schedule");
         let model_c = source_unit(&files, "sources/model.c");
+        let model_h = source_unit(&files, "sources/model.h");
         let assign_c = source_unit(&files, "sources/rmc_assign.c");
         assert!(
             model_c.contains("refresh_algebraics"),
@@ -132,7 +133,7 @@ end ExactAlgebraic;
             assign_c.contains("if (!isfinite(m->y[1]))"),
             "the FMI kernel must reject a non-finite refreshed algebraic value"
         );
-        execute_emitted_algebraic_refresh(&model_c, &assign_c, target);
+        execute_emitted_algebraic_refresh(&model_c, &model_h, &assign_c, target);
     }
 
     // fmi-ls-wasm renders the same C kernel as fmi3, so it consumes the exact
@@ -861,7 +862,7 @@ fn compile_and_run_c(driver: &str, label: &str) {
     );
 }
 
-fn execute_emitted_algebraic_refresh(model_c: &str, assign_c: &str, prefix: &str) {
+fn execute_emitted_algebraic_refresh(model_c: &str, model_h: &str, assign_c: &str, prefix: &str) {
     let start = model_c
         .find(&format!("static {prefix}Status update_discrete_equations"))
         .expect("rendered FMI C owns parameter and algebraic refresh");
@@ -871,6 +872,17 @@ fn execute_emitted_algebraic_refresh(model_c: &str, assign_c: &str, prefix: &str
         .expect("rendered FMI C terminates the algebraic refresh kernel");
     let refresh = &tail[..end];
     let assign = assign_c.replace("#include \"model.h\"", "");
+    // The kernel's fault codes, as the header declares them (SPEC_0044
+    // ME-PROJ-003).
+    let faults_start = model_h
+        .find("enum {\n    RMC_FAULT_NONE")
+        .expect("the header declares the kernel's fault codes");
+    let faults_end = faults_start
+        + model_h[faults_start..]
+            .find("#define RMC_NO_SITE ((size_t)-1)\n")
+            .expect("the header declares the fault without a site")
+        + "#define RMC_NO_SITE ((size_t)-1)\n".len();
+    let faults = &model_h[faults_start..faults_end];
     let driver = format!(
         r#"
 #include <math.h>
@@ -885,7 +897,7 @@ typedef enum {{ {prefix}OK = 0, {prefix}Error = 3 }} {prefix}Status;
 #define RMC_FATAL (-2)
 #define RMC_FAULTED(m) ((m)->rmc_fatal)
 #define RMC_LOG(m, message) ((void)(m), (void)(message))
-typedef struct {{ bool parameters_dirty; bool rmc_nonfinite; bool rmc_fatal; double time; double y[2]; double p[1]; }} ModelInstance;
+{faults}typedef struct {{ bool parameters_dirty; bool rmc_nonfinite; bool rmc_fatal; double time; double y[2]; double p[1]; }} ModelInstance;
 int rmc_bad_program(ModelInstance* m, size_t program);
 {assign}
 {refresh}

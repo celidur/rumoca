@@ -24,7 +24,10 @@
   function it mirrors.
 
   The including template defines `ModelInstance` (with `time`, `y`, `p`),
-  `Y_LEN`, and `RMC_LOG(m, message)`, and imports `scalar_op`.
+  `Y_LEN`, and `RMC_LOG(m, message)` and `RMC_LOG_AT(m, category, message)`,
+  and imports `scalar_op`. A lane build (`RMC_LANE_STATUS`, which every device
+  build is) logs nothing: it keeps its reports on the instance for
+  `rmc_lane_report` (SPEC_0044 ME-PROJ-003).
 -#}
 {%- from "fmi-c-kernel.jinja" import scalar_op, store_range, store_target, c_string, projection_lu_kernel, shared_prefix, shared_symbol, linear_solve_kernel %}
 {%- from "fmi-typed-functions.jinja" import functions as typed_functions, function_prototypes as typed_function_prototypes %}
@@ -63,6 +66,11 @@
 {%- if me.blocks|length > 0 %} double rmc_seed[{{ me.seed_len if me.seed_len > 0 else 1 }}]; size_t rmc_fb_calls[{{ me.blocks|length + 1 }}]; size_t rmc_fb_count[{{ me.blocks|length + 1 }}]; size_t rmc_fb_mark[{{ me.blocks|length + 1 }}]; bool rmc_fb_active[{{ me.blocks|length + 1 }}]; bool rmc_fb_reported[{{ me.blocks|length + 1 }}];{% endif -%}
 {%- if me.lane_max > 0 %} double rmc_lane_seed[{{ (me.seed_len if me.seed_len > 0 else 1) * me.lane_max }}];{% endif -%}
 {%- if me.switching %} size_t rmc_chart; size_t rmc_chart_target; bool rmc_chart_pending; double rmc_chart_reference; double rmc_chart_target_reference; bool rmc_chart_log; double rmc_chart_y[Y_LEN];{% endif -%}
+{%- if me.kernel or me.assign.plan.programs|length > 0 %}
+#if defined(RMC_LANE_STATUS)
+ unsigned rmc_lane_fault; size_t rmc_lane_fault_site; size_t rmc_lane_faults;{% if me.blocks|length > 0 %} size_t rmc_fb_report_count[{{ me.blocks|length + 1 }}]; size_t rmc_fb_report_calls[{{ me.blocks|length + 1 }}];{% endif %}
+#endif
+{% endif -%}
 {%- endmacro %}
 {%- macro workspace_reset(me) -%}
 {%- if me.kernel %} m->rmc_dtop = 0; m->rmc_stop = 0; m->rmc_tol = {{ me.policy.tolerance }}; m->rmc_certify = true;{% endif -%}
@@ -71,6 +79,115 @@
 {%- if me.blocks|length > 0 %} memset(m->rmc_seed, 0, sizeof(m->rmc_seed)); memset(m->rmc_fb_calls, 0, sizeof(m->rmc_fb_calls)); memset(m->rmc_fb_count, 0, sizeof(m->rmc_fb_count)); memset(m->rmc_fb_mark, 0, sizeof(m->rmc_fb_mark)); memset(m->rmc_fb_active, 0, sizeof(m->rmc_fb_active)); memset(m->rmc_fb_reported, 0, sizeof(m->rmc_fb_reported));{% endif -%}
 {%- if me.lane_max > 0 %} memset(m->rmc_lane_seed, 0, sizeof(m->rmc_lane_seed));{% endif -%}
 {%- if me.switching %} m->rmc_chart = 0; m->rmc_chart_target = 0; m->rmc_chart_pending = false; m->rmc_chart_reference = {{ me.switching[0].trial_rcond }}; m->rmc_chart_target_reference = 0.0;{% endif -%}
+{%- if me.kernel or me.assign.plan.programs|length > 0 %}
+#if defined(RMC_LANE_STATUS)
+ m->rmc_lane_fault = RMC_FAULT_NONE; m->rmc_lane_fault_site = RMC_NO_SITE; m->rmc_lane_faults = 0;{% if me.blocks|length > 0 %} memset(m->rmc_fb_report_count, 0, sizeof(m->rmc_fb_report_count)); memset(m->rmc_fb_report_calls, 0, sizeof(m->rmc_fb_report_calls));{% endif %}
+#endif
+{% endif -%}
+{%- endmacro %}
+
+{#- SPEC_0044 ME-PROJ-003: the one composer of every message the projection
+    kernel reports, read by the FMI log and by a lane build's host report.
+    Only `rmc_fault` runs in the kernel (on the device, in a device build);
+    the composer and its tables are host code, which the kernel of a lane
+    build never reaches: it records fault codes, sites and fallback counts.
+    The composer formats with the library `(snprintf)`, which a device
+    build's formatting shim does not replace. -#}
+{%- macro report_kernel(me, device=false) %}{%- set q = "static __device__" if device else "static" %}
+{%- if me.kernel or me.assign.plan.programs|length > 0 %}
+static const char* const rmc_fault_text[RMC_FAULT_COUNT] = {
+    "",
+    "algebraic projection workspace exhausted",
+    "projection program index outside its dispatcher: the generated program tables are inconsistent",
+    "complete algebraic projection did not establish coordinate convergence",
+    "algebraic projection did not establish coordinate convergence",
+    "initial residual evaluation view did not converge",
+    "algebraic projection sensitivity matrix is singular during refinement",
+    "algebraic projection sensitivity matrix is singular",
+    "algebraic projection produced a non-finite sensitivity",
+    "algebraic projection sensitivity did not satisfy the selected residual system",
+    "initial residual tangent did not converge",
+    "initial variable projection did not satisfy the complete residual system",
+    "initial algebraic/update projection did not converge",
+    "reduced-chart conditioning failed",
+    "the active reduced chart crossed its fold before a basis change could be requested",
+    "the reduced-chart basis transfer did not establish the target chart",
+};
+{%- if me.blocks|length > 0 %}
+#define RMC_FB_PLAN {{ me.blocks|length }}
+/* The ES016 fold each block reports when its projection fails (Solve IR
+   `UnlocalizableGuard`, SPEC_0044 ME-EVENT-008): the offset of its message in
+   the pool of distinct NUL-terminated messages, or RMC_NO_FOLD. Offsets keep
+   the table free of address constants; the pool is a character array, not a
+   string literal, so no compiler's literal length bounds it. */
+#define RMC_NO_FOLD ((size_t)-1)
+static const char rmc_fold_text[] = { {{ me.block_folds.pool|join(", ") }} };
+static const size_t rmc_block_fold[{{ me.blocks|length }}] = {
+{%- for offset in me.block_folds.offsets %}
+    {% if offset is none %}RMC_NO_FOLD{% else %}{{ offset }}{% endif %},
+{%- endfor %}
+};
+/* The failure a stage or complete projection of block `id` reports: its ES016
+   fold when it has one, else the generic convergence failure. */
+static const char* rmc_projection_failure(size_t id, const char* generic) {
+    size_t fold = rmc_block_fold[id];
+    return fold != RMC_NO_FOLD ? rmc_fold_text + fold : generic;
+}
+/* Each block's canonical index and row count, as its fallback report names
+   them. */
+static const size_t rmc_site_canonical[{{ me.blocks|length }}] = { {% for b in me.blocks %}{{ b.canonical }}{% if not loop.last %}, {% endif %}{% endfor %} };
+static const size_t rmc_site_rows[{{ me.blocks|length }}] = { {% for b in me.blocks %}{{ b.n }}{% if not loop.last %}, {% endif %}{% endfor %} };
+/* The report of `site` once `count` of its `calls` calls fell back. */
+static void rmc_fallback_message(size_t site, size_t count, size_t calls, char* message, size_t capacity) {
+    if (site == RMC_FB_PLAN) (snprintf)(message, capacity, "the staged algebraic refresh fell back on %zu of %zu calls", count, calls);
+    else (snprintf)(message, capacity, "projection block %zu (%zu rows) fell back on %zu of %zu calls", rmc_site_canonical[site], rmc_site_rows[site], count, calls);
+}
+{%- endif %}
+/* The message of fault `code` at `site`: a failed stage names its block's
+   ES016 fold when it has one. */
+static const char* rmc_fault_message(unsigned code, size_t site) {
+    const char* text = code < RMC_FAULT_COUNT ? rmc_fault_text[code] : "unknown algebraic projection fault";
+{%- if me.blocks|length > 0 %}
+    if (code == RMC_FAULT_STAGE && site < RMC_FB_PLAN) return rmc_projection_failure(site, text);
+{%- endif %}
+    (void)site;
+    return text;
+}
+/* A fault at `site`. An FMI component logs it under `error` as it occurs; a
+   lane build keeps the first fault and its site on the instance, and counts
+   every fault. */
+RMC_COLD {{ q }} void rmc_fault(ModelInstance* m, unsigned code, size_t site) {
+#if defined(RMC_LANE_STATUS)
+    if (m->rmc_lane_faults == 0) { m->rmc_lane_fault = code; m->rmc_lane_fault_site = site; }
+    m->rmc_lane_faults += 1;
+#else
+    RMC_LOG(m, rmc_fault_message(code, site));
+#endif
+}
+#if defined(RMC_LANE_STATUS)
+/* The host report of one lane's instance, in the categories and messages the
+   FMI component logs: each site whose fallback rate crossed the policy rate,
+   in site order, with the counts of the call that crossed it, then the first
+   fault. Answers the number of reports. */
+{% if not device %}RMC_API {% endif %}size_t rmc_lane_report(const ModelInstance* m, RmcReportSink sink, void* environment) {
+    size_t reports = 0;
+{%- if me.blocks|length > 0 %}
+    for (size_t site = 0; site <= RMC_FB_PLAN; ++site) {
+        if (!m->rmc_fb_reported[site]) continue;
+        char message[192];
+        rmc_fallback_message(site, m->rmc_fb_report_count[site], m->rmc_fb_report_calls[site], message, sizeof message);
+        sink(environment, "projection", message);
+        reports += 1;
+    }
+{%- endif %}
+    if (m->rmc_lane_faults > 0) {
+        sink(environment, "error", rmc_fault_message(m->rmc_lane_fault, m->rmc_lane_fault_site));
+        reports += 1;
+    }
+    return reports;
+}
+#endif
+{%- endif %}
 {%- endmacro %}
 
 {#- ── generic kernel ─────────────────────────────────────────────────────── -#}
@@ -94,7 +211,7 @@
 typedef struct { bool changed; bool settled; } RmcUpdate;
 
 /* ── workspace: one per-instance arena, released on every return ─────── */
-RMC_COLD {{ q }} int rmc_exhausted(ModelInstance* m) { RMC_LOG(m, "algebraic projection workspace exhausted"); return -1; }
+RMC_COLD {{ q }} int rmc_exhausted(ModelInstance* m) { rmc_fault(m, RMC_FAULT_WORKSPACE, RMC_NO_SITE); return -1; }
 {{ q }} double* rmc_dalloc(ModelInstance* m, size_t count) {
     if (count > RMC_DWORK - m->rmc_dtop) return NULL;
     double* values = m->rmc_d + m->rmc_dtop; m->rmc_dtop += count;
@@ -264,31 +381,13 @@ typedef struct RmcBlockDescS {
     view->id = id; view->d = &rmc_block_desc[id];
     return view;
 }
-/* The ES016 fold each block reports when its projection fails (Solve IR
-   `UnlocalizableGuard`, SPEC_0044 ME-EVENT-008): the offset of its message in
-   the pool of distinct NUL-terminated messages, or RMC_NO_FOLD. Offsets keep
-   the table free of address constants; the pool is a character array, not a
-   string literal, so no compiler's literal length bounds it. */
-#define RMC_NO_FOLD ((size_t)-1)
-{{ q }} const char rmc_fold_text[] = { {{ me.block_folds.pool|join(", ") }} };
-{{ q }} const size_t rmc_block_fold[{{ me.blocks|length }}] = {
-{%- for offset in me.block_folds.offsets %}
-    {% if offset is none %}RMC_NO_FOLD{% else %}{{ offset }}{% endif %},
-{%- endfor %}
-};
-/* The failure a stage or complete projection of block `id` logs: its ES016
-   fold when it has one, else the generic convergence failure. */
-{{ q }} const char* rmc_projection_failure(size_t id, const char* generic) {
-    size_t fold = rmc_block_fold[id];
-    return fold != RMC_NO_FOLD ? rmc_fold_text + fold : generic;
-}
-#define RMC_FB_PLAN {{ me.blocks|length }}
 #define RMC_FALLBACK_RATE {{ me.policy.fallback_rate }}
 #define RMC_FALLBACK_MIN_CALLS {{ me.policy.fallback_min_calls }}
 /* projection_fallbacks.rs: note_fallback. A call counts once however many
    fallbacks it takes, and a fallback ahead of a site's next call (a seed
    rescue) belongs to that call. The first time the share of calls that fell
-   back exceeds the policy rate, the site is logged under `projection`. */
+   back exceeds the policy rate, the site is logged under `projection`; a
+   lane build keeps the counts of that call for rmc_lane_report instead. */
 RMC_COLD {{ q }} void rmc_fb_note(ModelInstance* m, size_t site) {
     size_t call = m->rmc_fb_calls[site] + (m->rmc_fb_active[site] ? 0 : 1);
     if (m->rmc_fb_mark[site] == call) return;
@@ -296,10 +395,13 @@ RMC_COLD {{ q }} void rmc_fb_note(ModelInstance* m, size_t site) {
     size_t calls = m->rmc_fb_calls[site] > 0 ? m->rmc_fb_calls[site] : 1;
     if (m->rmc_fb_reported[site] || calls < RMC_FALLBACK_MIN_CALLS || (double)m->rmc_fb_count[site] <= RMC_FALLBACK_RATE * (double)calls) return;
     m->rmc_fb_reported[site] = true;
+#if defined(RMC_LANE_STATUS)
+    m->rmc_fb_report_count[site] = m->rmc_fb_count[site]; m->rmc_fb_report_calls[site] = calls;
+#else
     char message[192];
-    if (site == RMC_FB_PLAN) snprintf(message, sizeof message, "the staged algebraic refresh fell back on %zu of %zu calls", m->rmc_fb_count[site], calls);
-    else snprintf(message, sizeof message, "projection block %zu (%zu rows) fell back on %zu of %zu calls", rmc_block_desc[site].canonical, rmc_block_desc[site].n, m->rmc_fb_count[site], calls);
+    rmc_fallback_message(site, m->rmc_fb_count[site], calls, message, sizeof message);
     RMC_LOG_AT(m, "projection", message);
+#endif
 }
 {{ q }} bool rmc_all_zero(const double* values, size_t n) {
     for (size_t i = 0; i < n; ++i) if (values[i] != 0.0) return false;
@@ -1327,7 +1429,7 @@ RMC_COLD {{ q }} int rmc_plan_converged(ModelInstance* m, const size_t* entries,
    the instance is reset. */
 RMC_COLD {{ api }} int rmc_bad_program(ModelInstance* m, size_t program) {
     (void)program;
-    if (!m->rmc_fatal) RMC_LOG(m, "projection program index outside its dispatcher: the generated program tables are inconsistent");
+    if (!m->rmc_fatal) rmc_fault(m, RMC_FAULT_PROGRAM_TABLE, RMC_NO_SITE);
     m->rmc_fatal = true;
     RMC_DEBUG_ASSERT(!"projection program index outside its dispatcher");
     return RMC_FATAL;
@@ -1387,7 +1489,7 @@ typedef struct { unsigned char kind; size_t first; size_t count; size_t block; s
 {%- if blocks %}
         case RMC_STEP_COMPLETE:
             if (rmc_project_complete(m, complete, ncomplete) != 0) {
-                if (!m->rmc_fatal) RMC_LOG(m, "complete algebraic projection did not establish coordinate convergence");
+                if (!m->rmc_fatal) rmc_fault(m, RMC_FAULT_COMPLETE, RMC_FB_PLAN);
                 goto fail;
             }
             break;
@@ -1406,7 +1508,7 @@ typedef struct { unsigned char kind; size_t first; size_t count; size_t block; s
             }
 {%- endif %}
             if (rmc_project_stage(m, rmc_block_view(step->block, &step_view)) != 0) {
-                if (!m->rmc_fatal) RMC_LOG(m, rmc_projection_failure(step->block, "algebraic projection did not establish coordinate convergence"));
+                if (!m->rmc_fatal) rmc_fault(m, RMC_FAULT_STAGE, step->block);
                 goto fail;
             }
             break;
@@ -1431,7 +1533,7 @@ failure:
            nor a non-finite trial value. */
         if (m->rmc_fatal) goto fail;
         if (rescued == 0) { {% if me.kernel %}RMC_RELEASE; {% endif %}return {{ prefix }}OK; }
-        RMC_LOG(m, "complete algebraic projection did not establish coordinate convergence");
+        rmc_fault(m, RMC_FAULT_COMPLETE, RMC_FB_PLAN);
         /* An evaluation error during the rescue (a failed pure call, or an
            exhausted workspace) is not a non-finite trial value. */
         if (rescued < 0) goto fail;
@@ -1538,7 +1640,8 @@ static {{ prefix }}Status refresh_parameters(ModelInstance* m) {
     The C components call it after their parameter refresh (refresh_values);
     a device build (`device`) calls it after its own `refresh_parameters`. -#}
 {%- macro refresh_entries(solve, me, prefix, device=false) %}
-{{- projection_kernel(me, device=device) }}
+{{- report_kernel(me, device=device) }}
+{{ projection_kernel(me, device=device) }}
 {{ refresh_kernel(me, prefix, device=device) }}
 {%- set plan_suffix = "_plan" if me.blocks|length > 0 and me.seed_rule == "CommittedAcceptedPoint" else "" %}
 {%- if me.switching %}
@@ -1555,6 +1658,33 @@ static {{ prefix }}Status refresh_parameters(ModelInstance* m) {
 {{ committed_seed(me, prefix, device=device) }}
 {{ initialization_kernel(me, prefix, device=device) }}
 {{- chart_kernel(solve, me, prefix, device=device) }}
+{%- endmacro %}
+
+{#- SPEC_0044 ME-PROJ-003: the faults the projection kernel reports, and the
+    host report of a lane build (RMC_LANE_STATUS). -#}
+{%- macro fault_declarations(device=false) %}
+/* SPEC_0044 ME-PROJ-003: the faults the projection kernel reports, each at a
+   site (a block, RMC_FB_PLAN for the staged plan, or RMC_NO_SITE). An FMI
+   component logs each one as it occurs. A lane build (RMC_LANE_STATUS: one
+   instance per lane of a device integrator, with no logger; every device
+   build is one) keeps the first fault, its site, and the number of faults on
+   the instance beside the fallback counts, and rmc_lane_report gives the
+   host, from a copy of the lane's instance, the categories and messages the
+   FMI component logs. */
+enum {
+    RMC_FAULT_NONE, RMC_FAULT_WORKSPACE, RMC_FAULT_PROGRAM_TABLE, RMC_FAULT_COMPLETE, RMC_FAULT_STAGE,
+    RMC_FAULT_INIT_VIEW, RMC_FAULT_SENSITIVITY_REFINEMENT, RMC_FAULT_SENSITIVITY_SINGULAR,
+    RMC_FAULT_SENSITIVITY_NONFINITE, RMC_FAULT_SENSITIVITY_RESIDUAL, RMC_FAULT_INIT_TANGENT,
+    RMC_FAULT_INIT_VARIABLES, RMC_FAULT_INIT_PROJECTION, RMC_FAULT_CHART_CONDITIONING,
+    RMC_FAULT_CHART_FOLD, RMC_FAULT_CHART_TRANSFER, RMC_FAULT_COUNT
+};
+#define RMC_NO_SITE ((size_t)-1)
+#if defined(RMC_LANE_STATUS)
+{% if not device %}{{ shared_symbol("rmc_lane_report") }}{% endif %}/* Receives each report: its category (`projection` for a fallback rate,
+   `error` for a fault) and its message. */
+typedef void (*RmcReportSink)(void* environment, const char* category, const char* message);
+{% if not device %}RMC_API {% endif %}size_t rmc_lane_report(const ModelInstance* m, RmcReportSink sink, void* environment);
+#endif
 {%- endmacro %}
 
 {#- The active chart's plan (kernel.rs: the component's runtime is the active
@@ -1711,14 +1841,14 @@ typedef struct { size_t nrows; size_t ncols; size_t ndep; size_t dep; size_t nen
     {{- "\n    {" if device }}
     size_t active = m->rmc_chart, target = RMC_NCHARTS;
     double keep = RMC_CHART_SWITCH_KEEP * m->rmc_chart_reference;
-    if (rmc_chart_sigma(m, &rmc_charts[active], &sigma[active], &threshold[active]) != 0) { if (!m->rmc_fatal) RMC_LOG(m, "reduced-chart conditioning failed"); goto fail; }
+    if (rmc_chart_sigma(m, &rmc_charts[active], &sigma[active], &threshold[active]) != 0) { if (!m->rmc_fatal) rmc_fault(m, RMC_FAULT_CHART_CONDITIONING, RMC_NO_SITE); goto fail; }
     double current = sigma[active];
     double regular = threshold[active] * RMC_CHART_REGULAR_MULTIPLE;
     if (!(current >= keep && current >= regular)) {
         for (size_t c = 0; c < RMC_NCHARTS; ++c) {
-            if (c != active && rmc_chart_sigma(m, &rmc_charts[c], &sigma[c], &threshold[c]) != 0) { if (!m->rmc_fatal) RMC_LOG(m, "reduced-chart conditioning failed"); goto fail; }
+            if (c != active && rmc_chart_sigma(m, &rmc_charts[c], &sigma[c], &threshold[c]) != 0) { if (!m->rmc_fatal) rmc_fault(m, RMC_FAULT_CHART_CONDITIONING, RMC_NO_SITE); goto fail; }
         }
-        if (current < regular) { RMC_LOG(m, "the active reduced chart crossed its fold before a basis change could be requested"); goto fail; }
+        if (current < regular) { rmc_fault(m, RMC_FAULT_CHART_FOLD, RMC_NO_SITE); goto fail; }
         if (!(current >= keep)) {
             for (size_t c = 0; c < RMC_NCHARTS; ++c) {
                 bool qualifies = c != active && sigma[c] > RMC_CHART_SWITCH_IMPROVEMENT * current && sigma[c] >= threshold[c] * RMC_CHART_REGULAR_MULTIPLE;
@@ -1795,7 +1925,7 @@ typedef struct { size_t nrows; size_t ncols; size_t ndep; size_t dep; size_t nen
     RMC_RELEASE;
     if (m->rmc_fatal) return {{ prefix }}Error;
     m->rmc_chart_pending = false;
-    RMC_LOG(m, "the reduced-chart basis transfer did not establish the target chart");
+    rmc_fault(m, RMC_FAULT_CHART_TRANSFER, RMC_NO_SITE);
     return {{ prefix }}Error;
 }
 {%- endif %}
@@ -1858,7 +1988,7 @@ RMC_COLD {{ q }} int rmc_init_settle_view(ModelInstance* m) {
         if (changed < 0 || refresh_algebraics(m) != {{ prefix }}OK) break;
         if (pass > 0 && changed == 0) return 0;
     }
-    RMC_LOG(m, "initial residual evaluation view did not converge");
+    rmc_fault(m, RMC_FAULT_INIT_VIEW, RMC_NO_SITE);
     return -1;
 }
 /* initial_projection.rs: InitialProjectionModel::eval_initial_residual on the
@@ -1928,10 +2058,10 @@ RMC_COLD {{ q }} int rmc_tan_refine(ModelInstance* m, const RmcBlock* b, const s
         zero &= correction[row] == 0.0;
     }
     if (zero) return 0;
-    if (!rmc_lu_solve(lu, n, ipiv, correction)) { RMC_LOG(m, "algebraic projection sensitivity matrix is singular during refinement"); return -1; }
+    if (!rmc_lu_solve(lu, n, ipiv, correction)) { rmc_fault(m, RMC_FAULT_SENSITIVITY_REFINEMENT, RMC_NO_SITE); return -1; }
     for (size_t i = 0; i < n; ++i) {
         double value = seed[b_y_pool[i]] + correction[i];
-        if (!isfinite(value)) { RMC_LOG(m, "algebraic projection produced a non-finite sensitivity"); return -1; }
+        if (!isfinite(value)) { rmc_fault(m, RMC_FAULT_SENSITIVITY_NONFINITE, RMC_NO_SITE); return -1; }
         seed[b_y_pool[i]] = value;
     }
     return 0;
@@ -1955,9 +2085,9 @@ RMC_COLD {{ q }} int rmc_tan_refresh(ModelInstance* m, double* seed) {
         RmcBlock block_view; const RmcBlock* b = rmc_block_view(blocks[k], &block_view); size_t n = RMC_BS(b, n); double* rhs = scratch; double* jac = scratch + n;
         if (rmc_tan_rows(m, rows + 2 * offset, n, 2, seed, out, rhs) != 0 || rmc_tan_factor(m, b, rows + 2 * offset, unit, out, column, jac, lu, ipiv, columns) != 0) { result = -1; break; }
         for (size_t i = 0; i < n; ++i) rhs[i] = -rhs[i];
-        if (!rmc_lu_solve(lu, n, ipiv, rhs)) { RMC_LOG(m, "algebraic projection sensitivity matrix is singular"); result = -1; break; }
+        if (!rmc_lu_solve(lu, n, ipiv, rhs)) { rmc_fault(m, RMC_FAULT_SENSITIVITY_SINGULAR, blocks[k]); result = -1; break; }
         for (size_t i = 0; i < n && result == 0; ++i) {
-            if (!isfinite(rhs[i])) { RMC_LOG(m, "algebraic projection produced a non-finite sensitivity"); result = -1; }
+            if (!isfinite(rhs[i])) { rmc_fault(m, RMC_FAULT_SENSITIVITY_NONFINITE, blocks[k]); result = -1; }
             else seed[RMC_BP(b, y)[i]] = rhs[i];
         }
         if (result == 0 && rmc_block_scales_at(m, b, jac, seed, rscale + offset, vscale) != 0) result = -1;
@@ -1966,7 +2096,7 @@ RMC_COLD {{ q }} int rmc_tan_refresh(ModelInstance* m, double* seed) {
     for (int iteration = 0; iteration <= 2 && result == 0; ++iteration) {
         if (rmc_tan_rows(m, rows, RMC_TAN_ROWS, 2, seed, out, residual) != 0) { result = -1; break; }
         if (rmc_scaled_converged(m->rmc_tol, residual, rscale, RMC_TAN_ROWS)) break;
-        if (iteration == 2) { RMC_LOG(m, "algebraic projection sensitivity did not satisfy the selected residual system"); result = -1; break; }
+        if (iteration == 2) { rmc_fault(m, RMC_FAULT_SENSITIVITY_RESIDUAL, RMC_NO_SITE); result = -1; break; }
         offset = 0;
         for (size_t k = 0; k < RMC_TAN_BLOCKS && result == 0; ++k) {
             RmcBlock block_view; const RmcBlock* b = rmc_block_view(blocks[k], &block_view);
@@ -2012,7 +2142,7 @@ RMC_COLD {{ q }} int rmc_init_tangent(ModelInstance* m, double* seed) {
 {%- endif %}
         if (pass > 0 && !changed) { result = 0; break; }
     }
-    if (result != 0 && !failed) RMC_LOG(m, "initial residual tangent did not converge");
+    if (result != 0 && !failed) rmc_fault(m, RMC_FAULT_INIT_TANGENT, RMC_NO_SITE);
     RMC_RELEASE; return result;
 }
 /* initial.rs: initial_block_jacobian through eval_settled_initial_jacobian_v:
@@ -2186,7 +2316,7 @@ RMC_COLD {{ q }} int rmc_init_project(ModelInstance* m) {
     }
     if (result == 1) {
         if (rmc_scaled_converged(m->rmc_tol, residual, scales, RMC_INIT_ROWS)) result = 0;
-        else { RMC_LOG(m, "initial variable projection did not satisfy the complete residual system"); result = -1; }
+        else { rmc_fault(m, RMC_FAULT_INIT_VARIABLES, RMC_NO_SITE); result = -1; }
     }
     RMC_RELEASE; return result;
 }
@@ -2207,7 +2337,7 @@ RMC_COLD {{ q }} {{ prefix }}Status rmc_initialize(ModelInstance* m, double tole
     }
     m->rmc_tol = RMC_TOL; m->rmc_certify = true;
     if (m->rmc_fatal) return {{ prefix }}Error;
-    if (status != {{ prefix }}OK) RMC_LOG(m, "initial algebraic/update projection did not converge");
+    if (status != {{ prefix }}OK) rmc_fault(m, RMC_FAULT_INIT_PROJECTION, RMC_NO_SITE);
     return status;
 }
 {%- endif %}
@@ -2253,6 +2383,7 @@ RMC_COLD {{ q }} {{ prefix }}Status rmc_initialize(ModelInstance* m, double tole
 #define RMC_FATAL (-2)
 #define RMC_FAULTED(m) ((m)->rmc_fatal)
 {{ api }} int rmc_bad_program(ModelInstance* m, size_t program);
+{{ fault_declarations(device) }}
 {%- else %}
 /* A component without a kernel or assignment programs has no program fault. */
 #define RMC_FAULTED(m) ((void)(m), 0)
@@ -2497,24 +2628,29 @@ RMC_API extern const size_t rmc_iso_slot[{{ me.table.isolator_slot|length }}];
     parameter bindings it settles,
     `static __device__ int rmc_apply_updates(ModelInstance* m, bool initializing)`
     (-1 error, 0 unchanged, 1 changed). The including unit includes every
-    standard header it uses before `device_instance`, which redefines
-    `snprintf` and `memcmp`, and emits `real_extremum_prelude("cuda", true)`
-    before `device_kernel`. -#}
+    standard header it uses before `device_instance`, which includes
+    `stdio.h` and then redefines `snprintf` and `memcmp`, and emits
+    `real_extremum_prelude("cuda", true)` before `device_kernel`. After a
+    launch, the host passes a copy of each lane's instance to
+    `rmc_lane_report` for the lane's fallback and fault reports. -#}
 {%- macro device_instance(solve, me, prefix) %}
+#include <stdio.h>
 typedef enum { {{ prefix }}OK, {{ prefix }}Warning, {{ prefix }}Discard, {{ prefix }}Error, {{ prefix }}Fatal } {{ prefix }}Status;
 #define Y_LEN {{ solve.layout.y_scalars if solve.layout.y_scalars > 0 else 1 }}
 #define P_LEN {{ solve.layout.p_scalars if solve.layout.p_scalars > 0 else 1 }}
 #define STATE_LEN {{ solve.solve_layout.state_scalar_count if solve.solve_layout.state_scalar_count > 0 else 1 }}
-typedef struct { bool parameters_dirty; bool rmc_nonfinite; bool assertion_failed; double time; double y[Y_LEN]; double p[P_LEN];{{ workspace_fields(me) }} } ModelInstance;
 /* A lane has no logger: a failure reaches its caller through the status the
-   entry returns, a program fault through `rmc_fatal`, and a fallback through
-   the instance's counters. */
-#define RMC_LOG(m, message) ((void)(m), (void)(message))
-#define RMC_LOG_AT(m, category, message) ((void)(m), (void)(category), (void)(message))
+   entry returns, and the kernel keeps its fallback and fault reports on the
+   lane's instance (RMC_LANE_STATUS), which the host reads back and passes to
+   rmc_lane_report (SPEC_0044 ME-PROJ-003). Only the chart switch trace, which
+   an FMI component logs when debug logging is on, is dropped. */
+#define RMC_LANE_STATUS 1
+typedef struct { bool parameters_dirty; bool rmc_nonfinite; bool assertion_failed; double time; double y[Y_LEN]; double p[P_LEN];{{ workspace_fields(me) }} } ModelInstance;
 #define RMC_INFO(m, category, message) ((void)(m), (void)(category), (void)(message))
 static __device__ inline double rmc_now(const ModelInstance* m) { return m->time; }
-/* The device library has no formatted output, so a message the kernel
-   formats for its log is left empty; and no `memcmp`, which the kernel uses
+/* The device library has no formatted output, so the chart switch trace the
+   kernel formats is left empty (the host's report formats with the library
+   `(snprintf)`); and no `memcmp`, which the kernel uses
    to compare values bit for bit. */
 static __device__ inline int rmc_device_format(char* text, size_t size) { if (size > 0) text[0] = '\0'; return 0; }
 #define snprintf(text, size, ...) rmc_device_format((text), (size))
