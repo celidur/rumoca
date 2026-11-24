@@ -8,7 +8,8 @@
 //! the manifold (`certify_state_manifold`, its `CertifyInitial`). The shared
 //! kernel's `rmc_initialize` does the same through `rmc_certify_state_manifold`
 //! for a target that emits `manifold_kernel`. The test renders the device unit
-//! of `PinnedStart` from the lowered model (`device_instance`,
+//! of `PinnedStart` (rows on the settled refresh) and `PinnedSeed` (rows over
+//! state seeds) from the lowered model (`device_instance`,
 //! `binding_updates`, `device_kernel`, `manifold_kernel`). It builds that unit
 //! as host C++ with the CUDA qualifiers defined away and initializes one lane
 //! per start guess. Each lane is compared with the runtime on the same
@@ -42,6 +43,21 @@ equation
   w = z + x*x;
   x*x*x = 1;
 end PinnedStart;
+"#;
+
+/// The same retained row with no initial equation: the residual reads no
+/// continuous algebraic, so the C initialization evaluates it on the instance
+/// coordinates and solves `x` from its state seed.
+const PINNED_SEED: &str = r#"
+model PinnedSeed
+  Real x(start=1.2);
+  Real z(start=0.5, fixed=true);
+  Real lambda;
+equation
+  der(x) = lambda*x;
+  der(z) = 1 - z;
+  x*x*x = 1;
+end PinnedSeed;
 "#;
 
 const DEVICE_UNIT: &str = r#"{%- from "fmi-me-projection.jinja" import device_instance, device_kernel, binding_updates, manifold_kernel -%}
@@ -157,9 +173,14 @@ fn close(device: &[f64], runtime: &[f64]) -> bool {
 
 #[test]
 fn a_lane_initialization_certifies_the_retained_manifold_as_the_linked_kernel() {
+    check("PinnedStart", PINNED_START);
+    check("PinnedSeed", PINNED_SEED);
+}
+
+fn check(name: &str, source: &str) {
     let compiled = Compiler::new()
-        .model("PinnedStart")
-        .compile_str(PINNED_START, "state_manifold_initialization.mo")
+        .model(name)
+        .compile_str(source, "state_manifold_initialization.mo")
         .unwrap();
     let lowered =
         lower_correlated_for_simulation_with_overrides(&compiled.dae, &SimOptions::default())
@@ -198,18 +219,21 @@ fn a_lane_initialization_certifies_the_retained_manifold_as_the_linked_kernel() 
                 TOLERANCE,
                 ALGEBRAIC_REFRESH_MAX_ITERS,
             )
-            .unwrap_or_else(|error| panic!("guess {scale}: the runtime settles: {error}"));
+            .unwrap_or_else(|error| panic!("{name} guess {scale}: the runtime settles: {error}"));
         runtime
             .certify_state_manifold(&ry, &rp, 0.0, TOLERANCE)
-            .unwrap_or_else(|error| panic!("guess {scale}: the runtime certifies: {error}"));
-        assert!(*ok, "guess {scale}: the lane initializes and certifies");
+            .unwrap_or_else(|error| panic!("{name} guess {scale}: the runtime certifies: {error}"));
+        assert!(
+            *ok,
+            "{name} guess {scale}: the lane initializes and certifies"
+        );
         assert!(
             close(y, &ry) && close(p, &rp),
-            "guess {scale}: the lane differs from the runtime\n lane    y {y:?} p {p:?}\n runtime y {ry:?} p {rp:?}"
+            "{name} guess {scale}: the lane differs from the runtime\n lane    y {y:?} p {p:?}\n runtime y {ry:?} p {rp:?}"
         );
         assert!(
             (y[0].powi(3) - 1.0).abs() <= 1.0e-9,
-            "guess {scale}: the lane's x is on the manifold: {y:?}"
+            "{name} guess {scale}: the lane's x is on the manifold: {y:?}"
         );
     }
 }

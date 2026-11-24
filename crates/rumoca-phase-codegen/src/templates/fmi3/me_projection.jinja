@@ -2093,17 +2093,20 @@ typedef struct { size_t nrows; size_t ncols; size_t ndep; size_t dep; size_t nen
 {%- endmacro %}
 
 {#- The MLS §8.6 initialization of solve_runtime/initial_projection.rs:
-    settle_initialization_system, for a system whose residual rows are all
-    evaluated on the settled coordinates (the admitted C profile). Combined
-    unknown indices below the solver length are solver coordinates, the rest
-    parameters. -#}
+    settle_initialization_system. Its residual rows are evaluated on the
+    settled coordinates when a row role reads a reconstructed algebraic
+    (`init.settled`), else on the instance coordinates, where a one-row block
+    first tries its row's isolation of the unknown and the block Jacobian is
+    the residual's partial forward derivative (InitialProjectionModel without
+    refreshes_algebraic_reads). Combined unknown indices below the solver
+    length are solver coordinates, the rest parameters. -#}
 {%- macro initialization_kernel(me, prefix, device=false) %}{%- set q = "static __device__" if device else "static" %}{%- set api = "static __device__" if device else "RMC_API" %}
 {%- set init = me.init %}
 {%- if init.rows > 0 %}
 #define RMC_INIT_ROWS {{ init.rows }}
 #define RMC_INIT_Y_LEN {{ init.y_len }}
 #define RMC_UPDATE_ITERS {{ me.policy.update_iters }}
-typedef struct { size_t n; size_t rows; size_t unknowns; size_t fallback; size_t relax; size_t row_ptr; size_t col_idx; bool pattern; } RmcInitBlock;
+typedef struct { size_t n; size_t rows; size_t unknowns; size_t fallback; size_t relax; size_t row_ptr; size_t col_idx; bool pattern; size_t single; size_t row; size_t iso; } RmcInitBlock;
 {{ q }} const size_t rmc_init_pool[{{ init.pool|length }}] = {
 {%- for chunk in init.pool|batch(24) %}
     {% for value in chunk %}{{ value }},{% endfor %}
@@ -2111,9 +2114,9 @@ typedef struct { size_t n; size_t rows; size_t unknowns; size_t fallback; size_t
 };
 {{ q }} const RmcInitBlock rmc_init_blocks[] = {
 {%- for b in init.blocks %}
-    { {{ b.n }}, {{ b.rows }}, {{ b.unknowns }}, {{ b.fallback }}, {{ b.relax }}, {{ b.row_ptr }}, {{ b.col_idx }}, {{ "true" if b.pattern else "false" }} },
+    { {{ b.n }}, {{ b.rows }}, {{ b.unknowns }}, {{ b.fallback }}, {{ b.relax }}, {{ b.row_ptr }}, {{ b.col_idx }}, {{ "true" if b.pattern else "false" }}, {{ b.single }}, {{ b.row }}, {{ b.iso }} },
 {%- else %}
-    { 0, 0, 0, 0, 0, 0, 0, false },
+    { 0, 0, 0, 0, 0, 0, 0, false, 0, 0, 0 },
 {%- endfor %}
 };
 #define RMC_INIT_BLOCKS (sizeof(rmc_init_blocks) / sizeof(rmc_init_blocks[0]))
@@ -2139,6 +2142,7 @@ typedef struct { size_t n; size_t rows; size_t unknowns; size_t fallback; size_t
     if (combined < RMC_INIT_Y_LEN) return rmc_model_scale(combined, value);
     return fmax(rmc_valid_scale(pscale[combined - RMC_INIT_Y_LEN]), isfinite(value) ? fabs(value) : 0.0);
 }
+{%- if init.settled %}
 /* initial_projection.rs: settled_initial_coordinates: the bindings and the
    uncertified algebraic refresh alternate on the instance coordinates until
    the bindings stop changing; the caller saves and restores them. -1 error */
@@ -2164,6 +2168,53 @@ RMC_COLD {{ q }} int rmc_init_settled(ModelInstance* m, double* out) {
     memcpy(m->y, y, sizeof(m->y)); memcpy(m->p, p, sizeof(m->p)); m->parameters_dirty = dirty;
     RMC_RELEASE; return result;
 }
+{%- else %}
+/* initial_projection.rs: InitialProjectionModel::eval_initial_residual on the
+   instance coordinates: no row reads a continuous algebraic. -1 error */
+RMC_COLD {{ q }} int rmc_init_settled(ModelInstance* m, double* out) {
+    return rmc_init_residual(m, out) != 0 ? -1 : 0;
+}
+{%- if init.single_rows.programs|length > 0 %}
+{%- for program in init.single_rows.programs %}
+{{ program_function("rmc_init_row_p" ~ loop.index0, program, "ModelInstance* m, double* o", false, false, device=device) }}
+{%- endfor %}
+{%- for program in init.single_isolators.programs %}
+{{ program_function("rmc_init_iso_p" ~ loop.index0, program, "ModelInstance* m, double* o", false, false, device=device) }}
+{%- endfor %}
+/* InitialProjectionModel::eval_initial_residual_row: the one-row block's row
+   output on the instance coordinates. -1 error */
+RMC_COLD {{ q }} int rmc_init_row(ModelInstance* m, const RmcInitBlock* b, double* value) {
+    double o[1] = { 0.0 }; int result = -1;
+    switch (b->row) {
+{%- for program in init.single_rows.programs %}
+    case {{ loop.index0 }}: result = rmc_init_row_p{{ loop.index0 }}(m, o); break;
+{%- endfor %}
+    default: break;
+    }
+    *value = o[0];
+    return result != 0 ? -1 : 0;
+}
+/* InitialProjectionModel::eval_initial_target_value: the row's isolation of
+   the block unknown, or the row's own value when the row does not read the
+   unknown (single 1). -1 error */
+RMC_COLD {{ q }} int rmc_init_target(ModelInstance* m, const RmcInitBlock* b, double* value) {
+    if (b->single == 1) return rmc_init_row(m, b, value);
+{%- if init.single_isolators.programs|length > 0 %}
+    double o[1] = { 0.0 }; int result = -1;
+    switch (b->iso) {
+{%- for program in init.single_isolators.programs %}
+    case {{ loop.index0 }}: result = rmc_init_iso_p{{ loop.index0 }}(m, o); break;
+{%- endfor %}
+    default: break;
+    }
+    *value = o[0];
+    return result != 0 ? -1 : 0;
+{%- else %}
+    *value = NAN; return -1;
+{%- endif %}
+}
+{%- endif %}
+{%- endif %}
 {%- set tan = init.tangent %}
 #define RMC_TAN_OUTPUTS {{ tan.max_outputs }}
 /* JVP rows `(function, output offset, ...)` with `stride` entries each, under
@@ -2178,6 +2229,7 @@ RMC_COLD {{ q }} int rmc_tan_rows(ModelInstance* m, const size_t* entries, size_
     }
     return 0;
 }
+{%- if init.settled %}
 {%- if tan.nblocks > 0 %}
 #define RMC_TAN_BLOCKS {{ tan.nblocks }}
 #define RMC_TAN_ROWS {{ tan.nrows }}
@@ -2326,6 +2378,26 @@ RMC_COLD {{ q }} int rmc_init_jacobian(ModelInstance* m, const RmcInitBlock* b, 
     memcpy(m->y, y, sizeof(m->y)); memcpy(m->p, p, sizeof(m->p)); m->parameters_dirty = dirty;
     RMC_RELEASE; return result;
 }
+{%- else %}
+/* initial.rs: initial_block_jacobian through eval_partial_initial_jacobian_v:
+   the residual rows' JVP at the instance coordinates along each unknown.
+   Row-major over the block. -1 error */
+RMC_COLD {{ q }} int rmc_init_jacobian(ModelInstance* m, const RmcInitBlock* b, double* jac) {
+    RMC_MARK; int result = 0; size_t n = b->n;
+    const size_t* rows = rmc_init_pool + {{ tan.residual }};
+    double* seed = rmc_dalloc(m, RMC_SEED_LEN); double* residual = rmc_dalloc(m, RMC_INIT_ROWS); double* out = rmc_dalloc(m, RMC_TAN_OUTPUTS + 1);
+    if (!seed || !residual || !out) { RMC_RELEASE; return rmc_exhausted(m); }
+    memset(seed, 0, RMC_SEED_LEN * sizeof(double));
+    for (size_t col = 0; col < n && result == 0; ++col) {
+        size_t unknown = rmc_init_pool[b->unknowns + col];
+        seed[unknown] = 1.0;
+        if (rmc_tan_rows(m, rows, RMC_INIT_ROWS, 2, seed, out, residual) != 0) result = -1;
+        seed[unknown] = 0.0;
+        for (size_t row = 0; row < n && result == 0; ++row) jac[row * n + col] = residual[rmc_init_pool[b->rows + row]];
+    }
+    RMC_RELEASE; return result;
+}
+{%- endif %}
 /* scaling.rs: initial_block_scales (variable scales, the row-target
    fallbacks, and jacobian_row_scales over the issued pattern when present). */
 RMC_COLD {{ q }} void rmc_init_scales(ModelInstance* m, const RmcInitBlock* b, const double* pscale, const double* jac, double* rscale, double* vscale) {
@@ -2400,12 +2472,61 @@ RMC_COLD {{ q }} int rmc_init_relax(ModelInstance* m, const RmcInitBlock* b, con
     if (result != 1) *slot = previous;
     RMC_RELEASE; return result;
 }
-/* initial.rs: project_initial_block on the settled rows, where neither
-   singleton assignment applies (the settled model isolates no row); -1 error */
+{%- if not init.settled and init.single_rows.programs|length > 0 %}
+/* initial.rs: project_initial_singleton_assignment at the row-target
+   fallback scale; -1 error, 0 declined, 1 done */
+RMC_COLD {{ q }} int rmc_init_singleton(ModelInstance* m, const RmcInitBlock* b, const double* pscale, RmcUpdate* update) {
+    size_t unknown = rmc_init_pool[b->unknowns]; size_t target = rmc_init_pool[b->fallback];
+    double* slot = rmc_init_slot(m, unknown);
+    double vscale = rmc_init_scale(pscale, unknown, *slot);
+    double row_tol = rmc_scaled_tolerance(m->rmc_tol, target != 0 ? rmc_init_scale(pscale, target - 1, m->y[target - 1]) : vscale);
+    double variable_tol = rmc_scaled_tolerance(m->rmc_tol, vscale);
+    double before = 0.0, value = 0.0, after = 0.0;
+    if (rmc_init_row(m, b, &before) != 0) return -1;
+    if (!isfinite(before)) return 1;
+    if (rmc_init_target(m, b, &value) != 0) return -1;
+    if (!isfinite(value)) return 0;
+    double previous = *slot; *slot = value;
+    if (rmc_init_row(m, b, &after) != 0) return -1;
+    double step = previous - value;
+    /* singleton.rs: singleton_assignment_improves */
+    bool improves = isfinite(after) && (fabs(after) + row_tol < fabs(before)
+        || (fabs(after) <= row_tol && fabs(after) < fabs(before) && fabs(step) <= variable_tol));
+    if (improves) { update->changed = fabs(step) > variable_tol; update->settled = fabs(after) <= row_tol; return 1; }
+    *slot = previous; return 0;
+}
+/* initial.rs: project_initial_full_residual_singleton_assignment at the
+   block's Jacobian scales; -1 error, 0 declined, 1 done */
+RMC_COLD {{ q }} int rmc_init_full_singleton(ModelInstance* m, const RmcInitBlock* b, double before, double rscale, double vscale, RmcUpdate* update) {
+    double value = 0.0;
+    if (rmc_init_target(m, b, &value) != 0) return -1;
+    if (!isfinite(value)) return 0;
+    RMC_MARK;
+    double* residual = rmc_dalloc(m, RMC_INIT_ROWS);
+    if (!residual) { RMC_RELEASE; return rmc_exhausted(m); }
+    double* slot = rmc_init_slot(m, rmc_init_pool[b->unknowns]); double previous = *slot;
+    *slot = value;
+    if (rmc_init_settled(m, residual) != 0) { RMC_RELEASE; return -1; }
+    double after = residual[rmc_init_pool[b->rows]];
+    double row_tol = rmc_scaled_tolerance(m->rmc_tol, rscale), variable_tol = rmc_scaled_tolerance(m->rmc_tol, vscale);
+    int result = 0;
+    if (isfinite(after) && fabs(after) + row_tol < fabs(before)) { update->changed = fabs(previous - value) > variable_tol; update->settled = fabs(after) <= row_tol; result = 1; }
+    else *slot = previous;
+    RMC_RELEASE; return result;
+}
+{%- endif %}
+/* initial.rs: project_initial_block; the singleton assignments apply on the
+   instance coordinates alone (the settled model isolates no row); -1 error */
 RMC_COLD {{ q }} int rmc_init_block(ModelInstance* m, const RmcInitBlock* b, const double* pscale, RmcUpdate* update) {
     RMC_MARK; size_t n = b->n; int result = 0;
     update->changed = false; update->settled = false;
     if (n == 0) { update->settled = true; RMC_RELEASE; return 0; }
+{%- if not init.settled and init.single_rows.programs|length > 0 %}
+    if (b->single != 0) {
+        int done = rmc_init_singleton(m, b, pscale, update);
+        if (done != 0) { RMC_RELEASE; return done < 0 ? -1 : 0; }
+    }
+{%- endif %}
     double* residual = rmc_dalloc(m, RMC_INIT_ROWS); double* selected = rmc_dalloc(m, n); double* jac = rmc_dalloc(m, n * n);
     double* rscale = rmc_dalloc(m, n); double* vscale = rmc_dalloc(m, n); double* delta = rmc_dalloc(m, n);
     if (!residual || !selected || !jac || !rscale || !vscale || !delta) { RMC_RELEASE; return rmc_exhausted(m); }
@@ -2415,6 +2536,12 @@ RMC_COLD {{ q }} int rmc_init_block(ModelInstance* m, const RmcInitBlock* b, con
     if (rmc_init_jacobian(m, b, jac) != 0) { RMC_RELEASE; return -1; }
     rmc_init_scales(m, b, pscale, jac, rscale, vscale);
     if (rmc_scaled_converged(m->rmc_tol, selected, rscale, n)) { update->settled = true; RMC_RELEASE; return 0; }
+{%- if not init.settled and init.single_rows.programs|length > 0 %}
+    if (b->single != 0) {
+        int done = rmc_init_full_singleton(m, b, selected[0], rscale[0], vscale[0], update);
+        if (done != 0) { RMC_RELEASE; return done < 0 ? -1 : 0; }
+    }
+{%- endif %}
     if (n == 1) {
         int relaxed = rmc_init_relax(m, b, selected, jac, rscale, vscale);
         if (relaxed != 0) { update->changed = relaxed == 1; RMC_RELEASE; return relaxed < 0 ? -1 : 0; }
