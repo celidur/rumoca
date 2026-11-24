@@ -64,11 +64,13 @@ impl RefreshSource for solve::SolveModel {
         (&self.initial_y, &self.parameters)
     }
     fn parameter_binding_levels(&self) -> Result<usize, CodegenError> {
-        solve::fmi::parameter_binding_levels(self).map_err(|reason| {
-            CodegenError::dae_preparation_failed(
-                format!("unsupported-feature:initialization: {reason}"),
-                None,
-            )
-        })
+        solve::fmi::SolveBindingExecution::checked(self)
+            .map(|execution| execution.levels())
+            .map_err(|reason| {
+                CodegenError::dae_preparation_failed(
+                    format!("unsupported-feature:initialization: {reason}"),
+                    None,
+                )
+            })
     }
 }
