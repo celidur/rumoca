@@ -3,6 +3,7 @@ mod cuda_device_projection;
 mod cuda_ode_initialization;
 mod cuda_ode_ladder;
 mod cuda_ode_lane_kernels;
+mod cuda_ode_state_manifold;
 mod jax_compact_stencils;
 mod jax_lazy_conditionals;
 mod lane_target_renderer;
