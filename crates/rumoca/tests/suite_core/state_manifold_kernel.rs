@@ -63,6 +63,7 @@ const KERNEL: &str = r#"
 #include <string.h>
 #define RMC_COLD
 #define RMC_UNUSED
+#define RMC_NOINLINE
 #define RMC_API
 #define Y_LEN {{ y_len }}
 #define P_LEN {{ p_len }}

@@ -58,6 +58,110 @@
 }
 {%- endmacro %}
 
+{#- A device build's long sequence of programs, run in order: `items` are the
+    programs, or, with `programs`, executions naming theirs by
+    `program_index`. Consecutive items of at most rmc_device_chunk_max_ops
+    operations in all form one out-of-line run, `<name>_k<N>(params)`, and
+    `name(params)` calls the runs in order (-1 error, 0 done): a single
+    function holding every program would be the size of the model, past what
+    ptxas allocates. The call block renders one item, a block that returns -1
+    on error; `voids` silences the unused parameters. -#}
+{%- macro device_runs(name, items, params, args, voids, programs=none) %}
+{%- set runs = namespace(done=[], open=[], ops=0) %}
+{%- for item in items %}
+{%- set ops = (programs[item.program_index] if programs is not none else item).ops|length %}
+{%- if runs.open|length > 0 and runs.ops + ops > rmc_device_chunk_max_ops %}{% set runs.done = runs.done + [runs.open] %}{% set runs.open = [] %}{% set runs.ops = 0 %}{% endif %}
+{%- set runs.open = runs.open + [item] %}{% set runs.ops = runs.ops + ops %}
+{%- endfor %}
+{%- if runs.open|length > 0 %}{% set runs.done = runs.done + [runs.open] %}{% endif %}
+{%- for run in runs.done %}
+static __device__ RMC_NOINLINE int {{ name }}_k{{ loop.index0 }}({{ params }}) {
+    {{ voids }}
+{%- for item in run %}
+{{- caller(item) }}
+{%- endfor %}
+    return 0;
+}
+{%- endfor %}
+static __device__ int {{ name }}({{ params }}) {
+    {{ voids }}
+{%- for run in runs.done %}
+    if ({{ name }}_k{{ loop.index0 }}({{ args }}) != 0) return -1;
+{%- endfor %}
+    return 0;
+}
+{%- endmacro %}
+
+{#- A device switch over `key` that calls `<callee><id>(args)` for each of
+    the ascending case values `ids`, as out-of-line groups `<name>_g<N>` of
+    the ids in [N * group, (N + 1) * group), group =
+    rmc_device_chunk_max_ops / rmc_inline_program_max_ops, and the function
+    `name(params)` that selects the group (`pass` forwards its parameters);
+    any other key answers `fallback`. -#}
+{%- macro grouped_switch(decl, name, key, ids, callee, params, args, pass, fallback) %}
+{%- set group = rmc_device_chunk_max_ops // rmc_inline_program_max_ops %}
+{%- set g = namespace(open=-1, groups=[]) %}
+{%- for id in ids %}
+{%- if id // group != g.open %}
+{%- if g.open >= 0 %}
+    default: return {{ fallback }};
+    }
+}
+{%- endif %}
+{%- set g.open = id // group %}{% set g.groups = g.groups + [g.open] %}
+static __device__ RMC_NOINLINE int {{ name }}_g{{ g.open }}({{ params }}) {
+    switch ({{ key }}) {
+{%- endif %}
+    case {{ id }}: return {{ callee }}{{ id }}({{ args }});
+{%- endfor %}
+{%- if g.open >= 0 %}
+    default: return {{ fallback }};
+    }
+}
+{%- endif %}
+{{ decl }} RMC_NOINLINE int {{ name }}({{ params }}) {
+    switch ({{ key }} / {{ group }}) {
+{%- for open in g.groups %}
+    case {{ open }}: return {{ name }}_g{{ open }}({{ pass }});
+{%- endfor %}
+    default: return {{ fallback }};
+    }
+}
+{%- endmacro %}
+
+{#- A program family's dispatcher, `rmc_<family>_call(program, ...)`: a
+    switch calling `rmc_<family>_p<program>(args)`. A device build with more
+    programs than one group (rmc_device_chunk_max_ops /
+    rmc_inline_program_max_ops) splits it into out-of-line groups of
+    consecutive programs, so that the small programs inlined into a group's
+    cases stay within rmc_device_chunk_max_ops operations, and the family's
+    dispatcher selects the group. -#}
+{%- macro dispatcher(api, family, count, params, args, device=false) %}
+{%- set group = rmc_device_chunk_max_ops // rmc_inline_program_max_ops %}
+{%- if device and count > group -%}
+{{ grouped_switch(api, "rmc_" ~ family ~ "_call", "program", range(count), "rmc_" ~ family ~ "_p", params, args, "program, " ~ args, "rmc_bad_program(m, program)")|trim }}
+{%- else -%}
+{{ api }} {% if device %}RMC_NOINLINE {% endif %}int rmc_{{ family }}_call({{ params }}) {
+    switch (program) {
+{%- for i in range(count) %}
+    case {{ i }}: return rmc_{{ family }}_p{{ i }}({{ args }});
+{%- endfor %}
+    default: return rmc_bad_program(m, program);
+    }
+}
+{%- endif %}
+{%- endmacro %}
+
+{#- One whole program of a device run (device_runs) into `out`. -#}
+{%- macro program_block(program, out) %}
+    {
+    double r[{{ program.temporary_count if program.temporary_count > 0 else 1 }}]; (void)r;
+{%- for op in program.ops %}
+{{ scalar_op(op, out, "-1", device=true) }}
+{%- endfor %}
+    }
+{%- endmacro %}
+
 {#- Per-instance projection workspace; sized by the view from the deepest
     frame chain so no projection path allocates or uses variable-length arrays.
     The kernel tolerance and certification mode are the refresh policy of the
@@ -1350,6 +1454,11 @@ typedef struct { size_t m; size_t n; size_t rows; size_t y; } RmcManifoldBlock;
    variable scale */
 {{ q }} const double rmc_mf_scale[RMC_MF_STATES] = { {% for value in mf.state_scales %}{{ value }},{% endfor %} };
 /* manifold_execution.rs: eval_residual, every retained row. -1 error */
+{%- if device %}
+{%- call(program) device_runs("rmc_mf_residual", mf.residual.programs, "ModelInstance* m, double* o", "m, o", "(void)m; (void)o;") %}
+{{- program_block(program, "o") }}
+{%- endcall %}
+{%- else %}
 {{ q }} int rmc_mf_residual(ModelInstance* m, double* o) {
     (void)m;
 {%- for program in mf.residual.programs %}
@@ -1362,8 +1471,14 @@ typedef struct { size_t m; size_t n; size_t rows; size_t y; } RmcManifoldBlock;
 {%- endfor %}
     return 0;
 }
+{%- endif %}
 /* manifold_execution.rs: eval_directional, every retained row's derivative
    along the state direction `seed`. -1 error */
+{%- if device %}
+{%- call(program) device_runs("rmc_mf_jvp", mf.jvp.programs, "ModelInstance* m, const double* seed, double* o", "m, seed, o", "(void)m; (void)seed; (void)o;") %}
+{{- program_block(program, "o") }}
+{%- endcall %}
+{%- else %}
 {{ q }} int rmc_mf_jvp(ModelInstance* m, const double* seed, double* o) {
     (void)m; (void)seed;
 {%- for program in mf.jvp.programs %}
@@ -1376,6 +1491,7 @@ typedef struct { size_t m; size_t n; size_t rows; size_t y; } RmcManifoldBlock;
 {%- endfor %}
     return 0;
 }
+{%- endif %}
 /* manifold.rs: manifold_block_jacobian, column by column from the complete
    directional rows (`seed` is all zero on entry and on return), into the
    row-major m x n matrix `jac`. -1 error */
@@ -1609,14 +1725,7 @@ RMC_COLD {{ q }} int rmc_mf_wide_solve(ModelInstance* m, const double* a, size_t
 }
 {%- endfor %}
 {%- if me.assign.plan.programs|length > 0 %}
-{{ q }} int rmc_asg_call(size_t program, ModelInstance* m) {
-    switch (program) {
-{%- for program in me.assign.plan.programs %}
-    case {{ loop.index0 }}: return rmc_asg_p{{ loop.index0 }}(m);
-{%- endfor %}
-    default: return rmc_bad_program(m, program);
-    }
-}
+{{ dispatcher(q, "asg", me.assign.plan.programs|length, "size_t program, ModelInstance* m", "m", device) }}
 {{ q }} const size_t rmc_asg_seq[{{ me.assign.sequence|length }}] = {
 {%- for chunk in me.assign.sequence|batch(24) %}
     {% for value in chunk %}{{ value }},{% endfor %}
@@ -1810,6 +1919,30 @@ fail:
 }
 {%- endmacro %}
 
+{#- One binding execution: its whole program into `binding_output`, then the
+    rows it commits. `local` declares the output array in the block. -#}
+{%- macro binding_program(execution, program, targets, local, device=false) %}
+    {% if execution.initialization_only %}if (initializing) {% endif %}{
+    double r[{{ program.temporary_count if program.temporary_count > 0 else 1 }}]; (void)r;
+{%- if local %}
+    double binding_output[{{ targets|length }}]; (void)binding_output;
+{%- endif %}
+{%- for op in program.ops %}
+{{ scalar_op(op, "binding_output", "-1", device=device) }}
+{%- endfor %}
+{%- for row in execution.parameter_rows + execution.quotient_seed_rows %}{% set target = targets[row] %}
+    m->p[{{ target.P.index }}] = binding_output[{{ row }}];
+{%- endfor %}
+{%- if execution.state_start_rows|length > 0 %}
+    if (initializing) {
+{%- for row in execution.state_start_rows %}{% set target = targets[row] %}
+        m->y[{{ target.Y.index }}] = binding_output[{{ row }}];
+{%- endfor %}
+    }
+{%- endif %}
+    }
+{%- endmacro %}
+
 {#- The parameter bindings as the runtime applies them, over the binding
     execution `fmi` issues (`binding_execution`, `discrete_equations`): the
     checked FMI C component, or a Solve target's `SolveBindingExecution`.
@@ -1817,6 +1950,14 @@ fail:
     defines `update_discrete_equations` itself. -#}
 {%- macro binding_updates(solve, fmi, prefix, device=false) %}{%- set q = device_qualifier(device) %}
 {%- set targets = solve.initialization.update_targets %}
+{%- if device and targets|length > 0 %}
+{%- set programs = solve.initialization.update_plan.programs %}
+/* The bindings, in their execution order, as out-of-line runs (device_runs)
+   into the caller's `binding_output`, one slot per binding target. */
+{%- call(execution) device_runs("rmc_binding_runs", fmi.binding_execution, "ModelInstance* m, bool initializing, double* binding_output", "m, initializing, binding_output", "(void)m; (void)initializing; (void)binding_output;", programs) %}
+{{- binding_program(execution, programs[execution.program_index], targets, false, device) }}
+{%- endcall %}
+{%- endif %}
 /* relation_memory.rs: apply_initialization_updates. The checked parameter
    bindings run in dependency order, each reading only settled parameters and
    constants, so one pass reaches the runtime's repeated-sweep fixed point; a
@@ -1840,26 +1981,14 @@ fail:
     };
     double before[{{ targets|length }}];
     for (size_t k = 0; k < {{ targets|length }}; ++k) before[k] = in_y[k] ? m->y[targets[k]] : m->p[targets[k]];
+{%- if device %}
+    double binding_output[{{ targets|length }}];
+    if (rmc_binding_runs(m, initializing, binding_output) != 0) return -1;
+{%- else %}
 {%- for execution in fmi.binding_execution %}
-{%- set program = solve.initialization.update_plan.programs[execution.program_index] %}
-    {% if execution.initialization_only %}if (initializing) {% endif %}{
-    double r[{{ program.temporary_count if program.temporary_count > 0 else 1 }}]; (void)r;
-    double binding_output[{{ targets|length }}]; (void)binding_output;
-{%- for op in program.ops %}
-{{ scalar_op(op, "binding_output", "-1", device=device) }}
+{{- binding_program(execution, solve.initialization.update_plan.programs[execution.program_index], targets, true, device) }}
 {%- endfor %}
-{%- for row in execution.parameter_rows + execution.quotient_seed_rows %}{% set target = targets[row] %}
-    m->p[{{ target.P.index }}] = binding_output[{{ row }}];
-{%- endfor %}
-{%- if execution.state_start_rows|length > 0 %}
-    if (initializing) {
-{%- for row in execution.state_start_rows %}{% set target = targets[row] %}
-        m->y[{{ target.Y.index }}] = binding_output[{{ row }}];
-{%- endfor %}
-    }
 {%- endif %}
-    }
-{%- endfor %}
     if (update_discrete_equations(m) != {{ prefix }}OK) return -1;
     for (size_t k = 0; k < {{ targets|length }}; ++k) {
         const double after = in_y[k] ? m->y[targets[k]] : m->p[targets[k]];
@@ -2184,6 +2313,11 @@ typedef struct { size_t n; size_t rows; size_t unknowns; size_t fallback; size_t
 #define RMC_INIT_PLAN_ROWS {{ init.unknown_count }}
 {{ q }} const size_t rmc_init_row_target[RMC_INIT_ROWS] = { {% for value in init.row_targets %}{{ value }},{% endfor %} };
 /* The complete initialization residual, one output per row. -1 error */
+{%- if device %}
+{%- call(program) device_runs("rmc_init_residual", init.residual.programs, "ModelInstance* m, double* o", "m, o", "(void)m; (void)o;") %}
+{{- program_block(program, "o") }}
+{%- endcall %}
+{%- else %}
 {{ q }} int rmc_init_residual(ModelInstance* m, double* o) {
 {%- for program in init.residual.programs %}
     {
@@ -2195,6 +2329,7 @@ typedef struct { size_t n; size_t rows; size_t unknowns; size_t fallback; size_t
 {%- endfor %}
     return 0;
 }
+{%- endif %}
 {{ q }} double* rmc_init_slot(ModelInstance* m, size_t combined) { return combined < RMC_INIT_Y_LEN ? &m->y[combined] : &m->p[combined - RMC_INIT_Y_LEN]; }
 /* CombinedInitializationProjectionModel::variable_scale_for_y_index under
    scaling.rs: model_variable_scale: a solver coordinate takes its solver
@@ -2679,6 +2814,17 @@ RMC_COLD {{ q }} int rmc_init_project(ModelInstance* m) {
 {{ q }} const size_t rmc_init_delay_slot[RMC_INIT_DELAYS] = { {% for value in delays.value_parameters %}{{ value }},{% endfor %} };
 /* delay.rs: DelayRuntime::evaluate_channel_rows: every channel's source,
    delay time and maximum delay at the instance coordinate. -1 error */
+{%- if device %}
+{%- for rows in [(delays.source, "source"), (delays.delay_time, "delay_time"), (delays.delay_max, "delay_max")] %}
+{%- call(program) device_runs("rmc_init_delay_" ~ rows[1], rows[0].programs, "ModelInstance* m, double* " ~ rows[1], "m, " ~ rows[1], "(void)m; (void)" ~ rows[1] ~ ";") %}
+{{- program_block(program, rows[1]) }}
+{%- endcall %}
+{%- endfor %}
+{{ q }} int rmc_init_delay_rows(ModelInstance* m, double* source, double* delay_time, double* delay_max) {
+    if (rmc_init_delay_source(m, source) != 0 || rmc_init_delay_delay_time(m, delay_time) != 0) return -1;
+    return rmc_init_delay_delay_max(m, delay_max) != 0 ? -1 : 0;
+}
+{%- else %}
 {{ q }} int rmc_init_delay_rows(ModelInstance* m, double* source, double* delay_time, double* delay_max) {
 {%- for rows in [(delays.source, "source"), (delays.delay_time, "delay_time"), (delays.delay_max, "delay_max")] %}
 {%- for program in rows[0].programs %}
@@ -2692,6 +2838,7 @@ RMC_COLD {{ q }} int rmc_init_project(ModelInstance* m) {
 {%- endfor %}
     return 0;
 }
+{%- endif %}
 /* initial_projection.rs: refresh_initial_delay_values, DelayRuntime::refresh
    before any history is committed (MLS §3.7.2: delay(u, ...) = u during
    initialization): the delay times and maxima are checked
@@ -2788,13 +2935,28 @@ RMC_COLD {{ q }} {{ prefix }}Status rmc_initialize(ModelInstance* m, double tole
 /* A dispatcher calls each large program of its family out of line: inlined
    into its switch, a family's programs become one large function, which slows
    the hot path and the host compilers. A small program costs less than the
-   call that reaches it, so the compiler may inline it into its case. A device
+   call that reaches it, so the compiler may inline it into its case.
+{%- if device %} On a
+   device every dispatcher, every run of parameter bindings or delay rows
+   ({{ rmc_device_chunk_max_ops }} operations at most) and every typed pure function
+   stays out of line as well: inlined into the entries that reach them, they
+   would make each entry one function the size of the whole model, past what
+   ptxas allocates. */
+#if defined(__CUDACC__)
+#define RMC_NOINLINE __noinline__
+#elif defined(__GNUC__) || defined(__clang__)
+#define RMC_NOINLINE __attribute__((noinline))
+#else
+#define RMC_NOINLINE
+#endif
+{%- else %} A device
    compiler keeps its own inlining choices. */
 #if (defined(__GNUC__) || defined(__clang__)) && !defined(__CUDACC__)
 #define RMC_NOINLINE __attribute__((noinline))
 #else
 #define RMC_NOINLINE
 #endif
+{%- endif %}
 /* A kernel wrapper small enough that its call costs more than its body, on
    a path every block takes (rmc_row): inlined even where the compiler's size
    estimate would keep it out of line. */
@@ -2877,14 +3039,7 @@ RMC_API extern const size_t rmc_iso_slot[{{ me.table.isolator_slot|length }}];
 {%- for program in me.table.rows.programs %}
 {{ program_function("rmc_row_p" ~ loop.index0, program, "ModelInstance* m, double* o", false, true, device=device) }}
 {%- endfor %}
-{{ api }} int rmc_row_call(size_t program, ModelInstance* m, double* out) {
-    switch (program) {
-{%- for program in me.table.rows.programs %}
-    case {{ loop.index0 }}: return rmc_row_p{{ loop.index0 }}(m, out);
-{%- endfor %}
-    default: return rmc_bad_program(m, program);
-    }
-}
+{{ dispatcher(api, "row", me.table.rows.programs|length, "size_t program, ModelInstance* m, double* out", "m, out", device) }}
 {%- else %}
 {#- Rows whose packed programs differ only in their load indices share one
     function per shape, which reads each varying index from its row's
@@ -2911,7 +3066,20 @@ RMC_API extern const size_t rmc_iso_slot[{{ me.table.isolator_slot|length }}];
     {% for value in chunk %}{{ value }},{% endfor %}
 {%- endfor %}
 };
-{{ api }} int rmc_row_call(size_t program, ModelInstance* m, double* out) {
+{%- set group = rmc_device_chunk_max_ops // rmc_inline_program_max_ops %}
+{%- if device and (sharing.own|length > group or nshapes > group) %}
+{#- A device build bounds both switches as a dispatcher does. -#}
+{{ grouped_switch(q, "rmc_row_shape_call", "shape", range(nshapes), "rmc_row_s", "size_t shape, ModelInstance* m, double* out, const size_t* a", "m, out, a", "shape, m, out, a", "rmc_bad_program(m, shape)")|trim }}
+{{ grouped_switch(q, "rmc_row_own_call", "program", sharing.own, "rmc_row_p", "size_t program, ModelInstance* m, double* out", "m, out", "program, m, out", "rmc_bad_program(m, program)")|trim }}
+{{ api }} RMC_NOINLINE int rmc_row_call(size_t program, ModelInstance* m, double* out) {
+    if (program < {{ sharing.shape_of|length }}) {
+        const size_t shape = rmc_row_shape[program];
+        if (shape < {{ nshapes }}) return rmc_row_shape_call(shape, m, out, rmc_row_arg_pool + rmc_row_arg[program]);
+    }
+    return rmc_row_own_call(program, m, out);
+}
+{%- else %}
+{{ api }} {% if device %}RMC_NOINLINE {% endif %}int rmc_row_call(size_t program, ModelInstance* m, double* out) {
     if (program < {{ sharing.shape_of|length }}) {
         const size_t* a = rmc_row_arg_pool + rmc_row_arg[program];
         switch (rmc_row_shape[program]) {
@@ -2929,6 +3097,7 @@ RMC_API extern const size_t rmc_iso_slot[{{ me.table.isolator_slot|length }}];
     }
 }
 {%- endif %}
+{%- endif %}
 {%- for program in me.table.inv.programs %}
 {{ program_function("rmc_inv_p" ~ loop.index0, program, "ModelInstance* m, double* o", false, true, device=device) }}
 {%- endfor %}
@@ -2936,22 +3105,8 @@ RMC_API extern const size_t rmc_iso_slot[{{ me.table.isolator_slot|length }}];
 {{ program_function("rmc_dep_p" ~ loop.index0, program, "ModelInstance* m, const double* seed, double* o", true, true, device=device) }}
 {%- endfor %}
 {%- if me.table.inv.programs|length > 0 %}
-{{ api }} int rmc_inv_call(size_t program, ModelInstance* m, double* out) {
-    switch (program) {
-{%- for program in me.table.inv.programs %}
-    case {{ loop.index0 }}: return rmc_inv_p{{ loop.index0 }}(m, out);
-{%- endfor %}
-    default: return rmc_bad_program(m, program);
-    }
-}
-{{ api }} int rmc_dep_call(size_t program, ModelInstance* m, const double* seed, double* out) {
-    switch (program) {
-{%- for program in me.table.dep.programs %}
-    case {{ loop.index0 }}: return rmc_dep_p{{ loop.index0 }}(m, seed, out);
-{%- endfor %}
-    default: return rmc_bad_program(m, program);
-    }
-}
+{{ dispatcher(api, "inv", me.table.inv.programs|length, "size_t program, ModelInstance* m, double* out", "m, out", device) }}
+{{ dispatcher(api, "dep", me.table.dep.programs|length, "size_t program, ModelInstance* m, const double* seed, double* out", "m, seed, out", device) }}
 {%- endif %}
 {%- endif %}
 {%- endmacro %}
@@ -2962,28 +3117,14 @@ RMC_API extern const size_t rmc_iso_slot[{{ me.table.isolator_slot|length }}];
 {{ program_function("rmc_jvp_p" ~ loop.index0, program, "ModelInstance* m, const double* seed, double* o", true, true, device=device) }}
 {%- endfor %}
 {%- if me.table.jvp.programs|length > 0 %}
-{{ api }} int rmc_jvp_call(size_t program, ModelInstance* m, const double* seed, double* out) {
-    switch (program) {
-{%- for program in me.table.jvp.programs %}
-    case {{ loop.index0 }}: return rmc_jvp_p{{ loop.index0 }}(m, seed, out);
-{%- endfor %}
-    default: return rmc_bad_program(m, program);
-    }
-}
+{{ dispatcher(api, "jvp", me.table.jvp.programs|length, "size_t program, ModelInstance* m, const double* seed, double* out", "m, seed, out", device) }}
 {%- endif %}
 {%- if me.blocks|length > 0 %}
 {%- for program in me.table.lanes.programs %}
 {{ program_function("rmc_lane_p" ~ loop.index0, program, "ModelInstance* m, const double* seed, double* o", true, true, device=device) }}
 {%- endfor %}
 {%- if me.table.lanes.programs|length > 0 %}
-{{ api }} int rmc_lane_call(size_t program, ModelInstance* m, const double* seed, double* out) {
-    switch (program) {
-{%- for program in me.table.lanes.programs %}
-    case {{ loop.index0 }}: return rmc_lane_p{{ loop.index0 }}(m, seed, out);
-{%- endfor %}
-    default: return rmc_bad_program(m, program);
-    }
-}
+{{ dispatcher(api, "lane", me.table.lanes.programs|length, "size_t program, ModelInstance* m, const double* seed, double* out", "m, seed, out", device) }}
 {%- endif %}
 {%- endif %}
 {%- endmacro %}
@@ -3012,24 +3153,10 @@ RMC_API extern const size_t rmc_iso_slot[{{ me.table.isolator_slot|length }}];
 }
 {%- endfor %}
 {%- if me.table.causal.programs|length > 0 %}
-{{ api }} int rmc_causal_call(size_t program, ModelInstance* m, const size_t* targets) {
-    switch (program) {
-{%- for program in me.table.causal.programs %}
-    case {{ loop.index0 }}: return rmc_causal_p{{ loop.index0 }}(m, targets);
-{%- endfor %}
-    default: return rmc_bad_program(m, program);
-    }
-}
+{{ dispatcher(api, "causal", me.table.causal.programs|length, "size_t program, ModelInstance* m, const size_t* targets", "m, targets", device) }}
 {%- endif %}
 {%- if me.table.isolators.programs|length > 0 %}
-{{ api }} int rmc_iso_call(size_t program, ModelInstance* m, double* out) {
-    switch (program) {
-{%- for program in me.table.isolators.programs %}
-    case {{ loop.index0 }}: return rmc_iso_p{{ loop.index0 }}(m, out);
-{%- endfor %}
-    default: return rmc_bad_program(m, program);
-    }
-}
+{{ dispatcher(api, "iso", me.table.isolators.programs|length, "size_t program, ModelInstance* m, double* out", "m, out", device) }}
 {{ api }} const size_t rmc_iso_group[{{ me.table.isolator_group|length }}] = { {% for value in me.table.isolator_group %}{{ value }},{% endfor %} };
 {{ api }} const size_t rmc_iso_slot[{{ me.table.isolator_slot|length }}] = { {% for value in me.table.isolator_slot %}{{ value }},{% endfor %} };
 {%- endif %}
