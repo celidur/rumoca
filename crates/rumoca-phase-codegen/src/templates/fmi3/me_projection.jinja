@@ -2161,7 +2161,7 @@ typedef struct { size_t nrows; size_t ncols; size_t ndep; size_t dep; size_t nen
     the residual's partial forward derivative (InitialProjectionModel without
     refreshes_algebraic_reads). Combined unknown indices below the solver
     length are solver coordinates, the rest parameters. -#}
-{%- macro initialization_kernel(me, prefix, device=false) %}{%- set q = device_qualifier(device) %}
+{%- macro initialization_kernel(me, prefix, device=false) %}{%- set q = device_qualifier(device) %}{%- set api = device_qualifier(device, true) %}
 {%- set init = me.init %}
 {%- if init.rows > 0 %}
 #define RMC_INIT_ROWS {{ init.rows }}
@@ -2669,9 +2669,14 @@ RMC_COLD {{ q }} int rmc_init_project(ModelInstance* m) {
     }
     RMC_RELEASE; return result;
 }
+{%- if me.state_manifold %}
+/* manifold_kernel, which the including unit emits after this kernel. */
+{{ api }} int rmc_certify_state_manifold(ModelInstance* m, double tol);
+{%- endif %}
 /* solve_runtime/initial_projection.rs: settle_initialization_system at the
-   FMI tolerance; the certified continuous refresh follows at the refresh
-   tolerance. */
+   FMI tolerance{% if me.state_manifold %}, then the settled states certified on the retained
+   manifold at that tolerance (the linked kernel's CertifyInitial){% endif %};
+   the certified continuous refresh follows at the refresh tolerance. */
 RMC_COLD {{ q }} {{ prefix }}Status rmc_initialize(ModelInstance* m, double tolerance) {
     {{ prefix }}Status status = {{ prefix }}Error;
     if (m->rmc_fatal) return status;
@@ -2684,6 +2689,12 @@ RMC_COLD {{ q }} {{ prefix }}Status rmc_initialize(ModelInstance* m, double tole
         if (changed < 0) break;
         if (changed == 0) { status = {{ prefix }}OK; break; }
     }
+{%- if me.state_manifold %}
+    if (status == {{ prefix }}OK && !m->rmc_fatal && rmc_certify_state_manifold(m, m->rmc_tol) != 0) {
+        m->rmc_tol = RMC_TOL; m->rmc_certify = true;
+        return {{ prefix }}Error;
+    }
+{%- endif %}
     m->rmc_tol = RMC_TOL; m->rmc_certify = true;
     if (m->rmc_fatal) return {{ prefix }}Error;
     if (status != {{ prefix }}OK) RMC_LOG(m, "initial algebraic/update projection did not converge");
