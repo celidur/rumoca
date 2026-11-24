@@ -25,8 +25,7 @@ int main(void) {
     initialize_values(m);
     int status = 0;
     for (size_t k = 0; k < sizeof(rmc_block_desc) / sizeof(rmc_block_desc[0]); ++k) {
-        RmcBlock view;
-        const RmcBlock* b = rmc_block_view(k, &view);
+        const RmcBlock* b = rmc_block(k);
         double values[64];
         if (RMC_BS(b, nnz) > 64) { status = 3; break; }
         if (rmc_jacobian(m, b, values) != 0) { printf("block %zu unavailable\n", k); status = 1; continue; }

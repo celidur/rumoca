@@ -52,10 +52,11 @@ fn every_chart_reports_the_fold_of_its_own_guarded_block() {
         .map(|fields| {
             let fields: Vec<usize> = fields
                 .split(',')
-                .take(3)
+                .take(4)
                 .map(|field| field.trim().parse().expect("a descriptor count"))
                 .collect();
-            let (n, y) = (fields[1], fields[2]);
+            // id, canonical, n, y
+            let (n, y) = (fields[2], fields[3]);
             let mut unknowns = pool[y..y + n].to_vec();
             unknowns.sort_unstable();
             unknowns

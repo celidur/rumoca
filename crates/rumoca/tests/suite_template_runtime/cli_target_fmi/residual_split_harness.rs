@@ -39,10 +39,9 @@ int main(void) {
     CHECK(m != NULL, "allocate the instance");
     initialize_values(m);
     CHECK(settle_values(m) == fmi3OK, "settle the start point");
-    RmcBlock view;
     const RmcBlock* b = NULL;
     for (size_t k = 0; k < sizeof(rmc_block_desc) / sizeof(rmc_block_desc[0]); ++k)
-        if (!b && rmc_block_desc[k].affine && rmc_block_desc[k].n > 1 && rmc_block_desc[k].nsplit > 0) b = rmc_block_view(k, &view);
+        if (!b && rmc_block_desc[k].affine && rmc_block_desc[k].n > 1 && rmc_block_desc[k].nsplit > 0) b = rmc_block(k);
     CHECK(b != NULL, "an affine multi-row block carries a residual split");
     CHECK(RMC_BS(b, n) <= MAX_ROWS, "the block fits the harness buffers");
     double unsplit[MAX_ROWS], split[MAX_ROWS];
@@ -95,10 +94,9 @@ int main(void) {
     initialize_values(m);
     m->logger = capture;
     CHECK(settle_values(m) == fmi3OK, "settle the start point");
-    RmcBlock view;
     const RmcBlock* b = NULL;
     for (size_t k = 0; k < sizeof(rmc_block_desc) / sizeof(rmc_block_desc[0]); ++k)
-        if (!b && rmc_block_desc[k].affine && rmc_block_desc[k].n > 1 && rmc_block_desc[k].nsplit > 0) b = rmc_block_view(k, &view);
+        if (!b && rmc_block_desc[k].affine && rmc_block_desc[k].n > 1 && rmc_block_desc[k].nsplit > 0) b = rmc_block(k);
     CHECK(b != NULL && RMC_BS(b, n) <= MAX_ROWS, "an affine multi-row block carries a residual split");
     double split[MAX_ROWS];
     CHECK(rmc_row_call_real((size_t)-1, m, split) == RMC_FATAL && m->rmc_fatal, "a bad row index is fatal");
