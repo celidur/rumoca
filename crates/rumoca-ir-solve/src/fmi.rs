@@ -125,6 +125,14 @@ use rumoca_core::Span;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+/// The dependency levels of a model's parameter bindings, as the generated C
+/// component counts them: the simultaneous sweeps the runtime needs to settle
+/// them, plus one to observe that nothing changed. A binding the component
+/// cannot settle in dependency order is refused with its reason.
+pub fn parameter_binding_levels(model: &SolveModel) -> Result<usize, &'static str> {
+    parameter_updates::validate(&model.problem, &model.pure_calls).map(|(_, levels)| levels)
+}
+
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum FmiComponentError {
     #[error("Solve kernel is invalid: {0}")]
