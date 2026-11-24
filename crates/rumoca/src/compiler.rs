@@ -59,6 +59,8 @@ use rumoca_sim::{lower_solve_artifacts, lower_solve_package, lower_solve_problem
 
 use crate::error::CompilerError;
 
+mod solve_model;
+
 #[cfg(test)]
 mod tuple_calls_tests;
 
@@ -81,6 +83,10 @@ pub struct CompilationResult {
     /// Cached solve-template renderer for targets that never read the `dae`
     /// template entry.
     solve_template_renderer_without_dae:
+        std::sync::OnceLock<Result<SolveTemplateRenderer, CompilerError>>,
+    /// Cached renderer over the complete lowered model (problem plus start
+    /// values), for targets that seed their own lanes (`solve_model`).
+    solve_model_template_renderer:
         std::sync::OnceLock<Result<SolveTemplateRenderer, CompilerError>>,
 }
 
@@ -174,6 +180,7 @@ impl CompilationResult {
             resolved,
             solve_template_renderer: std::sync::OnceLock::new(),
             solve_template_renderer_without_dae: std::sync::OnceLock::new(),
+            solve_model_template_renderer: std::sync::OnceLock::new(),
         }
     }
 
@@ -245,6 +252,21 @@ impl CompilationResult {
         model_name: &str,
     ) -> Result<String, CompilerError> {
         self.solve_renderer_without_dae()?
+            .render_with_name(template, model_name)
+            .map_err(CompilerError::TemplateError)
+    }
+
+    /// Render a solve template against the complete lowered model, whose
+    /// `solve_model` entry carries the start values of every Y and P slot.
+    pub fn render_solve_model_template_str(
+        &self,
+        template: &str,
+        model_name: &str,
+    ) -> Result<String, CompilerError> {
+        self.solve_model_template_renderer
+            .get_or_init(|| solve_model::build_solve_model_template_renderer(&self.dae))
+            .as_ref()
+            .map_err(Clone::clone)?
             .render_with_name(template, model_name)
             .map_err(CompilerError::TemplateError)
     }

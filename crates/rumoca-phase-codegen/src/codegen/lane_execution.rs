@@ -264,12 +264,13 @@ fn require_lane_events(problem: &solve::SolveProblem) -> Result<(), CodegenError
             "terminate() actions are present",
         ),
         // A lane neither checks nor reports a model assertion: an
-        // error-level one would let a violated lane run on.
+        // error-level one would let a violated lane run on. An assertion
+        // inside a called function fails that call instead.
         (
-            events
-                .actions
-                .iter()
-                .any(|action| matches!(action.kind, solve::SolveEventActionKind::Assert)),
+            events.actions.iter().any(|action| {
+                matches!(action.kind, solve::SolveEventActionKind::Assert)
+                    && action.assertion_projection.is_none()
+            }),
             "error-level assert() actions are present",
         ),
         (
@@ -449,8 +450,20 @@ fn delays_value(
             "delay rows are not aligned with their slots",
         ));
     }
+    // The rows that read an algebraic slot read it settled; the others read
+    // the lane's coordinate as it is.
+    let algebraic: std::collections::BTreeSet<usize> =
+        (problem.solve_layout.state_scalar_count()..problem.layout.y_scalars()).collect();
+    let reads_algebraic = |block: &solve::ScalarProgramBlock| {
+        block
+            .programs()
+            .iter()
+            .any(|program| reads_slot(program, "y", &algebraic))
+    };
     Ok(minijinja::context! {
         count => count,
+        settle_times => reads_algebraic(&delays.delay_time_rhs) || reads_algebraic(&delays.delay_max_rhs),
+        settle_sources => reads_algebraic(&delays.source_rhs),
         source => source,
         delay_time => delay_time,
         delay_max => delay_max,
