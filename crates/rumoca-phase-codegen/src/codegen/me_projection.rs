@@ -624,6 +624,10 @@ pub(super) fn me_refresh_value(component: &impl RefreshSource) -> Result<Value, 
         variable_scales => variable_scales,
         policy => policy_value(),
         seed_rule => seed_rule(component),
+        // The target's `rmc_initialize` certifies the settled states on the
+        // retained manifold (`manifold_kernel`).
+        state_manifold => component.projects_state_manifold()
+            && !problem.continuous.manifold_projection_plan.is_empty(),
     })
 }
 
