@@ -31,9 +31,10 @@ fn compile(source: &str, model: &str) -> rumoca::CompilationResult {
         .unwrap_or_else(|error| panic!("compile {model}: {error:#}"))
 }
 
-// The C initialization evaluates every residual row on the settled algebraic
-// refresh (`parameter_updates::validate_projection`): each initial equation
-// below constrains an algebraic, which the refresh computes from the unknown.
+// A row role that reads an algebraic evaluates every residual row on the
+// settled algebraic refresh; rows reading no algebraic are evaluated on the
+// instance coordinates (`parameter_updates::validate_projection`), with each
+// one-row block's isolation of its unknown and the partial forward Jacobian.
 
 /// A nonlinear initial equation that settles a state through an algebraic.
 const STATE_THROUGH_ALGEBRAIC: &str = "model DeviceInitState
@@ -76,8 +77,45 @@ equation
   c = 1 + 0.1 * a * a - 0.3 * cos(c);
 end DeviceInitTorn;";
 
+/// Initial equations over state seeds alone: an affine row the row's own
+/// isolation settles, a nonlinear row Newton settles, and a coupled pair.
+const STATE_SEEDS: &str = "model DeviceInitSeeds
+  Real x(start = 1);
+  Real z(start = 2);
+  Real a(start = 1);
+  Real b(start = 2);
+initial equation
+  2 * x + 1 = 7;
+  z * z * z + z = 10;
+  a + b = 3;
+  a - b * b = -3;
+equation
+  der(x) = -x;
+  der(z) = -0.5 * z;
+  der(a) = b;
+  der(b) = -a;
+end DeviceInitSeeds;";
+
+/// A `fixed = false` parameter whose initial equation reads a fixed state
+/// seed and another parameter's binding.
+const PARAMETER_OVER_SEEDS: &str = "model DeviceInitParameterSeed
+  parameter Real g = 2;
+  parameter Real h = 3 * g;
+  parameter Real k(fixed = false, start = 1);
+  Real x(start = h, fixed = true);
+initial equation
+  k * k * k + k = x + g;
+equation
+  der(x) = -k * x;
+end DeviceInitParameterSeed;";
+
 pub(crate) fn models() -> Vec<(rumoca::CompilationResult, &'static str)> {
     vec![
+        (compile(STATE_SEEDS, "DeviceInitSeeds"), "DeviceInitSeeds"),
+        (
+            compile(PARAMETER_OVER_SEEDS, "DeviceInitParameterSeed"),
+            "DeviceInitParameterSeed",
+        ),
         (
             compile(STATE_THROUGH_ALGEBRAIC, "DeviceInitState"),
             "DeviceInitState",
