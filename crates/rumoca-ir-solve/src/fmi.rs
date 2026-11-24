@@ -100,6 +100,7 @@ pub use native_deployment::{
     FmiCarryPair, FmiNativeDeploymentView, NativeCarryError, NativeDeploymentError,
     NativeTypedInventoryGap, check_native_typed_membership, reads_input_lanes,
 };
+pub use parameter_updates::initial_rows_read_settled_view;
 pub use root_location::{
     RootBracket, RootLocationPlan, RootRefinementMethod, RootTieBreak, SlidingModes,
 };
