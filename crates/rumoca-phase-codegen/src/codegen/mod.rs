@@ -97,7 +97,9 @@ use symbol_alloc::{
     symbol_function,
 };
 
-pub use me_projection::{lane_refresh_admissible, me_refresh_admissible};
+pub use me_projection::{
+    lane_refresh_admissible, me_refresh_admissible, me_refresh_admissible_with_state_manifold,
+};
 pub use solve_lazy::{
     explicit_algebraic_assignment_complete, explicit_algebraic_assignment_complete_with_calls,
     explicit_initialization_renderable_with_calls,
@@ -327,6 +329,10 @@ fn solve_template_blocks_value(
         // blocks, events, delays, initialization) for batched targets that
         // run one model instance per thread. Built on first read.
         lanes => lane_execution::LaneBlocks::value(handle.clone()),
+        // The projection onto the retained state manifold for targets that
+        // drive it themselves after each accepted step (the shared kernel's
+        // `manifold_kernel`). Built on first read.
+        state_manifold => me_projection::StateManifoldBlocks::value(handle.clone()),
         artifacts => minijinja::context! {
             continuous => minijinja::context! {
                 implicit_jacobian_v => solve_template_compute_block_json(&artifacts.continuous.implicit_jacobian_v)?,
