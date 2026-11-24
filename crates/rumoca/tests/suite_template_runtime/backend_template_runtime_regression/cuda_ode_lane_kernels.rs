@@ -147,7 +147,7 @@ fn cuda_ode_refreshes_once_after_a_settled_event_pass() {
     let body = &body[..body.find("\n}\n").expect("the event iteration ends")];
     assert_eq!(body.matches("Relay_refresh(time").count(), 2);
     assert!(
-        body.contains("if (!settled) {\n        Relay_refresh(time"),
+        body.contains("if (!settled && Relay_refresh(time"),
         "the refresh after the loop runs only after an unsettled last pass"
     );
 }
