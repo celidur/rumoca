@@ -127,6 +127,25 @@ use rumoca_core::Span;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+/// Admits a lowered model to the C kernel (SPEC_0044 ME-PROJ-001): the
+/// kernel checks and the parameter-binding execution check the generated C
+/// component runs, each refusing with the component's reason. The component's
+/// event profile, deployment and variable checks are not run.
+///
+/// Returns the dependency levels of the parameter bindings, as the component
+/// counts them: the simultaneous sweeps the runtime needs to settle them,
+/// plus one to observe that nothing changed.
+pub fn parameter_binding_levels(model: &SolveModel) -> Result<usize, &'static str> {
+    let (order, levels) = c_codegen::admit_kernel(model, None).map_err(|error| error.0)?;
+    let initialization = &model.problem.initialization;
+    binding_execution::BindingExecution::checked(
+        initialization.update_rhs(),
+        initialization.update_targets(),
+        &order,
+    )?;
+    Ok(levels)
+}
+
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum FmiComponentError {
     #[error("Solve kernel is invalid: {0}")]
