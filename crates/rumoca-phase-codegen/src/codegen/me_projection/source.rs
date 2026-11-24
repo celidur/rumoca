@@ -47,28 +47,30 @@ impl RefreshSource for solve::fmi::FmiCCodegenView {
 
 /// A complete lowered model, without an FMI component, admitted to the C
 /// kernel: it passed the kernel checks the C component runs before its C is
-/// generated (`rumoca_ir_solve::fmi::parameter_binding_levels`: initial mode,
-/// finite initial values sized to the layout, no recursive function group,
-/// typed functions within the C profile, parameter bindings in dependency
-/// order). Only an admitted model is a refresh source, so no view is built
-/// from a model the kernel refuses.
+/// generated (`rumoca_ir_solve::fmi::SolveBindingExecution::checked`: initial
+/// mode, finite initial values sized to the layout, no recursive function
+/// group, typed functions within the C profile, parameter bindings in
+/// dependency order). Only an admitted model is a refresh source, so no view
+/// is built from a model the kernel refuses.
 pub(crate) struct AdmittedSolveModel<'a> {
     model: &'a solve::SolveModel,
-    binding_levels: usize,
+    bindings: solve::fmi::SolveBindingExecution,
 }
 
 impl<'a> AdmittedSolveModel<'a> {
     pub(crate) fn new(model: &'a solve::SolveModel) -> Result<Self, CodegenError> {
-        let binding_levels = solve::fmi::parameter_binding_levels(model).map_err(|reason| {
+        let bindings = solve::fmi::SolveBindingExecution::checked(model).map_err(|reason| {
             CodegenError::dae_preparation_failed(
                 format!("unsupported-feature:projection-kernel: {reason}"),
                 None,
             )
         })?;
-        Ok(Self {
-            model,
-            binding_levels,
-        })
+        Ok(Self { model, bindings })
+    }
+
+    /// The parameter bindings the kernel's `binding_updates` runs.
+    pub(crate) fn bindings(&self) -> &solve::fmi::SolveBindingExecution {
+        &self.bindings
     }
 }
 
@@ -89,6 +91,6 @@ impl RefreshSource for AdmittedSolveModel<'_> {
         (&self.model.initial_y, &self.model.parameters)
     }
     fn parameter_binding_levels(&self) -> usize {
-        self.binding_levels
+        self.bindings.levels()
     }
 }

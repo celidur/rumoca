@@ -64,7 +64,7 @@ mod static_assertions;
 mod tests;
 mod time_events;
 
-pub use binding_execution::FmiBindingProgram;
+pub use binding_execution::{FmiBindingProgram, SolveBindingExecution};
 pub use c_codegen::{FmiCCodegenError, FmiCCodegenView, FmiInstantiationBuffer};
 pub use co_simulation::{
     CoSimulationController, CoSimulationMethod, CoSimulationStepPlan, CoSimulationSubstep,
@@ -126,22 +126,6 @@ use crate::{
 use rumoca_core::Span;
 use std::collections::BTreeSet;
 use std::sync::Arc;
-
-/// Admits a lowered model to the C kernel as the generated C component does,
-/// without the checks of the component's own variables: its initial mode, its
-/// finite initial values sized to the layout, no recursive function group,
-/// typed functions within the C profile, and parameter bindings the kernel
-/// settles in dependency order. A model that fails one is refused with the
-/// component's reason.
-///
-/// Returns the dependency levels of the parameter bindings, as the component
-/// counts them: the simultaneous sweeps the runtime needs to settle them,
-/// plus one to observe that nothing changed.
-pub fn parameter_binding_levels(model: &SolveModel) -> Result<usize, &'static str> {
-    c_codegen::admit_kernel(model, None)
-        .map(|(_, levels)| levels)
-        .map_err(|error| error.0)
-}
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum FmiComponentError {
