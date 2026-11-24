@@ -658,7 +658,10 @@ extern "C" __global__ void {{ name }}_load_starts_batch(
 // launches at each static time event and whenever an event indicator of
 // `{{ name }}_event_indicators_batch` changes sign over a step.
 
-__device__ void {{ name }}_roots(double time, const double *batch_y, const double *batch_p, double *__roots)
+// The row functions below are called from several kernels and grow with the
+// model; like the refresh and the derivative rows they stay out of line, so
+// no kernel's compiled size is the sum of the rows it reaches.
+__device__ __noinline__ void {{ name }}_roots(double time, const double *batch_y, const double *batch_p, double *__roots)
 {
     (void)time;
     (void)batch_y;
@@ -667,7 +670,7 @@ __device__ void {{ name }}_roots(double time, const double *batch_y, const doubl
 {{ programs(ev.roots, out="__roots") }}
 }
 
-__device__ void {{ name }}_discrete_rows(double time, const double *batch_y, const double *batch_p, double *__values)
+__device__ __noinline__ void {{ name }}_discrete_rows(double time, const double *batch_y, const double *batch_p, double *__values)
 {
     (void)time;
     (void)batch_y;
@@ -824,7 +827,7 @@ extern "C" __global__ void {{ name }}_event_update_batch(
 #define {{ NAME }}_INIT_TOLERANCE 0.0
 #endif
 
-__device__ int {{ name }}_initial_projection(double time, double *batch_y, double *batch_p)
+__device__ __noinline__ int {{ name }}_initial_projection(double time, double *batch_y, double *batch_p)
 {
     ModelInstance *m = {{ name }}_lane_instances + RUMOCA_LANE_INDEX;
     rmc_lane_reset(m);
@@ -852,7 +855,7 @@ __device__ int {{ name }}_initial_projection(double time, double *batch_y, doubl
 // event. `status` (may be null) receives 0, or 1 when the initial event did
 // not settle.
 
-__device__ void {{ name }}_bindings(double time, double *batch_y, double *batch_p)
+__device__ __noinline__ void {{ name }}_bindings(double time, double *batch_y, double *batch_p)
 {
     (void)time;
     (void)batch_y;
@@ -917,7 +920,7 @@ extern "C" __global__ void {{ name }}_initialize_batch(
 #define {{ NAME }}_DELAY_HISTORY_STRIDE (2 + {{ NAME }}_DELAY_CAPACITY * (1 + {{ NAME }}_DELAYS))
 {%- if delays.count > 0 %}
 
-__device__ void {{ name }}_delay_sources(double time, const double *batch_y, const double *batch_p, double *__sources)
+__device__ __noinline__ void {{ name }}_delay_sources(double time, const double *batch_y, const double *batch_p, double *__sources)
 {
     (void)time;
     (void)batch_y;
@@ -925,7 +928,7 @@ __device__ void {{ name }}_delay_sources(double time, const double *batch_y, con
 {{ programs(delays.source, out="__sources") }}
 }
 
-__device__ void {{ name }}_delay_times(double time, const double *batch_y, const double *batch_p, double *__times)
+__device__ __noinline__ void {{ name }}_delay_times(double time, const double *batch_y, const double *batch_p, double *__times)
 {
     (void)time;
     (void)batch_y;
