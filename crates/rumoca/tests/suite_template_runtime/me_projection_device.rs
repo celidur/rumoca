@@ -9,9 +9,11 @@
 
 use std::sync::Arc;
 
-/// The device unit: the instance, a lane that settles no parameter binding,
-/// and the kernel.
-const DEVICE_UNIT: &str = r#"{%- from "fmi-me-projection.jinja" import device_instance, device_kernel -%}
+/// The device unit: the instance, the lane's parameter bindings as the
+/// kernel's `binding_updates` runs them over the model's
+/// `SolveBindingExecution` (no discrete equation settles with them: a lane
+/// target's initial event iteration does), and the kernel.
+const DEVICE_UNIT: &str = r#"{%- from "fmi-me-projection.jinja" import device_instance, device_kernel, binding_updates -%}
 #include <float.h>
 #include <math.h>
 #include <stdbool.h>
@@ -19,11 +21,8 @@ const DEVICE_UNIT: &str = r#"{%- from "fmi-me-projection.jinja" import device_in
 #include <stdint.h>
 #include <string.h>
 {{ device_instance(solve, me_refresh, "rmc") }}
-/* The lane's parameters are the values it was given. */
-static __device__ rmcStatus refresh_parameters(ModelInstance* m) { m->parameters_dirty = false; return rmcOK; }
-{%- if me_refresh.init.rows > 0 %}
-static __device__ int rmc_apply_updates(ModelInstance* m, bool initializing) { (void)m; (void)initializing; return 0; }
-{%- endif %}
+static __device__ rmcStatus update_discrete_equations(ModelInstance* m) { (void)m; return rmcOK; }
+{{ binding_updates(solve, me_bindings, "rmc", device=true) }}
 {{ real_extremum_prelude("cuda", true) }}
 {{ device_kernel(solve, me_refresh, "rmc") }}
 "#;
