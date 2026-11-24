@@ -36,9 +36,10 @@ pub(super) fn validate(
     )
     .map_err(|error| anyhow::anyhow!(error.to_string()))
     .context("Lower Solve IR for target capability validation")?;
-    // The lane view runs a staged refresh made of exact-assignment stages
-    // only (`solve_blocks.lanes.refresh`), so such a model needs no residual
-    // export; a refresh that retains a projection stage is still refused.
+    // The lane kernels run a staged refresh made of exact-assignment stages
+    // themselves (`solve_blocks.lanes.refresh`) and one that retains
+    // projection stages with the shared ME projection kernel, built per lane
+    // (SPEC_0044 ME-PROJ-001), so neither needs residual export.
     let problem = &lowered.model().problem;
     // A lane refreshes on the primary chart alone: no lane kernel switches
     // among the executable alternate charts of a reduced chart set (SPEC_0040
@@ -56,7 +57,8 @@ pub(super) fn validate(
     }
     let mut capabilities = capabilities.clone();
     if capabilities.exact_algebraic_assignments == Some(true)
-        && rumoca_phase_codegen::lane_refresh_admissible(problem)
+        && (rumoca_phase_codegen::lane_refresh_admissible(problem)
+            || rumoca_phase_codegen::me_refresh_admissible(problem))
     {
         capabilities.residual_equations = Some(true);
     }

@@ -161,8 +161,16 @@ fn build_solve_model_template_renderer(
     )
     .map_err(|err| CompilerError::TemplateError(CodegenError::template(err.to_string())))?;
     let prepared = lowered.prepared_dae();
-    SolveTemplateRenderer::new_owned_model_with_dae(Arc::new(lowered.model().clone()), prepared)
-        .map_err(CompilerError::TemplateError)
+    let model = Arc::new(lowered.model().clone());
+    // A refresh made of exact assignments needs no projection kernel; one
+    // that retains a projection stage is rendered with the ME refresh view,
+    // from which the target compiles the shared kernel per lane.
+    if rumoca_phase_codegen::lane_refresh_admissible(&model.problem) {
+        SolveTemplateRenderer::new_owned_model_with_dae(model, prepared)
+    } else {
+        SolveTemplateRenderer::new_owned_model_with_me_projection(model, prepared)
+    }
+    .map_err(CompilerError::TemplateError)
 }
 
 fn build_solve_template_renderer_without_dae(

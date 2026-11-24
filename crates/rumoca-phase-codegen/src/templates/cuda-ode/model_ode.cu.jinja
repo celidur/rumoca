@@ -1,4 +1,5 @@
 {%- from "cuda-typed-functions.jinja" import functions as typed_functions %}
+{%- from "fmi-me-projection.jinja" import device_instance, device_kernel %}
 {%- macro scalar_const(op) -%}
 {%- if op.value_class == "finite" -%}{{ op.value }}
 {%- elif op.value_class == "positive_infinity" -%}INFINITY
@@ -231,6 +232,10 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+{%- if me_refresh is defined and me_refresh.blocks | length > 0 %}
+#include <float.h>
+#include <stdbool.h>
+{%- endif %}
 #else
 typedef long long int64_t;
 typedef unsigned long long uint64_t;
@@ -248,11 +253,14 @@ typedef unsigned long long uint64_t;
 #endif
 {%- set lane_functions = solve_blocks.lanes.functions %}
 {%- set has_functions = lane_functions.table.owners | length > 0 %}
-{{ real_extremum_prelude("cuda", has_functions) }}
+{{ real_extremum_prelude("cuda", has_functions or (me_refresh is defined and me_refresh.blocks | length > 0)) }}
 {%- if has_functions %}
 // Typed pure functions the lane programs call (bodies with data-dependent
 // loops, which cannot be inlined into the scalar rows).
+// The shared projection kernel below carries its own bit-cast helper.
+#define rumoca_real64 rumoca_lane_real64
 {{ typed_functions(lane_functions.table, (model_name | default("model") | sanitize) ~ "_pure_") }}
+#undef rumoca_real64
 {%- endif %}
 {%- set name = model_name | default("model") | sanitize %}
 {%- set NAME = name | upper %}
@@ -266,7 +274,10 @@ typedef unsigned long long uint64_t;
 {%- set exact_refresh = alg_plan and alg_plan.output_count > 0 %}
 {%- set lanes = solve_blocks.lanes %}
 {%- set staged = (not exact_refresh) and solve.solve_layout.algebraic_scalar_count > 0 %}
-{%- set refresh = lanes.refresh if staged else none %}
+{#- A refresh that retains projection stages runs the shared ME projection
+    kernel, one instance per lane (SPEC_0044 ME-PROJ-001). -#}
+{%- set shared = me_refresh is defined and me_refresh.blocks | length > 0 %}
+{%- set refresh = lanes.refresh if staged and not shared else none %}
 {%- set ev = lanes.events %}
 {%- set delays = lanes.delays %}
 {%- set init = lanes.initialization %}
@@ -296,20 +307,91 @@ const double {{ name }}_time_events[{{ ev.time_events | length }}] = { {% for ti
 #endif
 {%- endif %}
 
+{%- if shared %}
+
+// ---------------------------------------------------------------------------
+// The shared Model-Exchange projection kernel, built for the device: the
+// staged refresh plans and block projection algorithms of the linked kernel.
+// Each lane owns one instance (its coordinate, its projection workspace and
+// its fallback counters) in a device buffer the host allocates:
+// {{ NAME }}_LANE_WORKSPACE_BYTES bytes per lane, attached once with
+// `{{ name }}_workspace_init_batch` before any other kernel is launched.
+// A lane calls only some of the kernel's entries.
+#if defined(__GNUC__) && !defined(__CUDACC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+#endif
+{{ device_instance(solve, me_refresh, "rmc") }}
+// The lane's parameters are the values it was given.
+static __device__ rmcStatus refresh_parameters(ModelInstance* m) { m->parameters_dirty = false; return rmcOK; }
+{%- if me_refresh.init.rows > 0 %}
+static __device__ int rmc_apply_updates(ModelInstance* m, bool initializing) { (void)m; (void)initializing; return 0; }
+{%- endif %}
+{{ device_kernel(solve, me_refresh, "rmc") }}
+#if defined(__GNUC__) && !defined(__CUDACC__)
+#pragma GCC diagnostic pop
+#endif
+#define {{ NAME }}_LANE_WORKSPACE_BYTES sizeof(ModelInstance)
+// The lane of the calling thread. Override with -D for another launch shape.
+#ifndef RUMOCA_LANE_INDEX
+#define RUMOCA_LANE_INDEX (blockIdx.x * blockDim.x + threadIdx.x)
+#endif
+__device__ ModelInstance *{{ name }}_lane_instances;
+
+// Attach the lane instances (host-allocated device memory) and start each
+// lane's projection workspace.
+extern "C" __global__ void {{ name }}_workspace_init_batch(void *instances, int batch_count)
+{
+    int batch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (batch == 0) {
+        {{ name }}_lane_instances = (ModelInstance *)instances;
+    }
+    if (batch < batch_count) {
+        ModelInstance *m = (ModelInstance *)instances + batch;
+        m->parameters_dirty = false;
+        m->rmc_nonfinite = false;
+        m->assertion_failed = false;
+        rmc_lane_reset(m);
+    }
+}
+{%- else %}
+#define {{ NAME }}_LANE_WORKSPACE_BYTES 0
+{%- endif %}
+
 // Algebraic refresh: settle every algebraic slot of one lane from its
-// states, parameters and time by the issued exact assignments, in checked
-// order.
-__device__ __noinline__ void {{ name }}_refresh(double time, double *batch_y, const double *batch_p)
+// states, parameters and time: the issued exact assignments in checked order,
+// or the staged refresh of the shared projection kernel from the lane's
+// current coordinate. Returns 0, or 1 when the refresh failed.
+__device__ __noinline__ int {{ name }}_refresh(double time, double *batch_y, const double *batch_p)
 {
     (void)time;
     (void)batch_y;
     (void)batch_p;
-{%- if exact_refresh %}
+{%- if shared %}
+    ModelInstance *m = {{ name }}_lane_instances + RUMOCA_LANE_INDEX;
+    m->time = time;
+    for (int i = 0; i < {{ y_len }}; ++i) {
+        m->y[i] = batch_y[i];
+    }
+    for (int i = 0; i < {{ p_len }}; ++i) {
+        m->p[i] = batch_p[i];
+    }
+    m->assertion_failed = false;
+    int failed = refresh_algebraics{{ "_plan" if me_refresh.seed_rule == "CommittedAcceptedPoint" else "" }}(m) != rmcOK || m->assertion_failed;
+    for (int i = 0; i < {{ y_len }}; ++i) {
+        batch_y[i] = m->y[i];
+    }
+    return failed;
+{%- elif exact_refresh %}
 {{ programs(alg, out="batch_y") }}
-{%- elif refresh %}
+    return 0;
+{%- else %}
+{%- if refresh %}
 {%- for step in refresh.steps %}
 {{ programs(step.rows, out="batch_y") }}
 {%- endfor %}
+{%- endif %}
+    return 0;
 {%- endif %}
 }
 
@@ -382,6 +464,10 @@ extern "C" __global__ void {{ name }}_init_state_batch(
 
 // The derivative of the states of every lane. Only the state slots of `y`
 // are read: the algebraic slots are settled on a per-thread copy first.
+{%- if shared %}
+// The shared kernel starts its projections from that copy, so the algebraic
+// slots of `y` are the integrator's warm start (SPEC_0044 ME-PROJ-005).
+{%- endif %}
 // A model with many algebraic slots needs a large thread stack for that copy
 // (cudaDeviceSetLimit(cudaLimitStackSize, ...)); `{{ name }}_rhs_batch`
 // settles them in place instead.
@@ -403,12 +489,12 @@ extern "C" __global__ void {{ name }}_derivative_rhs_batch(
     const double *batch_y_in = y + ((long long)batch * (long long)y_stride);
     const double *batch_p = p + ((long long)batch * (long long)p_stride);
     double *batch_out = out + ((long long)batch * (long long)out_stride);
-{%- if exact_refresh or refresh %}
+{%- if exact_refresh or refresh or shared %}
     double batch_y[{{ y_len }}];
     for (int i = 0; i < {{ y_len }}; ++i) {
         batch_y[i] = batch_y_in[i];
     }
-    {{ name }}_refresh(time, batch_y, batch_p);
+    (void){{ name }}_refresh(time, batch_y, batch_p);
 {%- else %}
     const double *batch_y = batch_y_in;
 {%- endif %}
@@ -417,8 +503,8 @@ extern "C" __global__ void {{ name }}_derivative_rhs_batch(
 
 // The derivative of every lane after settling its algebraic slots in place
 // in `y` (they are left there for observation). `status` (may be null)
-// receives, per lane, the number of non-finite derivatives: a failed function
-// call (a checked domain error) leaves NaN.
+// receives, per lane, 1 when the refresh failed plus the number of non-finite
+// derivatives: a failed function call (a checked domain error) leaves NaN.
 extern "C" __global__ void {{ name }}_rhs_batch(
     double time,
     double *y,
@@ -437,8 +523,7 @@ extern "C" __global__ void {{ name }}_rhs_batch(
     double *batch_y = y + ((long long)batch * (long long)y_stride);
     const double *batch_p = p + ((long long)batch * (long long)p_stride);
     double *batch_out = out + ((long long)batch * (long long)out_stride);
-    int failures = 0;
-    {{ name }}_refresh(time, batch_y, batch_p);
+    int failures = {{ name }}_refresh(time, batch_y, batch_p);
     {{ name }}_derivative_rows(time, batch_y, batch_p, batch_out);
     for (int i = 0; i < {{ state_count }}; ++i) {
         failures += !isfinite(batch_out[i]);
@@ -448,11 +533,13 @@ extern "C" __global__ void {{ name }}_rhs_batch(
     }
 }
 
-// Settle the algebraic slots of every lane in place.
+// Settle the algebraic slots of every lane in place. `status` (may be null)
+// receives, per lane, 1 when the refresh failed.
 extern "C" __global__ void {{ name }}_refresh_batch(
     double time,
     double *y,
     const double *p,
+    int *status,
     int y_stride,
     int p_stride,
     int batch_count)
@@ -463,7 +550,10 @@ extern "C" __global__ void {{ name }}_refresh_batch(
     }
     double *batch_y = y + ((long long)batch * (long long)y_stride);
     const double *batch_p = p + ((long long)batch * (long long)p_stride);
-    {{ name }}_refresh(time, batch_y, batch_p);
+    int failed = {{ name }}_refresh(time, batch_y, batch_p);
+    if (status) {
+        status[batch] = failed;
+    }
 }
 #ifndef RUMOCA_OMIT_INITIALIZATION
 
@@ -551,8 +641,9 @@ __device__ int {{ name }}_changes(double stored, double value)
 // One event iteration at `time`: settle the algebraic slots, re-encode every
 // relation memory from its root, apply the discrete equations, and repeat
 // until nothing changes; then advance the condition memories. Returns the
-// number of passes, or -1 when the iteration did not settle or a root is not
-// finite (the runtime refuses a non-finite root condition).
+// number of passes, or -1 when the iteration did not settle, a refresh
+// failed or a root is not finite (the runtime refuses a non-finite root
+// condition).
 __device__ int {{ name }}_event_iterate(double time, double *batch_y, double *batch_p)
 {
     double roots[{{ [ev.root_count, 1] | max }}];
@@ -568,7 +659,9 @@ __device__ int {{ name }}_event_iterate(double time, double *batch_y, double *ba
     int passes = 0;
     int settled = 0;
     for (; passes < {{ NAME }}_EVENT_MAX_PASSES && !settled; ++passes) {
-        {{ name }}_refresh(time, batch_y, batch_p);
+        if ({{ name }}_refresh(time, batch_y, batch_p)) {
+            return -1;
+        }
         int changed = 0;
 {%- if nroots > 0 %}
         {{ name }}_roots(time, batch_y, batch_p, roots);
@@ -601,8 +694,8 @@ __device__ int {{ name }}_event_iterate(double time, double *batch_y, double *ba
     }
     // A settled pass changed nothing after its own refresh, so the slots are
     // settled already; refresh again only after the last unsettled pass.
-    if (!settled) {
-        {{ name }}_refresh(time, batch_y, batch_p);
+    if (!settled && {{ name }}_refresh(time, batch_y, batch_p)) {
+        return -1;
     }
 {%- if ev.discrete_count > 0 %}
     {{ name }}_discrete_rows(time, batch_y, batch_p, values);
@@ -636,7 +729,7 @@ extern "C" __global__ void {{ name }}_event_indicators_batch(
     const double *batch_p = p + ((long long)batch * (long long)p_stride);
     double *batch_z = z + ((long long)batch * (long long)z_stride);
     (void)batch_z;
-    {{ name }}_refresh(time, batch_y, batch_p);
+    (void){{ name }}_refresh(time, batch_y, batch_p);
 {%- if nroots > 0 %}
     double roots[{{ [ev.root_count, 1] | max }}];
     {{ name }}_roots(time, batch_y, batch_p, roots);
@@ -660,8 +753,8 @@ extern "C" __global__ void {{ name }}_event_indicators_batch(
 
 // Handle an event at `time` for every lane (static time event or located
 // state event): see `{{ name }}_event_iterate`. `passes` (may be null)
-// receives the passes taken, or -1 when the iteration did not settle or a
-// root is not finite.
+// receives the passes taken, or -1 when the iteration did not settle, a
+// refresh failed or a root is not finite.
 extern "C" __global__ void {{ name }}_event_update_batch(
     double time,
     double *y,
@@ -688,7 +781,8 @@ extern "C" __global__ void {{ name }}_event_update_batch(
 // Initialization (MLS 8.6): parameter and start bindings, the algebraic
 // refresh, and the initial event. Launch after `{{ name }}_load_starts_batch`
 // (and after overriding any parameter) at the start time. `status` (may be
-// null) receives 0, or 1 when the initial event did not settle.
+// null) receives 0, or 1 when the initial event did not settle or a refresh
+// failed.
 
 __device__ void {{ name }}_bindings(double time, double *batch_y, double *batch_p)
 {
@@ -726,7 +820,7 @@ extern "C" __global__ void {{ name }}_initialize_batch(
 {%- if ev.initial_flag is not none %}
     batch_p[{{ ev.initial_flag }}] = 0.0;
 {%- endif %}
-    {{ name }}_refresh(time, batch_y, batch_p);
+    unsettled |= {{ name }}_refresh(time, batch_y, batch_p);
     if (status) {
         status[batch] = unsettled;
     }
@@ -879,14 +973,31 @@ __device__ int {{ name }}_delay_reads_current(const double *history, double time
 }
 
 // The lane's coordinate with its algebraic slots settled, for the delay rows
-// that read them: `scratch` holds a settled copy of `batch_y`.
+// that read them: {% if shared %}the coordinate of the lane's kernel instance
+// after its refresh (`scratch` is unused){% else %}`scratch` holds a settled
+// copy of `batch_y`{% endif %}.
 __device__ const double *{{ name }}_delay_settle(double time, const double *batch_y, const double *batch_p, double *scratch)
 {
+{%- if shared %}
+    (void)scratch;
+    ModelInstance *m = {{ name }}_lane_instances + RUMOCA_LANE_INDEX;
+    m->time = time;
+    for (int i = 0; i < {{ y_len }}; ++i) {
+        m->y[i] = batch_y[i];
+    }
+    for (int i = 0; i < {{ p_len }}; ++i) {
+        m->p[i] = batch_p[i];
+    }
+    m->assertion_failed = false;
+    (void)refresh_algebraics{{ "_plan" if me_refresh.seed_rule == "CommittedAcceptedPoint" else "" }}(m);
+    return m->y;
+{%- else %}
     for (int i = 0; i < {{ y_len }}; ++i) {
         scratch[i] = batch_y[i];
     }
     (void){{ name }}_refresh(time, scratch, batch_p);
     return scratch;
+{%- endif %}
 }
 
 __device__ void {{ name }}_delay_append(double *history, double time, const double *sources)
@@ -942,7 +1053,7 @@ extern "C" __global__ void {{ name }}_delay_init_batch(
     // The delayed values feed the rows their sources read: settle the
     // start-time fixed point a few times.
     for (int pass = 0; pass < 4; ++pass) {
-        {{ name }}_refresh(time, batch_y, batch_p);
+        (void){{ name }}_refresh(time, batch_y, batch_p);
         {{ name }}_delay_sources(time, batch_y, batch_p, sources);
         int changed = 0;
         for (int channel = 0; channel < {{ delays.count }}; ++channel) {
@@ -953,7 +1064,7 @@ extern "C" __global__ void {{ name }}_delay_init_batch(
             break;
         }
     }
-    {{ name }}_refresh(time, batch_y, batch_p);
+    (void){{ name }}_refresh(time, batch_y, batch_p);
     {{ name }}_delay_sources(time, batch_y, batch_p, sources);
     {{ name }}_delay_append(batch_history, time, sources);
 {%- endif %}
@@ -991,7 +1102,9 @@ extern "C" __global__ void {{ name }}_delay_apply_batch(
     // Rows that read algebraic slots read them settled; the sources are read
     // only when a channel needs its current value.
     const double *view = batch_y;
-{%- if delays.settle_times or delays.settle_sources %}
+{%- if (delays.settle_times or delays.settle_sources) and shared %}
+    double *scratch = 0;
+{%- elif delays.settle_times or delays.settle_sources %}
     double scratch[{{ [y_len, 1] | max }}];
 {%- endif %}
 {%- if delays.settle_times %}
@@ -1046,7 +1159,7 @@ extern "C" __global__ void {{ name }}_delay_commit_batch(
     (void)batch_history;
 {%- if delays.count > 0 %}
     double sources[{{ delays.count }}];
-    {{ name }}_refresh(time, batch_y, batch_p);
+    (void){{ name }}_refresh(time, batch_y, batch_p);
     {{ name }}_delay_sources(time, batch_y, batch_p, sources);
     {{ name }}_delay_append(batch_history, time, sources);
 {%- endif %}
