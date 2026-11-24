@@ -37,6 +37,7 @@ mod fold_render_tests;
 mod galec_golden_tests;
 #[cfg(test)]
 mod galec_manifest_template_tests;
+mod lane_execution;
 mod lazy_scalar_projection;
 mod me_projection;
 mod native_fmi_renderer;
@@ -94,7 +95,7 @@ use symbol_alloc::{
     symbol_function,
 };
 
-pub use me_projection::me_refresh_admissible;
+pub use me_projection::{lane_refresh_admissible, me_refresh_admissible};
 pub use solve_lazy::{
     explicit_algebraic_assignment_complete, explicit_algebraic_assignment_complete_with_calls,
     explicit_initialization_renderable_with_calls,
@@ -320,6 +321,10 @@ fn solve_template_blocks_value(
             Some(block) => solve_template_compute_block_json(&block)?,
             None => Value::from(()),
         },
+        // Per-lane execution view (staged algebraic refresh with projection
+        // blocks, events, delays, initialization) for batched targets that
+        // run one model instance per thread. Built on first read.
+        lanes => lane_execution::LaneBlocks::value(handle.clone()),
         artifacts => minijinja::context! {
             continuous => minijinja::context! {
                 implicit_jacobian_v => solve_template_compute_block_json(&artifacts.continuous.implicit_jacobian_v)?,
