@@ -226,13 +226,17 @@
 // own capability and differential evidence before this target may advertise
 // them.
 
+{#- The shared projection kernel is compiled into the unit when the refresh
+    retains projection stages, the initialization has residual rows, or the
+    model retains a state manifold. -#}
+{%- set kernel_unit = me_refresh is defined and (me_refresh.blocks | length > 0 or me_refresh.init.rows > 0 or solve_blocks.state_manifold.blocks | length > 0) %}
 // NVRTC (runtime compilation) provides the math builtins but no libc headers.
 #ifndef __CUDACC_RTC__
 #include <math.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
-{%- if me_refresh is defined and me_refresh.blocks | length > 0 %}
+{%- if kernel_unit %}
 #include <float.h>
 #include <stdbool.h>
 {%- endif %}
@@ -247,7 +251,7 @@
 #endif
 {%- set lane_functions = solve_blocks.lanes.functions %}
 {%- set has_functions = lane_functions.table.owners | length > 0 %}
-{{ real_extremum_prelude("cuda", has_functions or (me_refresh is defined and me_refresh.blocks | length > 0)) }}
+{{ real_extremum_prelude("cuda", has_functions or kernel_unit) }}
 {%- if has_functions %}
 // Typed pure functions the lane programs call (bodies with data-dependent
 // loops, which cannot be inlined into the scalar rows).
@@ -278,9 +282,8 @@
 {%- set shared_init = me_refresh is defined and me_refresh.init.rows > 0 %}
 {#- A retained state manifold is projected by the shared kernel after each
     accepted step (`rmc_project_state_manifold`). -#}
-{%- set manifold = solve_blocks.state_manifold if me_refresh is defined else none %}
-{%- set manifold = manifold if manifold and manifold.blocks | length > 0 else none %}
-{%- set kernel = shared or shared_init or manifold %}
+{%- set manifold = solve_blocks.state_manifold if kernel_unit and solve_blocks.state_manifold.blocks | length > 0 else none %}
+{%- set kernel = kernel_unit %}
 {%- set refresh = lanes.refresh if staged and not shared else none %}
 {%- set ev = lanes.events %}
 {%- set delays = lanes.delays %}
