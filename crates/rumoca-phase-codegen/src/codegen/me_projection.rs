@@ -16,6 +16,7 @@ mod chart;
 mod initial;
 #[cfg(test)]
 mod lane_render_tests;
+mod manifold;
 mod source;
 mod table;
 #[cfg(test)]
@@ -32,6 +33,7 @@ use rumoca_ir_solve as solve;
 use crate::errors::CodegenError;
 use assign::AssignmentCatalog;
 use block::{BlockRecord, BlockSources, block_record};
+pub(super) use manifold::StateManifoldBlocks;
 pub(crate) use source::RefreshSource;
 use table::ProgramTable;
 
@@ -113,15 +115,22 @@ fn algebraic_refresh_covers(
     (state_count..state_count + algebraic_count).all(|index| settled.contains(&index))
 }
 
-/// The runtime projection shapes the shared kernel does not execute: a block
+/// The runtime projection shapes the shared refresh does not execute: a block
 /// with alternate reduced charts (the first-integral mirrors the linked kernel
-/// selects per block) and a retained state-manifold projection (the linked
-/// kernel projects accepted states onto lower-order constraints). A model
-/// carrying either is refused rather than integrated on one chart or without
-/// the manifold correction. A reduced chart set with executable alternates is
+/// selects per block) and, unless the target projects onto it itself, a
+/// retained state-manifold projection (the linked kernel projects accepted
+/// states onto lower-order constraints). A model carrying either is refused
+/// rather than integrated on one chart or without the manifold correction. A
+/// target that runs `manifold_kernel` after each accepted step
+/// (`state_manifold`) carries that correction; the C FMI components never do,
+/// since FMI 3 Model Exchange has no call that moves the continuous states at
+/// an accepted point. A reduced chart set with executable alternates is
 /// executed: the generated kernel switches among its charts exactly as the
 /// linked kernel does (SPEC_0040 STRUCT-T07 constraint-fold chart rows).
-fn unsupported_runtime_shape(problem: &solve::SolveProblem) -> Option<&'static str> {
+fn unsupported_runtime_shape(
+    problem: &solve::SolveProblem,
+    state_manifold: bool,
+) -> Option<&'static str> {
     let continuous = &problem.continuous;
     if continuous
         .algebraic_projection_plan
@@ -132,7 +141,7 @@ fn unsupported_runtime_shape(problem: &solve::SolveProblem) -> Option<&'static s
     {
         return Some("a projection block carries alternate reduced charts");
     }
-    if !continuous.manifold_projection_plan.is_empty() {
+    if !state_manifold && !continuous.manifold_projection_plan.is_empty() {
         return Some("the model retains a state-manifold projection");
     }
     None
@@ -157,10 +166,22 @@ fn refresh_plans_admissible(problem: &solve::SolveProblem) -> bool {
 /// every executable alternate chart.
 #[must_use]
 pub fn me_refresh_admissible(problem: &solve::SolveProblem) -> bool {
+    refresh_admissible(problem, false)
+}
+
+/// [`me_refresh_admissible`] for a target that also projects its accepted
+/// states onto the retained state manifold with `manifold_kernel`, as the
+/// linked kernel does: a retained manifold no longer refuses the refresh.
+#[must_use]
+pub fn me_refresh_admissible_with_state_manifold(problem: &solve::SolveProblem) -> bool {
+    refresh_admissible(problem, true)
+}
+
+fn refresh_admissible(problem: &solve::SolveProblem, state_manifold: bool) -> bool {
     if problem.validate().is_err() {
         return false;
     }
-    if unsupported_runtime_shape(problem).is_some() {
+    if unsupported_runtime_shape(problem, state_manifold).is_some() {
         return false;
     }
     refresh_plans_admissible(problem)
@@ -507,7 +528,7 @@ pub(super) fn me_refresh_value(component: &impl RefreshSource) -> Result<Value, 
     let problem = component.problem();
     let artifacts = component.artifacts();
     require_settleable_bindings(component)?;
-    if let Some(reason) = unsupported_runtime_shape(problem) {
+    if let Some(reason) = unsupported_runtime_shape(problem, component.projects_state_manifold()) {
         return Err(CodegenError::dae_preparation_failed(
             format!("unsupported-feature:algebraic_projection: {reason}"),
             None,
@@ -583,7 +604,7 @@ pub(super) fn me_refresh_value(component: &impl RefreshSource) -> Result<Value, 
         init_doubles,
         switching.then_some(&switch_records),
     );
-    let sizes = block_sizes + init_sizes;
+    let (doubles, sizes) = with_manifold_arena(component, (doubles, block_sizes + init_sizes))?;
     Ok(minijinja::context! {
         derivative => charts[0].get_attr("derivative")?,
         algebraic => charts[0].get_attr("algebraic")?,
@@ -602,6 +623,21 @@ pub(super) fn me_refresh_value(component: &impl RefreshSource) -> Result<Value, 
         policy => policy_value(),
         seed_rule => importer_seed_rule(problem),
     })
+}
+
+/// The arena `(doubles, sizes)` of a refresh view: the refresh's own, or for a
+/// source whose target also projects onto the retained state manifold, the
+/// larger of the two, since that projection runs after an accepted step,
+/// outside every refresh frame.
+fn with_manifold_arena(
+    component: &impl RefreshSource,
+    (doubles, sizes): (usize, usize),
+) -> Result<(usize, usize), CodegenError> {
+    if !component.projects_state_manifold() {
+        return Ok((doubles, sizes));
+    }
+    let (manifold_doubles, manifold_sizes) = manifold::manifold_work(component.problem())?;
+    Ok((doubles.max(manifold_doubles), sizes.max(manifold_sizes)))
 }
 
 /// The projection arena's doubles. The algebraic refresh takes its incoming
@@ -705,7 +741,7 @@ pub(super) fn exact_algebraic_assignments_value(
     problem: &solve::SolveProblem,
 ) -> Result<minijinja::Value, crate::errors::CodegenError> {
     if !super::solve_lazy::explicit_algebraic_assignment_complete(problem)
-        || unsupported_runtime_shape(problem).is_some()
+        || unsupported_runtime_shape(problem, false).is_some()
     {
         return Ok(minijinja::Value::from(()));
     }
