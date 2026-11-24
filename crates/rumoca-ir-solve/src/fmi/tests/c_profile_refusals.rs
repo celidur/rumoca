@@ -126,16 +126,25 @@ fn homotopy_initialization_is_refused() {
     );
 }
 
+/// An initialization residual beside a delay: `delay(u, ...) = u` while
+/// initializing (MLS §3.7.2), so the shared kernel's initialization admits it
+/// for a Solve target, and the FMI C profile still refuses the delay itself
+/// as a runtime event.
 #[test]
-fn delay_histories_in_initialization_are_refused() {
+fn delays_in_initialization_are_refused_only_as_runtime_events() {
+    let with_delay = |model: &mut SolveModel| {
+        one_initial_row(model, SETTLED);
+        let (delayed, _) = super::max_step_duration_local::delay_bearing_model_with_one_run();
+        model.problem.events.delays = delayed.problem.events.delays;
+    };
     assert_refused(
-        "C initialization cannot synchronize delay histories",
-        |model| {
-            one_initial_row(model, SETTLED);
-            let (delayed, _) = super::max_step_duration_local::delay_bearing_model_with_one_run();
-            model.problem.events.delays = delayed.problem.events.delays;
-        },
+        "the C profile cannot execute delays or terminal events",
+        with_delay,
     );
+    let (mut model, _) = super::max_step_duration_local::delay_bearing_model_with_one_run();
+    with_delay(&mut model);
+    crate::fmi::SolveBindingExecution::checked(&model)
+        .expect("the shared initialization holds each delayed value at its source");
 }
 
 #[test]
