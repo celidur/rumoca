@@ -1,11 +1,11 @@
 version = 1
 ir = "solve"
 name = "cuda-ode"
-description = "Batched CUDA C explicit-ODE right-hand-side evaluator from checked Solve IR"
+description = "Batched CUDA C hybrid-ODE model kernels (events, delays, initialization) from checked Solve IR"
 execution_mode = "compiled"
 deployment_class = "gpu"
 readiness_level = 1
-completion_message = """CUDA ODE right-hand-side source written to: {{ out_dir }}
+completion_message = """CUDA model kernels written to: {{ out_dir }}
 Compile: nvcc -c {{ out_dir }}/{{ model_name }}_ode.cu"""
 
 [capabilities]
@@ -20,9 +20,13 @@ scalar_fallback = true
 external_functions = false
 external_tables = false
 random = false
-initialization = false
-events = false
-runtime_events = false
+# `<model>_initialize_batch`: bindings and the initial event.
+initialization = true
+# Relation memories, event indicators and event iteration per lane; the host
+# integrator locates events and stops at the static time events.
+events = true
+# `delay()` through per-lane history ring buffers.
+runtime_events = true
 clocks = false
 dynamic_ranges = false
 dynamic_derivative_subscripts = false
@@ -45,3 +49,7 @@ dtypes = ["f64"]
 [[files]]
 path = "{{ model_name }}_ode.cu"
 template = "model_ode.cu.jinja"
+
+[[partials]]
+template = "typed_functions.jinja"
+name = "cuda-typed-functions.jinja"
