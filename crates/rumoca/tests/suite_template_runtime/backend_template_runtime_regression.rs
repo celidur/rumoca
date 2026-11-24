@@ -1,7 +1,9 @@
 #[cfg(feature = "fmu-packaging")]
 mod cuda_device_projection;
+mod cuda_ode_lane_kernels;
 mod jax_compact_stencils;
 mod jax_lazy_conditionals;
+mod lane_target_renderer;
 mod selected_regions;
 
 use rumoca::Compiler;
