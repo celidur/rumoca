@@ -51,7 +51,11 @@ and integration (including event location and stopping at time events).
   `<MODEL>_INIT_TOLERANCE` can be overridden with `-D`). The shared kernel
   admits the initial equations of the C profile: rows evaluated on the
   settled algebraic refresh, and rows over state and parameter seeds that
-  read no continuous algebraic.
+  read no continuous algebraic. A delayed value equals its source while
+  initializing (`delay(u, ...) = u`, MLS §3.7.2): `rmc_initialize` holds it
+  there before each pass and refreshes it after the projection, and
+  `<model>_delay_init_batch` then starts the history from the initialized
+  lane.
 - Functions: pure-function bodies that cannot be inlined (data-dependent
   loops, such as table interpolation or sorting) are emitted as typed
   `__device__` functions. A failed error-level assertion inside one fails
@@ -67,10 +71,9 @@ and integration (including event location and stopping at time events).
 
 This is not an NVRTC executor, an FMU, or a full simulator: there is no
 integrator. Initial equations outside the C initialization profile (a row
-reading an algebraic without a settled row role, homotopy, delays during
-initialization), a retained state-manifold projection, a reduced chart set
-with alternate charts, error-level model assertions, linear-solve tensor ops,
-clocks, external
+reading an algebraic without a settled row role, homotopy), a retained
+state-manifold projection, a reduced chart set with alternate charts,
+error-level model assertions, linear-solve tensor ops, clocks, external
 functions, callbacks, and unsupported operations fail before source is
 written. No GPU availability
 is inferred from successful source generation.

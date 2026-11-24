@@ -1383,6 +1383,24 @@ pub struct SolveDelayPartition {
     pub source_is_discrete: Vec<bool>,
 }
 
+impl SolveDelayPartition {
+    /// Whether a channel's source, delay time or maximum delay reads a solver
+    /// coordinate in `state_count..y_len`: an algebraic or output the
+    /// continuous equations determine. While initializing, a delayed value is
+    /// its source (MLS 3.6 §3.7.2) at the coordinate the continuous equations
+    /// settle (§8.6), so such a read needs the algebraic refresh first rather
+    /// than the stored seed.
+    #[must_use]
+    pub fn reads_solver_slots_from(&self, state_count: usize, y_len: usize) -> bool {
+        let slots = (state_count..y_len).collect::<std::collections::BTreeSet<_>>();
+        !slots.is_empty()
+            && [&self.source_rhs, &self.delay_time_rhs, &self.delay_max_rhs]
+                .into_iter()
+                .flat_map(|block| block.programs().iter().flatten())
+                .any(|op| op.reads_y_index_in(&slots))
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub enum RootZeroDomain {
     Positive,
