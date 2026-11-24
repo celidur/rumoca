@@ -209,3 +209,106 @@ mod isolation_slices {
         assert!(slices.iter().flatten().all(|slice| slice.len() == 21));
     }
 }
+
+/// A device build runs a long sequence of whole programs as out-of-line runs
+/// of at most the device bound in operations, called in order; a program past
+/// the bound forms a run of its own.
+#[test]
+fn a_device_program_sequence_runs_in_bounded_out_of_line_runs() {
+    let program = |ops: usize| {
+        minijinja::context! {
+            temporary_count => 1,
+            ops => vec![minijinja::context! { kind => "Move", dst => 0, src => 0 }; ops],
+        }
+    };
+    let half = super::DEVICE_CHUNK_MAX_OPS / 2;
+    let programs = vec![
+        program(half),
+        program(half),
+        program(1),
+        program(super::DEVICE_CHUNK_MAX_OPS + 1),
+        program(1),
+    ];
+    let mut environment = crate::codegen::create_environment();
+    environment
+        .add_template(
+            "runs.cu",
+            r#"{%- from "fmi-me-projection.jinja" import device_runs, program_block -%}
+{%- call(program) device_runs("rmc_seq", programs, "ModelInstance* m, double* o", "m, o", "(void)m; (void)o;") %}
+{{- program_block(program, "o") }}
+{%- endcall %}"#,
+        )
+        .expect("the runs template parses");
+    let rendered = environment
+        .get_template("runs.cu")
+        .expect("the runs template")
+        .render(minijinja::context! { programs => programs })
+        .expect("render the program sequence");
+    for run in 0..4 {
+        assert!(
+            rendered.contains(&format!(
+                "static __device__ RMC_NOINLINE int rmc_seq_k{run}(ModelInstance* m, double* o) {{"
+            )),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("    if (rmc_seq_k{run}(m, o) != 0) return -1;")),
+            "{rendered}"
+        );
+    }
+    assert!(!rendered.contains("rmc_seq_k4"), "{rendered}");
+    assert!(
+        rendered.contains("static __device__ int rmc_seq(ModelInstance* m, double* o) {"),
+        "{rendered}"
+    );
+    let run = |k: usize| {
+        let start = rendered
+            .find(&format!("rmc_seq_k{k}(ModelInstance"))
+            .expect("the run");
+        let end = rendered[start..].find("    return 0;\n}").expect("its end") + start;
+        rendered[start..end].matches("double r[").count()
+    };
+    assert_eq!(
+        [run(0), run(1), run(2), run(3)],
+        [2, 1, 1, 1],
+        "the two halves fill one run, and the program past the bound stands alone between its neighbours"
+    );
+}
+
+/// A device dispatcher of more programs than one group selects an
+/// out-of-line group of consecutive programs; the host dispatcher is the one
+/// switch over every program.
+#[test]
+fn a_device_dispatcher_selects_out_of_line_program_groups() {
+    let group = super::DEVICE_CHUNK_MAX_OPS / super::INLINE_PROGRAM_MAX_OPS;
+    let mut environment = crate::codegen::create_environment();
+    environment
+        .add_template(
+            "dispatch.c",
+            r#"{%- from "fmi-me-projection.jinja" import dispatcher -%}
+{{ dispatcher("static __device__" if device else "RMC_API", "row", count, "size_t program, ModelInstance* m, double* out", "m, out", device) }}"#,
+        )
+        .expect("the dispatcher template parses");
+    let render = |device: bool| {
+        environment
+            .get_template("dispatch.c")
+            .expect("the dispatcher template")
+            .render(minijinja::context! { count => group + 1, device => device })
+            .expect("render the dispatcher")
+    };
+    let host = render(false);
+    assert!(
+        host.starts_with("RMC_API int rmc_row_call(size_t program, ModelInstance* m, double* out) {\n    switch (program) {\n    case 0: return rmc_row_p0(m, out);"),
+        "{host}"
+    );
+    assert!(!host.contains("_g0"), "{host}");
+    let device = render(true);
+    assert!(
+        device.contains("static __device__ RMC_NOINLINE int rmc_row_call(size_t program, ModelInstance* m, double* out) {")
+            && device.contains(&format!("    switch (program / {group}) {{"))
+            && device.contains("    case 1: return rmc_row_call_g1(program, m, out);")
+            && device.contains(&format!("    case {group}: return rmc_row_p{group}(m, out);"))
+            && !device.contains("rmc_row_call_g2"),
+        "{device}"
+    );
+}
