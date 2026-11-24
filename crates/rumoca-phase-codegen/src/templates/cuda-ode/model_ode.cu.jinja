@@ -597,7 +597,11 @@ __device__ int {{ name }}_event_iterate(double time, double *batch_y, double *ba
 {%- endif %}
         settled = !changed;
     }
-    {{ name }}_refresh(time, batch_y, batch_p);
+    // A settled pass changed nothing after its own refresh, so the slots are
+    // settled already; refresh again only after the last unsettled pass.
+    if (!settled) {
+        {{ name }}_refresh(time, batch_y, batch_p);
+    }
 {%- if ev.discrete_count > 0 %}
     {{ name }}_discrete_rows(time, batch_y, batch_p, values);
 {%- for target in ev.discrete_targets %}
