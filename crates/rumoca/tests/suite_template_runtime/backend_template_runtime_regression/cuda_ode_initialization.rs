@@ -1,7 +1,8 @@
 //! cuda-ode initializes each lane through the shared ME projection kernel
 //! (`rmc_initialize`, MLS §8.6): initial equations solved for a state and a
 //! `fixed = false` parameter, from each lane's own parameter values, through
-//! the settled algebraic refresh or over the state seeds themselves.
+//! the settled algebraic refresh or over the state seeds themselves, with a
+//! delayed value equal to its source while initializing (MLS §3.7.2).
 
 use super::{rendered_model_target, run_checked};
 use rumoca::Compiler;
@@ -25,8 +26,31 @@ equation
 end LaneInit;
 "#;
 
-/// CPU emulation of two lanes, included after the generated kernel: lane 1
-/// overrides `g` before initializing.
+/// The same initialization through a delay: `delay(2 * x, 0.1) = 2 * x`
+/// while initializing, so the second initial equation solves
+/// `k^3 + k + 2 x = g` for `k`.
+const LANE_INIT_DELAY: &str = r#"
+model LaneInitDelay
+  parameter Real g = 3.25;
+  parameter Real k(fixed = false, start = 1);
+  Real x(start = 0.5);
+  Real y;
+  Real w;
+  Real d;
+initial equation
+  y = 2;
+  w = g;
+equation
+  y = x + x * x * x;
+  d = delay(2 * x, 0.1);
+  w = k * k * k + k + d;
+  der(x) = -k * x;
+end LaneInitDelay;
+"#;
+
+/// CPU emulation of two lanes of model `LaneInit`, included after the
+/// generated kernel: lane 1 overrides `g` before initializing, and each lane
+/// checks `k^3 + k + DELAYED * x = g`.
 const HARNESS: &str = r#"
 static int slot(const char *name) {
     for (int i = 0; i < LANEINIT_Y_LEN; ++i) {
@@ -65,7 +89,7 @@ int main() {
         // der(x) = -k * x, so the solved parameter is -der(x) / x.
         const double kk = -out[k * LANEINIT_STATE_COUNT] / xk;
         if (status[k] != 0 || std::fabs(xk + xk * xk * xk - 2.0) > 1e-9
-            || std::fabs(kk * kk * kk + kk - gains[k]) > 1e-9 * gains[k]) {
+            || std::fabs(kk * kk * kk + kk + DELAYED * xk - gains[k]) > 1e-9 * gains[k]) {
             std::printf("lane %d: status %d, x %.17g, k %.17g\n", k, status[k], xk, kk);
             return 1;
         }
@@ -77,10 +101,10 @@ int main() {
 
 /// Render `model` for cuda-ode, check that it initializes through the shared
 /// kernel, and run `harness` (included after the kernel) in CPU emulation.
-fn run_lane_harness(source: &str, model: &str, harness: &str) {
+fn run_lane_harness(model_source: &str, model: &str, harness: &str) {
     let compiled = Compiler::new()
         .model(model)
-        .compile_str(source, &format!("{model}.mo"))
+        .compile_str(model_source, &format!("{model}.mo"))
         .expect("the compiler accepts the model");
     let (directory, files) = rendered_model_target(&compiled, model, "cuda-ode");
     let source = files
@@ -91,6 +115,11 @@ fn run_lane_harness(source: &str, model: &str, harness: &str) {
     assert!(
         source.content.contains(&call),
         "the lanes must initialize through the shared kernel"
+    );
+    assert_eq!(
+        source.content.contains("rmc_init_delays(m)"),
+        model_source.contains("delay("),
+        "the initialization refreshes delayed values exactly when the model has a delay"
     );
     let path = directory.path().join("lane_init.cpp");
     let prelude = "#include <cmath>\n#include <cstdio>\n#include <cstdlib>\n#include <cstring>\n\
@@ -119,7 +148,16 @@ fn run_lane_harness(source: &str, model: &str, harness: &str) {
 
 #[test]
 fn cuda_ode_lanes_solve_their_initial_equations_with_the_shared_kernel() {
-    run_lane_harness(LANE_INIT, "LaneInit", HARNESS);
+    run_lane_harness(LANE_INIT, "LaneInit", &HARNESS.replace("DELAYED", "0.0"));
+}
+
+#[test]
+fn cuda_ode_lanes_initialize_a_delay_at_its_source() {
+    let harness = HARNESS
+        .replace("LaneInit_", "LaneInitDelay_")
+        .replace("LANEINIT_", "LANEINITDELAY_")
+        .replace("DELAYED", "2.0");
+    run_lane_harness(LANE_INIT_DELAY, "LaneInitDelay", &harness);
 }
 
 /// Initial equations over state seeds alone: the affine row settles through
