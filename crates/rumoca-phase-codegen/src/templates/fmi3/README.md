@@ -49,10 +49,14 @@ in dependency order, and export as calculated parameters. Changing an
 independent tunable parameter recomputes these bindings before checking
 assertions or reading outputs. An initialization residual runs the runtime's
 settled initialization (bindings and the initialization projection alternate
-until the bindings stop changing, each residual row evaluated after the
-algebraic refresh) through the shared projection kernel at the FMI tolerance.
-Initialization rows over declaration seeds, homotopy continuation, delay
-histories, and retained state-manifold rows are refused.
+until the bindings stop changing) through the shared projection kernel at the
+FMI tolerance. When a row role reads a reconstructed algebraic, each residual
+row is evaluated after the algebraic refresh; rows that read no continuous
+algebraic (over state and parameter seeds) are evaluated on the instance
+coordinates, with each one-row block's isolation of its unknown and the
+residual's partial forward Jacobian, as the runtime does. A row reading an
+algebraic without such a role, homotopy continuation, delay histories, and
+retained state-manifold rows are refused.
 
 The current profile executes state, input, and time events and periodic clocks
 through the event iteration of SPEC_0044 ME-EVENT-002 and rejects dynamic time
