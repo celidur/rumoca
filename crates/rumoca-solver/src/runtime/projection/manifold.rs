@@ -18,6 +18,7 @@ use nalgebra::DMatrix;
 use super::BlockJacobian;
 #[cfg(test)]
 use rumoca_eval_solve::dense_basis::DenseStageMatrix;
+use rumoca_eval_solve::projection_policy::MANIFOLD_PROJECTION_MAX_ITERS;
 use rumoca_ir_solve as solve;
 
 use super::{
@@ -25,8 +26,6 @@ use super::{
     jacobian_row_scales, next_scaled_backtrack, scaled_newton_delta, scaled_residual_converged,
     scaled_residual_norm,
 };
-
-const MANIFOLD_PROJECTION_MAX_ITERS: usize = 16;
 
 /// Runtime view of lower-order constraints retained by structural index
 /// reduction.
