@@ -29,7 +29,7 @@
 {%- macro observation_wrapper(owner, device=false) -%}
 {% set predicates = owner.outputs|selectattr("role.kind", "equalto", "assertion_predicate")|list -%}
 {% if predicates|length > 0 -%}
-{{ "RMC_UNUSED static __device__" if device else "RMC_API" }} int rumoca_scalar_observe_{{ owner.id }}(const double* const in[], double* out, const RmcAssertionObserver* observer) {
+{{ "RMC_UNUSED static __device__ RMC_NOINLINE" if device else "RMC_API" }} int rumoca_scalar_observe_{{ owner.id }}(const double* const in[], double* out, const RmcAssertionObserver* observer) {
 (void)in;
 {% for ty in owner.inputs -%}
 {% if not direct(ty) -%}
@@ -172,7 +172,7 @@ if (i{{ loop.index0 }}) b{{ loop.index0 }}[0]+={{ integer(binder.step) }};
 {% endif -%}
 {% endmacro %}
 
-{%- macro definition(program, name, prefix="rumoca_pure_", assertion_outputs=[], source_predicate_outputs={}, device=false) -%}
+{%- macro definition(program, name, prefix="rumoca_pure_", assertion_outputs=[], source_predicate_outputs={}, device=false, entry=false) -%}
 {% for issued in program.operations -%}
 {% set op = issued.operation -%}
 {% set child = name ~ "_region_" ~ loop.index0 -%}
@@ -193,7 +193,7 @@ if (i{{ loop.index0 }}) b{{ loop.index0 }}[0]+={{ integer(binder.step) }};
 {% endif -%}
 {% endif -%}
 {% endfor -%}
-{{ "RMC_UNUSED static __device__" if device else "static" }} int {{ name }}(const void* const in[], void* const out[], const RmcAssertionObserver* observer) {
+{{ "RMC_UNUSED static __device__" if device else "static" }} {% if device and entry %}RMC_NOINLINE {% endif %}int {{ name }}(const void* const in[], void* const out[], const RmcAssertionObserver* observer) {
 (void)in; (void)out; (void)observer; (void)rumoca_real64;
 {% set input = namespace(index=0, pointers=[]) -%}
 {% for slot in program.slots -%}
@@ -242,7 +242,7 @@ return 0;
 {#- Binary64 inputs and outputs pass the caller's arrays straight through;
     other types convert through local arrays. -#}
 {%- macro wrapper(owner, kind="", device=false) -%}
-{{ "RMC_UNUSED static __device__" if device else "RMC_API" }} int rumoca_scalar_pure_{{ kind }}{{ owner.id }}(const double* const in[], double* out, const RmcAssertionObserver* observer) {
+{{ "RMC_UNUSED static __device__ RMC_NOINLINE" if device else "RMC_API" }} int rumoca_scalar_pure_{{ kind }}{{ owner.id }}(const double* const in[], double* out, const RmcAssertionObserver* observer) {
 (void)in;
 if (!out) return 1;
 {% for ty in owner.inputs -%}
@@ -280,13 +280,13 @@ __attribute__((unused))
 {% endif -%}
 {% for owner in table.owners %}{{ "RMC_UNUSED static __device__" if device else "static" }} int rumoca_pure_{{ owner.id }}(const void* const in[], void* const out[], const RmcAssertionObserver* observer);{% endfor %}
 {% for owner in table.owners -%}
-{{ definition(owner.body, "rumoca_pure_" ~ owner.id, assertion_outputs=owner.outputs, source_predicate_outputs=owner.source_predicate_outputs, device=device) -}}
+{{ definition(owner.body, "rumoca_pure_" ~ owner.id, assertion_outputs=owner.outputs, source_predicate_outputs=owner.source_predicate_outputs, device=device, entry=true) -}}
 {{ wrapper(owner, device=device) -}}
 {{ observation_wrapper(owner, device) -}}
 {% endfor -%}
 {% for owner in directional %}{{ "RMC_UNUSED static __device__" if device else "static" }} int rumoca_pure_directional_{{ owner.id }}(const void* const in[], void* const out[], const RmcAssertionObserver* observer);{% endfor %}
 {% for owner in directional -%}
-{{ definition(owner.body, "rumoca_pure_directional_" ~ owner.id, "rumoca_pure_directional_", owner.outputs, owner.source_predicate_outputs, device) -}}
+{{ definition(owner.body, "rumoca_pure_directional_" ~ owner.id, "rumoca_pure_directional_", owner.outputs, owner.source_predicate_outputs, device, true) -}}
 {{ wrapper(owner, "directional_", device) -}}
 {% endfor -%}
 {% endmacro %}

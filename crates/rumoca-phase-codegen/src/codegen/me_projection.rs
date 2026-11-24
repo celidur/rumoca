@@ -42,6 +42,12 @@ use table::ProgramTable;
 /// causal program stays out of line (`RMC_NOINLINE`).
 pub(super) const INLINE_PROGRAM_MAX_OPS: usize = 32;
 
+/// The largest run of whole programs, in operations, that a device build
+/// keeps in one out-of-line function where the host kernel runs them in one
+/// function (parameter bindings, delay rows, complete residuals); a single
+/// larger program forms a run of its own.
+pub(super) const DEVICE_CHUNK_MAX_OPS: usize = 1024;
+
 fn refusal(label: &str, refusal: solve::StagedRefreshRefusal) -> String {
     let reason = match refusal {
         solve::StagedRefreshRefusal::NonExactStage => {

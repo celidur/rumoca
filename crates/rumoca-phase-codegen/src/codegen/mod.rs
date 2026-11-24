@@ -774,6 +774,11 @@ fn create_environment() -> Environment<'static> {
         "rmc_inline_program_max_ops",
         minijinja::Value::from(me_projection::INLINE_PROGRAM_MAX_OPS),
     );
+    // The device build's bound on one out-of-line run of whole programs.
+    env.add_global(
+        "rmc_device_chunk_max_ops",
+        minijinja::Value::from(me_projection::DEVICE_CHUNK_MAX_OPS),
+    );
     // The shared render environment: every template a target manifest
     // publishes under a shared name, and nothing else. Support partials
     // (`[[partials]]`, e.g. the GALEC-derived C symbol policy, which every C
