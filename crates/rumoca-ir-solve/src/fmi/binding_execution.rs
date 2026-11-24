@@ -104,10 +104,13 @@ impl SolveBindingExecution {
     /// Admit the model to the C kernel as the generated C component does,
     /// without the checks of the component's own variables
     /// (`c_codegen::admit_kernel`), and issue the execution rows of its
-    /// parameter bindings.
+    /// parameter bindings. The target projects onto the retained state
+    /// manifold itself, so its initialization certifies the settled states
+    /// there (`rmc_certify_state_manifold`) and admits the retained manifold
+    /// rows.
     pub fn checked(model: &crate::SolveModel) -> Result<Self, &'static str> {
         let (order, levels) =
-            super::c_codegen::admit_kernel(model, None).map_err(|error| error.0)?;
+            super::c_codegen::admit_kernel(model, None, true).map_err(|error| error.0)?;
         let init = &model.problem.initialization;
         let execution =
             BindingExecution::checked(init.update_rhs(), init.update_targets(), &order)?
