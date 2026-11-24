@@ -1120,12 +1120,13 @@ impl ScalarExecutionView<'_> {
         // A discrete equation the initial inputs fix (`k2 = k`) holds before the
         // first algebraic refresh reads its target (`y = p[k2]`).
         self.apply_initial_seed_rows(y, p, t)?;
+        let delays_read_algebraics = self.initial_delays_read_algebraic_slots();
         for _ in 0..max_iters {
             // MLS 3.6 §3.7.2 defines delay(u, ...) = u throughout
             // initialization. The delayed-value P slots are runtime storage,
             // so keep them synchronized with the current initialization
             // coordinate before either updates or residuals observe them.
-            self.refresh_delay_values(t, y, p)?;
+            self.refresh_initial_delay_values(t, y, p, (tol, max_iters), delays_read_algebraics)?;
             self.apply_initialization_updates(y, p, t, tol, max_iters)?;
             self.project_initial_variables(y, p, t, tol, max_iters)?;
             // Projection can move a delay source. Refresh its identity value
@@ -1133,7 +1134,7 @@ impl ScalarExecutionView<'_> {
             // converged; otherwise declaration starts can leak into the first
             // event even though the source itself was settled correctly.
             let before_delay_refresh = p.to_vec();
-            self.refresh_delay_values(t, y, p)?;
+            self.refresh_initial_delay_values(t, y, p, (tol, max_iters), delays_read_algebraics)?;
             let delay_changed = crate::runtime_values_changed(&before_delay_refresh, p, tol);
             if refresh_algebraics_for_updates {
                 self.refresh_algebraic_and_output_slots(t, y, p, tol, max_iters)?;
@@ -1152,6 +1153,41 @@ impl ScalarExecutionView<'_> {
         Err(RuntimeSolveError::solve_ir(format!(
             "initial algebraic/update projection did not converge at t={t}"
         )))
+    }
+}
+
+impl SolveRuntime {
+    /// Whether a delay channel reads an algebraic or output solver slot
+    /// (`SolveDelayPartition::reads_solver_slots_from`).
+    fn initial_delays_read_algebraic_slots(&self) -> bool {
+        self.has_delay_channels()
+            && self.model.problem.events.delays.reads_solver_slots_from(
+                self.model.state_scalar_count(),
+                self.model.problem.solve_layout.solver_scalar_count(),
+            )
+    }
+
+    /// `refresh_delay_values` while initializing: every delayed value is its
+    /// source (MLS 3.6 §3.7.2). A source that reads an algebraic reads it on
+    /// the coordinate the continuous equations determine (§8.6), the
+    /// algebraic refresh applied to a copy of `y`, as a residual row's settled
+    /// view does; the stored algebraic is only the projection's seed.
+    fn refresh_initial_delay_values(
+        &self,
+        t: f64,
+        y: &[f64],
+        p: &mut [f64],
+        (tol, max_iters): (f64, usize),
+        reads_algebraics: bool,
+    ) -> Result<(), RuntimeSolveError> {
+        if !reads_algebraics {
+            self.refresh_delay_values(t, y, p)?;
+            return Ok(());
+        }
+        let mut settled = y.to_vec();
+        self.refresh_algebraic_and_output_slots(t, &mut settled, p, tol, max_iters)?;
+        self.refresh_delay_values(t, &settled, p)?;
+        Ok(())
     }
 }
 
