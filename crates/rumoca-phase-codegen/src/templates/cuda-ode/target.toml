@@ -20,7 +20,8 @@ scalar_fallback = true
 external_functions = false
 external_tables = false
 random = false
-# `<model>_initialize_batch`: bindings and the initial event.
+# `<model>_initialize_batch`: bindings, the initial equations through the
+# shared kernel's `rmc_initialize`, and the initial event.
 initialization = true
 # Relation memories, event indicators and event iteration per lane; the host
 # integrator locates events and stops at the static time events.
