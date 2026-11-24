@@ -1524,7 +1524,12 @@ fail:
 }
 {%- endmacro %}
 
-{%- macro refresh_values(solve, me, prefix) %}
+{#- The parameter bindings as the runtime applies them, over the binding
+    execution `fmi` issues (`binding_execution`, `discrete_equations`): the
+    checked FMI C component, or a Solve target's `SolveBindingExecution`.
+    A device build (`device`) qualifies both functions for the device; it
+    defines `update_discrete_equations` itself. -#}
+{%- macro binding_updates(solve, fmi, prefix, device=false) %}{%- set q = "RMC_UNUSED static __device__" if device else "static" %}
 {%- set targets = solve.initialization.update_targets %}
 /* relation_memory.rs: apply_initialization_updates. The checked parameter
    bindings run in dependency order, each reading only settled parameters and
@@ -1534,7 +1539,7 @@ fail:
    initial value). The parameter-determined discrete equations follow: they
    read only parameters, so they settle with them.
    -1 error, 0 unchanged, 1 changed */
-static int rmc_apply_updates(ModelInstance* m, bool initializing) {
+{{ q }} int rmc_apply_updates(ModelInstance* m, bool initializing) {
     (void)initializing;
 {%- if targets|length > 0 %}
     static const size_t targets[{{ targets|length }}] = {
@@ -1555,7 +1560,7 @@ static int rmc_apply_updates(ModelInstance* m, bool initializing) {
     double r[{{ program.temporary_count if program.temporary_count > 0 else 1 }}]; (void)r;
     double binding_output[{{ targets|length }}]; (void)binding_output;
 {%- for op in program.ops %}
-{{ scalar_op(op, "binding_output", "-1") }}
+{{ scalar_op(op, "binding_output", "-1", device=device) }}
 {%- endfor %}
 {%- for row in execution.parameter_rows + execution.quotient_seed_rows %}{% set target = targets[row] %}
     m->p[{{ target.P.index }}] = binding_output[{{ row }}];
@@ -1579,12 +1584,16 @@ static int rmc_apply_updates(ModelInstance* m, bool initializing) {
     return update_discrete_equations(m) == {{ prefix }}OK ? 0 : -1;
 {%- endif %}
 }
-static {{ prefix }}Status refresh_parameters(ModelInstance* m) {
+{{ q }} {{ prefix }}Status refresh_parameters(ModelInstance* m) {
     if (!m->parameters_dirty) return {{ prefix }}OK;
     if (rmc_apply_updates(m, false) < 0) return {{ prefix }}Error;
     m->parameters_dirty = false;
     return {{ prefix }}OK;
 }
+{%- endmacro %}
+
+{%- macro refresh_values(solve, me, prefix) %}
+{{- binding_updates(solve, fmi, prefix) }}
 {{ refresh_entries(solve, me, prefix) }}
 {%- endmacro %}
 
