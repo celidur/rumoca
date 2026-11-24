@@ -232,7 +232,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
-{%- if me_refresh is defined and me_refresh.blocks | length > 0 %}
+{%- if me_refresh is defined and (me_refresh.blocks | length > 0 or me_refresh.init.rows > 0) %}
 #include <float.h>
 #include <stdbool.h>
 {%- endif %}
