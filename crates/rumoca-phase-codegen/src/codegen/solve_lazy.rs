@@ -86,6 +86,15 @@ impl SolveRenderHandle {
         }
     }
 
+    /// The complete retained model, when the renderer owns one; its start
+    /// values seed targets without an initialization runtime.
+    pub(super) fn model(&self) -> Option<&solve::SolveModel> {
+        match self {
+            Self::Model(model) => Some(model),
+            Self::Standalone { .. } | Self::Fmi(_) => None,
+        }
+    }
+
     pub(super) fn fmi(component: solve::fmi::FmiCCodegenView) -> Self {
         Self::Fmi(Arc::new(FmiRenderOwner {
             component: Arc::new(component),
