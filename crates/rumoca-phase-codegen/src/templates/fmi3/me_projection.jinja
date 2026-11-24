@@ -85,6 +85,43 @@ static __device__ int {{ name }}({{ params }}) {
 }
 {%- endmacro %}
 
+{#- A device switch over `key` that calls `<callee><id>(args)` for each of
+    the ascending case values `ids`, as out-of-line groups `<name>_g<N>` of
+    the ids in [N * group, (N + 1) * group), group =
+    rmc_device_chunk_max_ops / rmc_inline_program_max_ops, and the function
+    `name(params)` that selects the group (`pass` forwards its parameters);
+    any other key answers `fallback`. -#}
+{%- macro grouped_switch(decl, name, key, ids, callee, params, args, pass, fallback) %}
+{%- set group = rmc_device_chunk_max_ops // rmc_inline_program_max_ops %}
+{%- set g = namespace(open=-1, groups=[]) %}
+{%- for id in ids %}
+{%- if id // group != g.open %}
+{%- if g.open >= 0 %}
+    default: return {{ fallback }};
+    }
+}
+{%- endif %}
+{%- set g.open = id // group %}{% set g.groups = g.groups + [g.open] %}
+static __device__ RMC_NOINLINE int {{ name }}_g{{ g.open }}({{ params }}) {
+    switch ({{ key }}) {
+{%- endif %}
+    case {{ id }}: return {{ callee }}{{ id }}({{ args }});
+{%- endfor %}
+{%- if g.open >= 0 %}
+    default: return {{ fallback }};
+    }
+}
+{%- endif %}
+{{ decl }} RMC_NOINLINE int {{ name }}({{ params }}) {
+    switch ({{ key }} / {{ group }}) {
+{%- for open in g.groups %}
+    case {{ open }}: return {{ name }}_g{{ open }}({{ pass }});
+{%- endfor %}
+    default: return {{ fallback }};
+    }
+}
+{%- endmacro %}
+
 {#- A program family's dispatcher, `rmc_<family>_call(program, ...)`: a
     switch calling `rmc_<family>_p<program>(args)`. A device build with more
     programs than one group (rmc_device_chunk_max_ops /
@@ -94,26 +131,8 @@ static __device__ int {{ name }}({{ params }}) {
     dispatcher selects the group. -#}
 {%- macro dispatcher(api, family, count, params, args, device=false) %}
 {%- set group = rmc_device_chunk_max_ops // rmc_inline_program_max_ops %}
-{%- set groups = (count + group - 1) // group %}
-{%- if device and count > group %}
-{%- for g in range(groups) -%}
-static __device__ RMC_NOINLINE int rmc_{{ family }}_call_g{{ g }}({{ params }}) {
-    switch (program) {
-{%- for i in range(g * group, [count, (g + 1) * group]|min) %}
-    case {{ i }}: return rmc_{{ family }}_p{{ i }}({{ args }});
-{%- endfor %}
-    default: return rmc_bad_program(m, program);
-    }
-}
-{% endfor -%}
-{{ api }} RMC_NOINLINE int rmc_{{ family }}_call({{ params }}) {
-    switch (program / {{ group }}) {
-{%- for g in range(groups) %}
-    case {{ g }}: return rmc_{{ family }}_call_g{{ g }}(program, {{ args }});
-{%- endfor %}
-    default: return rmc_bad_program(m, program);
-    }
-}
+{%- if device and count > group -%}
+{{ grouped_switch(api, "rmc_" ~ family ~ "_call", "program", range(count), "rmc_" ~ family ~ "_p", params, args, "program, " ~ args, "rmc_bad_program(m, program)")|trim }}
 {%- else -%}
 {{ api }} {% if device %}RMC_NOINLINE {% endif %}int rmc_{{ family }}_call({{ params }}) {
     switch (program) {
@@ -3000,6 +3019,19 @@ RMC_API extern const size_t rmc_iso_slot[{{ me.table.isolator_slot|length }}];
     {% for value in chunk %}{{ value }},{% endfor %}
 {%- endfor %}
 };
+{%- set group = rmc_device_chunk_max_ops // rmc_inline_program_max_ops %}
+{%- if device and (sharing.own|length > group or nshapes > group) %}
+{#- A device build bounds both switches as a dispatcher does. -#}
+{{ grouped_switch(q, "rmc_row_shape_call", "shape", range(nshapes), "rmc_row_s", "size_t shape, ModelInstance* m, double* out, const size_t* a", "m, out, a", "shape, m, out, a", "rmc_bad_program(m, shape)")|trim }}
+{{ grouped_switch(q, "rmc_row_own_call", "program", sharing.own, "rmc_row_p", "size_t program, ModelInstance* m, double* out", "m, out", "program, m, out", "rmc_bad_program(m, program)")|trim }}
+{{ api }} RMC_NOINLINE int rmc_row_call(size_t program, ModelInstance* m, double* out) {
+    if (program < {{ sharing.shape_of|length }}) {
+        const size_t shape = rmc_row_shape[program];
+        if (shape < {{ nshapes }}) return rmc_row_shape_call(shape, m, out, rmc_row_arg_pool + rmc_row_arg[program]);
+    }
+    return rmc_row_own_call(program, m, out);
+}
+{%- else %}
 {{ api }} {% if device %}RMC_NOINLINE {% endif %}int rmc_row_call(size_t program, ModelInstance* m, double* out) {
     if (program < {{ sharing.shape_of|length }}) {
         const size_t* a = rmc_row_arg_pool + rmc_row_arg[program];
@@ -3017,6 +3049,7 @@ RMC_API extern const size_t rmc_iso_slot[{{ me.table.isolator_slot|length }}];
     default: return rmc_bad_program(m, program);
     }
 }
+{%- endif %}
 {%- endif %}
 {%- for program in me.table.inv.programs %}
 {{ program_function("rmc_inv_p" ~ loop.index0, program, "ModelInstance* m, double* o", false, true, device=device) }}

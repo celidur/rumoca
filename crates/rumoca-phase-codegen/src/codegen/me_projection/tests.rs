@@ -312,3 +312,54 @@ fn a_device_dispatcher_selects_out_of_line_program_groups() {
         "{device}"
     );
 }
+
+/// A device switch over sparse case values (the rows with their own function
+/// beside shared row shapes) groups each value by its range of one group's
+/// width and selects only the groups that hold a value.
+#[test]
+fn a_device_switch_groups_sparse_cases_by_range() {
+    let group = super::DEVICE_CHUNK_MAX_OPS / super::INLINE_PROGRAM_MAX_OPS;
+    let ids = vec![0, 5, group + 3, group + 4, 3 * group];
+    let mut environment = crate::codegen::create_environment();
+    environment
+        .add_template(
+            "sparse.cu",
+            r#"{%- from "fmi-me-projection.jinja" import grouped_switch -%}
+{{ grouped_switch("static __device__", "rmc_row_own_call", "program", ids, "rmc_row_p", "size_t program, ModelInstance* m, double* out", "m, out", "program, m, out", "rmc_bad_program(m, program)")|trim }}"#,
+        )
+        .expect("the sparse switch template parses");
+    let rendered = environment
+        .get_template("sparse.cu")
+        .expect("the sparse switch template")
+        .render(minijinja::context! { ids => ids })
+        .expect("render the sparse switch");
+    assert!(
+        rendered.starts_with(
+            "static __device__ RMC_NOINLINE int rmc_row_own_call_g0(size_t program, ModelInstance* m, double* out) {"
+        ),
+        "{rendered}"
+    );
+    for (group_index, id) in [
+        (0, 0),
+        (0, 5),
+        (1, group + 3),
+        (1, group + 4),
+        (3, 3 * group),
+    ] {
+        assert!(
+            rendered.contains(&format!("    case {id}: return rmc_row_p{id}(m, out);")),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!(
+                "    case {group_index}: return rmc_row_own_call_g{group_index}(program, m, out);"
+            )),
+            "{rendered}"
+        );
+    }
+    assert!(!rendered.contains("rmc_row_own_call_g2"), "{rendered}");
+    assert!(
+        rendered.contains(&format!("    switch (program / {group}) {{")),
+        "{rendered}"
+    );
+}
