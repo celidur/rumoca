@@ -209,14 +209,16 @@ pub(super) fn initialization_value(
         blocks.push(record);
     }
     let (nominal_indices, nominal_values) = parameter_nominals(init.projection_plan());
-    let (tangent, tangent_doubles) =
-        tangent_value(problem, artifacts, tangent, settled, &mut pool)?;
+    let ((tangent, tangent_doubles), (delays, delay_doubles)) = (
+        tangent_value(problem, artifacts, tangent, settled, &mut pool)?,
+        delay_value(problem)?,
+    );
     // The deepest initialization frame chain: the plan's parameter scales and
     // residual rows, one block's scaled Newton system with its dense factor
     // and SVD factors, the settled residual's saved coordinates, and slack.
     let doubles =
         y_len + 2 * problem.layout.p_scalars() + 5 * rows + 5 * max_n * max_n + 12 * max_n + 64;
-    let doubles = doubles + tangent_doubles;
+    let doubles = doubles + tangent_doubles + delay_doubles;
     let pool = if pool.is_empty() { vec![0] } else { pool };
     Ok((
         minijinja::context! {
@@ -234,8 +236,48 @@ pub(super) fn initialization_value(
             single_isolators => singletons.isolators.into_plan()?,
             nominal_indices => nominal_indices,
             nominal_values => nominal_values,
+            delays => delays,
         },
         doubles,
+    ))
+}
+
+/// The delay channels the initialization refreshes (MLS §3.7.2: `delay(u,
+/// ...) = u` while initializing, `DelayRuntime::refresh` before any history
+/// is committed): the source, delay-time and delay-max rows, one output per
+/// channel, the parameter slot that holds each channel's delayed value, and
+/// whether a row reads an algebraic, which it then reads on the algebraic
+/// refresh (`refresh_initial_delay_values`); with the doubles one refresh
+/// takes: the sources, delay times and maxima, and the saved coordinate.
+fn delay_value(problem: &solve::SolveProblem) -> Result<(Value, usize), CodegenError> {
+    let delays = &problem.events.delays;
+    let count = delays.value_parameter_indices.len();
+    if count == 0 {
+        return Ok((minijinja::context! { count => 0 }, 0));
+    }
+    let rows = |block: &solve::ScalarProgramBlock| {
+        if block.stored_output_count() != count
+            || block.output_indices().iter().any(|&output| output >= count)
+        {
+            return Err(refuse("delay rows are not aligned with their slots"));
+        }
+        Ok(Value::from_object(ScalarProgramPlan::new(Arc::new(
+            block.clone(),
+        ))?))
+    };
+    Ok((
+        minijinja::context! {
+            count => count,
+            source => rows(&delays.source_rhs)?,
+            delay_time => rows(&delays.delay_time_rhs)?,
+            delay_max => rows(&delays.delay_max_rhs)?,
+            value_parameters => delays.value_parameter_indices.clone(),
+            reads_algebraics => delays.reads_solver_slots_from(
+                problem.solve_layout.state_scalar_count(),
+                problem.solve_layout.solver_scalar_count(),
+            ),
+        },
+        3 * count + problem.solve_layout.solver_scalar_count(),
     ))
 }
 
