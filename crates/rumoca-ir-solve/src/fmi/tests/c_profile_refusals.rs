@@ -80,10 +80,13 @@ fn one_initial_row(model: &mut SolveModel, role: InitializationRowRole) {
 
 const SETTLED: InitializationRowRole = InitializationRowRole::SurplusAlgebraicCheck;
 
+/// A row over the seed of a solver coordinate past the states (here the
+/// fixture has none) reads a continuous algebraic, whose value only the
+/// settled refresh gives, so a role that does not select that view is refused.
 #[test]
-fn initialization_rows_over_declaration_seeds_are_refused() {
+fn an_initialization_row_reading_an_algebraic_without_its_role_is_refused() {
     assert_refused(
-        "C initialization evaluates residual rows only on the settled algebraic refresh",
+        "C initialization evaluates a row that reads a continuous algebraic only on the settled algebraic refresh",
         |model| {
             one_initial_row(model, InitializationRowRole::SurplusCheck);
             model.problem.layout = crate::VarLayout::from_parts(Default::default(), 1, 2);
@@ -95,7 +98,7 @@ fn initialization_rows_over_declaration_seeds_are_refused() {
             ]]));
             model.problem.initialization =
                 crate::InitializationSolveSystem::construct(initialization)
-                    .expect("one declaration-seed row is a checked initialization");
+                    .expect("one algebraic-seed row is a checked initialization");
         },
     );
 }
