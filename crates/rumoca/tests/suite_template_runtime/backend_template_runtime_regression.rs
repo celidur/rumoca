@@ -1,5 +1,6 @@
 #[cfg(feature = "fmu-packaging")]
 mod cuda_device_projection;
+mod cuda_ode_ladder;
 mod cuda_ode_lane_kernels;
 mod jax_compact_stencils;
 mod jax_lazy_conditionals;
@@ -67,16 +68,18 @@ end ImplicitAlgebraic;
         ("fmi2", "sources/model.c"),
         ("fmi3", "sources/model.c"),
         ("fmi-ls-wasm", "csrc/model.c"),
+        // Not an FMI target: each lane embeds the same kernel's device build.
+        ("cuda-ode", "ImplicitAlgebraic_ode.cu"),
     ] {
         let files = rumoca::render_target_files(&compiled, "ImplicitAlgebraic", target, None)
-            .expect("FMI projects the implicit algebraic block with the shared ME kernel");
+            .expect("the shared ME kernel projects the implicit algebraic block");
         let model_c = files
             .iter()
             .find(|file| file.path == model_c_path)
-            .expect("FMI emits its C kernel");
+            .expect("the target emits its C kernel");
         assert!(
             model_c.content.contains("rmc_project_stage"),
-            "the FMI kernel must project the coupled block"
+            "the kernel of {target} must project the coupled block"
         );
     }
     for target in [
@@ -85,7 +88,6 @@ end ImplicitAlgebraic;
         "rust-fixed-ode",
         "casadi-ode",
         "jax-ode",
-        "cuda-ode",
         "wgsl-ode",
     ] {
         let error = rumoca::render_target_files(&compiled, "ImplicitAlgebraic", target, None)
