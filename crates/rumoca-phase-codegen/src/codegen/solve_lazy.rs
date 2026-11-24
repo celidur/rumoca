@@ -95,6 +95,22 @@ impl SolveRenderHandle {
         }
     }
 
+    /// The solver variable scale of every solver coordinate
+    /// (`SolveModel::solver_variable_scale`), when the renderer owns the
+    /// retained model or its FMI component; a standalone problem carries no
+    /// start values or nominals to form them from.
+    pub(super) fn solver_variable_scales(&self) -> Option<Box<[f64]>> {
+        match self {
+            Self::Model(model) => Some(model.solver_variable_scales()),
+            Self::Fmi(owner) => Some(
+                (0..owner.component.problem().solve_layout.solver_scalar_count())
+                    .map(|index| owner.component.solver_variable_scale(index))
+                    .collect(),
+            ),
+            Self::Standalone { .. } => None,
+        }
+    }
+
     pub(super) fn fmi(component: solve::fmi::FmiCCodegenView) -> Self {
         Self::Fmi(Arc::new(FmiRenderOwner {
             component: Arc::new(component),
