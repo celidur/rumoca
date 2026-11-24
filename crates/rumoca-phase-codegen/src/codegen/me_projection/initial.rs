@@ -3,8 +3,12 @@
 //! The runtime settles initialization through
 //! `SolveRuntime::settle_initialization_system`: the parameter bindings and
 //! the initialization projection plan alternate until the bindings stop
-//! changing, and every residual row is evaluated on the settled coordinates
-//! (bindings plus the algebraic refresh applied to a copy). The generated
+//! changing. When a row role reads a reconstructed algebraic, every residual
+//! row is evaluated on the settled coordinates (bindings plus the algebraic
+//! refresh applied to a copy) along the settled tangent; otherwise on the
+//! instance coordinates, where a one-row block first tries the row's own
+//! isolation of its unknown and the Jacobian is the residual's partial
+//! forward derivative. The generated
 //! component runs the same loop through the shared kernel; this module reads
 //! the checked initialization owner once and records its rows, blocks,
 //! combined unknowns, and Jacobian patterns for the C initialization kernel.
@@ -15,20 +19,27 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use minijinja::Value;
-use rumoca_eval_solve::to_scalar_program_projection;
+use rumoca_eval_solve::{
+    PreparedScalarProgramBlock, TargetIsolationProgram, to_scalar_program_projection,
+};
 use rumoca_ir_solve as solve;
 use serde::Serialize;
 
 use super::super::scalar_program_plan::ScalarProgramPlan;
 use super::block::check_seed_loads;
-use super::table::ProgramTable;
+use super::table::{FunctionFamily, ProgramTable};
 use crate::errors::CodegenError;
 
 /// One initialization block: pool offsets of its residual rows, combined
 /// unknowns (a solver-Y index, or the solver length plus a parameter index),
 /// per-row fallback targets (a solver-Y index plus one, zero for none),
 /// per-row relaxation columns (the block column of the row's own target, `n`
-/// for none), and its compressed-row Jacobian pattern when one is issued.
+/// for none), its compressed-row Jacobian pattern when one is issued, and,
+/// for a one-row block on the instance coordinates, its row's isolation of
+/// the unknown (`single`: zero when the row program has several outputs, the
+/// unknown is a parameter, or the evaluator returns no isolated value, else
+/// `SINGLE_OUTPUT_VALUE` or `SINGLE_ISOLATOR`, with the row function `row`
+/// and the isolator `iso`).
 #[derive(Serialize, Default)]
 struct InitBlockRecord {
     n: usize,
@@ -39,6 +50,81 @@ struct InitBlockRecord {
     row_ptr: usize,
     col_idx: usize,
     pattern: bool,
+    single: usize,
+    row: usize,
+    iso: usize,
+}
+
+/// The isolation is the row's own value, which does not read the unknown.
+const SINGLE_OUTPUT_VALUE: usize = 1;
+/// The isolation is an isolator program.
+const SINGLE_ISOLATOR: usize = 2;
+
+/// The single-output row programs and isolators of the one-row blocks, when
+/// the rows are evaluated on the instance coordinates (`prepared`).
+#[derive(Default)]
+struct Singletons {
+    prepared: Option<PreparedScalarProgramBlock>,
+    rows: FunctionFamily<usize>,
+    isolators: FunctionFamily<usize>,
+}
+
+impl Singletons {
+    fn new(projection: &solve::ScalarProgramBlock, settled: bool) -> Result<Self, CodegenError> {
+        let prepared = (!settled)
+            .then(|| PreparedScalarProgramBlock::new(projection.clone()))
+            .transpose()
+            .map_err(|error| refuse(&error.to_string()))?;
+        Ok(Self {
+            prepared,
+            ..Self::default()
+        })
+    }
+
+    /// `InitialProjectionModel::eval_initial_target_value` on the instance
+    /// coordinates for block `index`, when it has one row and a solver
+    /// coordinate unknown (below `y_len`): the row's program when it has one
+    /// output, isolated for that unknown.
+    fn record(
+        &mut self,
+        (index, rows, y_len): (usize, &[usize], usize),
+        pool: &[usize],
+        record: &mut InitBlockRecord,
+    ) -> Result<(), CodegenError> {
+        let (Some(prepared), [row], [unknown]) = (&self.prepared, rows, unknowns_of(pool, record))
+        else {
+            return Ok(());
+        };
+        let (row, unknown) = (*row, *unknown);
+        if unknown >= y_len {
+            return Ok(());
+        }
+        let Some(program) = prepared.single_output_row_for_output_index(row) else {
+            return Ok(());
+        };
+        let block = prepared.block();
+        let span = block
+            .program_span(program)
+            .ok_or_else(|| refuse("an initialization row has no source provenance"))?;
+        let single = match prepared.target_isolation_output_program(program, 0, unknown) {
+            TargetIsolationProgram::Unavailable => return Ok(()),
+            TargetIsolationProgram::OutputValue => SINGLE_OUTPUT_VALUE,
+            TargetIsolationProgram::Isolator(operations) => {
+                record.iso = self.isolators.intern(index, || Ok((operations, span)))?;
+                SINGLE_ISOLATOR
+            }
+            TargetIsolationProgram::Unrepresentable => {
+                return Err(refuse(
+                    "an initialization row needs an isolation no scalar program reproduces",
+                ));
+            }
+        };
+        record.row = self
+            .rows
+            .intern(program, || Ok((block.programs()[program].clone(), span)))?;
+        record.single = single;
+        Ok(())
+    }
 }
 
 fn refuse(reason: &str) -> CodegenError {
@@ -68,6 +154,8 @@ pub(super) fn initialization_value(
         return Err(refuse("the solver coordinates do not fill the Y storage"));
     }
     let projection = to_scalar_program_projection(init.residual())?.into_block();
+    let settled = solve::fmi::initial_rows_read_settled_view(problem);
+    let mut singletons = Singletons::new(&projection, settled)?;
     let residual = Value::from_object(ScalarProgramPlan::new(Arc::new(projection))?);
     let combined = |slot: solve::ScalarSlot| match slot {
         solve::ScalarSlot::Y { index, .. } if index < y_len => Ok(index),
@@ -114,26 +202,15 @@ pub(super) fn initialization_value(
         record.relax = push(&mut pool, relax.collect::<Vec<_>>());
         record.fallback = push(&mut pool, block.rows.iter().map(|&row| row_target(row)));
         record.unknowns = push(&mut pool, unknowns);
-        if let Some(pattern) = structures
-            .get(index)
-            .map(solve::ColoredJacobianStructure::pattern)
-            .filter(|pattern| pattern.rows() as usize == n && pattern.columns() as usize == n)
-        {
-            let (mut row_ptr, mut col_idx) = (vec![0], Vec::new());
-            for row in 0..n {
-                pattern.visit_row_columns(row, &mut |column| col_idx.push(column));
-                row_ptr.push(col_idx.len());
-            }
-            record.pattern = true;
-            record.row_ptr = push(&mut pool, row_ptr);
-            record.col_idx = push(&mut pool, col_idx);
-        }
+        record_pattern(&mut pool, structures.get(index), &mut record);
+        singletons.record((index, &block.rows, y_len), &pool, &mut record)?;
         max_n = max_n.max(n);
         unknown_count += n;
         blocks.push(record);
     }
     let (nominal_indices, nominal_values) = parameter_nominals(init.projection_plan());
-    let (tangent, tangent_doubles) = tangent_value(problem, artifacts, tangent, &mut pool)?;
+    let (tangent, tangent_doubles) =
+        tangent_value(problem, artifacts, tangent, settled, &mut pool)?;
     // The deepest initialization frame chain: the plan's parameter scales and
     // residual rows, one block's scaled Newton system with its dense factor
     // and SVD factors, the settled residual's saved coordinates, and slack.
@@ -152,6 +229,9 @@ pub(super) fn initialization_value(
             row_targets => (0..rows).map(row_target).collect::<Vec<_>>(),
             sizes => 2 * max_n + 8,
             tangent => tangent,
+            settled => settled,
+            single_rows => singletons.rows.into_plan()?,
+            single_isolators => singletons.isolators.into_plan()?,
             nominal_indices => nominal_indices,
             nominal_values => nominal_values,
         },
@@ -174,6 +254,35 @@ fn parameter_nominals(plan: &solve::InitializationProjectionPlan) -> (Vec<usize>
             _ => None,
         })
         .unzip()
+}
+
+/// The block's issued compressed-row Jacobian pattern, when it is square
+/// over the block.
+fn record_pattern(
+    pool: &mut Vec<usize>,
+    structure: Option<&solve::ColoredJacobianStructure>,
+    record: &mut InitBlockRecord,
+) {
+    let n = record.n;
+    let Some(pattern) = structure
+        .map(solve::ColoredJacobianStructure::pattern)
+        .filter(|pattern| pattern.rows() as usize == n && pattern.columns() as usize == n)
+    else {
+        return;
+    };
+    let (mut row_ptr, mut col_idx) = (vec![0], Vec::new());
+    for row in 0..n {
+        pattern.visit_row_columns(row, &mut |column| col_idx.push(column));
+        row_ptr.push(col_idx.len());
+    }
+    record.pattern = true;
+    record.row_ptr = push(pool, row_ptr);
+    record.col_idx = push(pool, col_idx);
+}
+
+/// The combined unknowns of `record`, already in the pool.
+fn unknowns_of<'a>(pool: &'a [usize], record: &InitBlockRecord) -> &'a [usize] {
+    &pool[record.unknowns..record.unknowns + record.n]
 }
 
 fn push(pool: &mut Vec<usize>, values: impl IntoIterator<Item = usize>) -> usize {
@@ -250,11 +359,13 @@ impl<'a> JvpRows<'a> {
 /// plan (`seed_blocks`, interned block ids in plan order) with each block
 /// row's JVP over `[solver-y | parameter]` seeds, the update rows' JVP with
 /// their combined targets (plus one, zero for none), and the residual rows'
-/// JVP, all as pool offsets.
+/// JVP, all as pool offsets. Rows evaluated on the instance coordinates
+/// (`settled` false) need the residual rows' JVP alone.
 fn tangent_value(
     problem: &solve::SolveProblem,
     artifacts: &solve::SolveArtifacts,
     (table, seed_blocks, seed_len): (&mut ProgramTable, &[(usize, usize)], usize),
+    settled: bool,
     pool: &mut Vec<usize>,
 ) -> Result<(Value, usize), CodegenError> {
     let init = &problem.initialization;
@@ -266,7 +377,14 @@ fn tangent_value(
     );
     let residual_block =
         rumoca_eval_solve::to_scalar_program_block(&artifacts.initialization.residual_jacobian_v)?;
-    let cone = tangent_cone(problem, artifacts, seed_blocks, &residual_block)?;
+    let cone = if settled {
+        tangent_cone(problem, artifacts, seed_blocks, &residual_block)?
+    } else {
+        TangentCone {
+            blocks: vec![false; seed_blocks.len()],
+            updates: vec![false; init.update_targets().len()],
+        }
+    };
     let mut kept_blocks = Vec::with_capacity(seed_blocks.len());
     for (block, kept) in seed_blocks.iter().zip(&cone.blocks) {
         if *kept {
