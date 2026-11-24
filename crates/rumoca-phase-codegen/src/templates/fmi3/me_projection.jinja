@@ -1806,7 +1806,7 @@ fail:
     double r[{{ program.temporary_count if program.temporary_count > 0 else 1 }}]; (void)r;
     double binding_output[{{ targets|length }}]; (void)binding_output;
 {%- for op in program.ops %}
-{{ scalar_op(op, "binding_output", "-1") }}
+{{ scalar_op(op, "binding_output", "-1", device=device) }}
 {%- endfor %}
 {%- for row in execution.parameter_rows %}{% set target = targets[row] %}
     m->p[{{ target.P.index }}] = binding_output[{{ row }}];
