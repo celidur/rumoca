@@ -37,6 +37,7 @@ mod reported_bug_runtime;
 mod same_tick_function_chain;
 mod solve_renderer_without_dae;
 mod solve_residual_scalar;
+mod state_manifold_kernel;
 mod string_constant_elements;
 
 mod actual_stream_product_events;

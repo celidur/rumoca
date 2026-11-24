@@ -378,6 +378,10 @@ fn a_state_manifold_projection_is_refused_before_any_byte() {
         .validate()
         .expect("the manifold-bearing fixture is a valid Solve problem");
     assert!(!super::me_projection::me_refresh_admissible(&model.problem));
+    assert!(
+        super::me_projection::me_refresh_admissible_with_state_manifold(&model.problem),
+        "a target that projects onto the retained manifold itself admits its refresh"
+    );
 
     let component = solve::fmi::FmiComponent::construct(model, vec![state_input()])
         .expect("the manifold-bearing fixture is a checked component");
