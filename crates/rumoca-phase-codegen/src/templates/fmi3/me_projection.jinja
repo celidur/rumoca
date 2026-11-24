@@ -2667,21 +2667,86 @@ RMC_COLD {{ q }} int rmc_init_project(ModelInstance* m) {
 /* manifold_kernel, which the including unit emits after this kernel. */
 {{ api }} int rmc_certify_state_manifold(ModelInstance* m, double tol);
 {%- endif %}
+{%- set delays = init.delays %}
+{%- if delays.count > 0 %}
+#define RMC_INIT_DELAYS {{ delays.count }}
+{{ q }} const size_t rmc_init_delay_slot[RMC_INIT_DELAYS] = { {% for value in delays.value_parameters %}{{ value }},{% endfor %} };
+/* delay.rs: DelayRuntime::evaluate_channel_rows: every channel's source,
+   delay time and maximum delay at the instance coordinate. -1 error */
+{{ q }} int rmc_init_delay_rows(ModelInstance* m, double* source, double* delay_time, double* delay_max) {
+{%- for rows in [(delays.source, "source"), (delays.delay_time, "delay_time"), (delays.delay_max, "delay_max")] %}
+{%- for program in rows[0].programs %}
+    {
+    double r[{{ program.temporary_count if program.temporary_count > 0 else 1 }}]; (void)r;
+{%- for op in program.ops %}
+{{ scalar_op(op, rows[1], "-1", device=device) }}
+{%- endfor %}
+    }
+{%- endfor %}
+{%- endfor %}
+    return 0;
+}
+/* initial_projection.rs: refresh_initial_delay_values, DelayRuntime::refresh
+   before any history is committed (MLS §3.7.2: delay(u, ...) = u during
+   initialization): the delay times and maxima are checked
+   (validate_delay_values) and each delayed value is its source at the
+   current coordinate{% if delays.reads_algebraics %}, its algebraics refreshed on a copy (the stored ones
+   are only seeds){% endif %}. -1 error, 0 unchanged, 1 a delayed value moved
+   beyond the tolerance (solve_ops.rs: runtime_value_changed). */
+RMC_COLD {{ q }} int rmc_init_delays(ModelInstance* m) {
+    RMC_MARK; int result = 0;
+    double* source = rmc_dalloc(m, 3 * RMC_INIT_DELAYS);
+    if (!source) { RMC_RELEASE; return rmc_exhausted(m); }
+    double* delay_time = source + RMC_INIT_DELAYS; double* delay_max = delay_time + RMC_INIT_DELAYS;
+{%- if delays.reads_algebraics %}
+    double* y = rmc_dalloc(m, Y_LEN);
+    if (!y) { RMC_RELEASE; return rmc_exhausted(m); }
+    memcpy(y, m->y, sizeof(m->y));
+    int rows = refresh_algebraics(m) == {{ prefix }}OK ? rmc_init_delay_rows(m, source, delay_time, delay_max) : -1;
+    memcpy(m->y, y, sizeof(m->y));
+    if (rows != 0) { RMC_RELEASE; return -1; }
+{%- else %}
+    if (rmc_init_delay_rows(m, source, delay_time, delay_max) != 0) { RMC_RELEASE; return -1; }
+{%- endif %}
+    for (size_t k = 0; k < RMC_INIT_DELAYS; ++k) {
+        if (!isfinite(delay_time[k]) || delay_time[k] < 0.0) { RMC_LOG(m, "a delay channel produced an invalid delayTime; expected a finite non-negative value"); RMC_RELEASE; return -1; }
+        if (!isfinite(delay_max[k]) || delay_max[k] < delay_time[k]) { RMC_LOG(m, "a delay channel produced delayMax below delayTime"); RMC_RELEASE; return -1; }
+    }
+    for (size_t k = 0; k < RMC_INIT_DELAYS; ++k) {
+        double* slot = &m->p[rmc_init_delay_slot[k]];
+        const double before = *slot, after = source[k];
+        if (before != after && (!isfinite(before) || !isfinite(after)
+            || fabs(before - after) > fabs(m->rmc_tol) * fmax(1.0, fmax(fabs(before), fabs(after))))) result = 1;
+        *slot = after;
+    }
+    RMC_RELEASE; return result;
+}
+{%- endif %}
 /* solve_runtime/initial_projection.rs: settle_initialization_system at the
    FMI tolerance{% if me.state_manifold %}, then the settled states certified on the retained
    manifold at that tolerance (the linked kernel's CertifyInitial){% endif %};
-   the certified continuous refresh follows at the refresh tolerance. */
+   the certified continuous refresh follows at the refresh tolerance.{% if delays.count > 0 %} Every
+   pass first holds each delayed value at its source, and refreshes it again
+   after the projection: a moved value sends the pass round again, as a
+   changed binding does.{% endif %} */
 RMC_COLD {{ q }} {{ prefix }}Status rmc_initialize(ModelInstance* m, double tolerance) {
     {{ prefix }}Status status = {{ prefix }}Error;
     if (m->rmc_fatal) return status;
     m->rmc_tol = tolerance > 0.0 ? tolerance : RMC_TOL; m->rmc_certify = false;
     for (int iteration = 0; iteration < RMC_UPDATE_ITERS; ++iteration) {
+{%- if delays.count > 0 %}
+        if (rmc_init_delays(m) < 0) break;
+{%- endif %}
         if (rmc_apply_updates(m, true) < 0) break;
         m->parameters_dirty = false;
         if (rmc_init_project(m) != 0) break;
+{%- if delays.count > 0 %}
+        int delayed = rmc_init_delays(m);
+        if (delayed < 0) break;
+{%- endif %}
         int changed = rmc_apply_updates(m, true);
         if (changed < 0) break;
-        if (changed == 0) { status = {{ prefix }}OK; break; }
+        if (changed == 0{% if delays.count > 0 %} && delayed == 0{% endif %}) { status = {{ prefix }}OK; break; }
     }
 {%- if me.state_manifold %}
     if (status == {{ prefix }}OK && !m->rmc_fatal && rmc_certify_state_manifold(m, m->rmc_tol) != 0) {
