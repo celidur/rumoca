@@ -618,7 +618,7 @@ fn initialization_value(
     if !init.projection_plan().blocks.is_empty() {
         return Err(refuse(
             FEATURE,
-            "the initialization retains residual blocks to solve",
+            "the initialization retains residual blocks, which only the shared projection kernel (`me_refresh`) solves",
         ));
     }
     // Consecutive bindings of one column form one block, written straight
