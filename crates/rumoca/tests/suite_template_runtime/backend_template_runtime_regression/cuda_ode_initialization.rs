@@ -1,6 +1,7 @@
 //! cuda-ode initializes each lane through the shared ME projection kernel
 //! (`rmc_initialize`, MLS §8.6): initial equations solved for a state and a
-//! `fixed = false` parameter, from each lane's own parameter values.
+//! `fixed = false` parameter, from each lane's own parameter values, through
+//! the settled algebraic refresh or over the state seeds themselves.
 
 use super::{rendered_model_target, run_checked};
 use rumoca::Compiler;
@@ -74,37 +75,37 @@ int main() {
 }
 "#;
 
-#[test]
-fn cuda_ode_lanes_solve_their_initial_equations_with_the_shared_kernel() {
+/// Render `model` for cuda-ode, check that it initializes through the shared
+/// kernel, and run `harness` (included after the kernel) in CPU emulation.
+fn run_lane_harness(source: &str, model: &str, harness: &str) {
     let compiled = Compiler::new()
-        .model("LaneInit")
-        .compile_str(LANE_INIT, "LaneInit.mo")
+        .model(model)
+        .compile_str(source, &format!("{model}.mo"))
         .expect("the compiler accepts the model");
-    let (directory, files) = rendered_model_target(&compiled, "LaneInit", "cuda-ode");
+    let (directory, files) = rendered_model_target(&compiled, model, "cuda-ode");
     let source = files
         .iter()
         .find(|file| file.path.ends_with("_ode.cu"))
         .expect("cuda-ode emits its kernel");
+    let call = format!("rmc_initialize(m, {}_INIT_TOLERANCE)", model.to_uppercase());
     assert!(
-        source
-            .content
-            .contains("rmc_initialize(m, LANEINIT_INIT_TOLERANCE)"),
+        source.content.contains(&call),
         "the lanes must initialize through the shared kernel"
     );
-    let harness = directory.path().join("lane_init.cpp");
+    let path = directory.path().join("lane_init.cpp");
     let prelude = "#include <cmath>\n#include <cstdio>\n#include <cstdlib>\n#include <cstring>\n\
         struct Dim3 { int x; };\nstatic Dim3 blockIdx, blockDim, threadIdx;\n\
         #define __global__\n#define __host__\n#define __device__\n";
     fs::write(
-        &harness,
-        format!("{prelude}#include {:?}\n{HARNESS}", source.path),
+        &path,
+        format!("{prelude}#include {:?}\n{harness}", source.path),
     )
     .expect("write the initialization harness");
     let executable = directory.path().join("cuda-ode-lane-init");
     run_checked(
         Command::new("c++")
             .args(["-std=c++17", "-Wall", "-Wextra", "-Werror"])
-            .arg(&harness)
+            .arg(&path)
             .arg("-o")
             .arg(&executable)
             .current_dir(directory.path()),
@@ -114,4 +115,75 @@ fn cuda_ode_lanes_solve_their_initial_equations_with_the_shared_kernel() {
         &mut Command::new(executable),
         "execute CUDA ODE initialization emulation",
     );
+}
+
+#[test]
+fn cuda_ode_lanes_solve_their_initial_equations_with_the_shared_kernel() {
+    run_lane_harness(LANE_INIT, "LaneInit", HARNESS);
+}
+
+/// Initial equations over state seeds alone: the affine row settles through
+/// its isolation, the cubic one by Newton on the partial Jacobian.
+const SEED_INIT: &str = r#"
+model SeedInit
+  parameter Real c = 10;
+  Real x(start = 1);
+  Real z(start = 2);
+initial equation
+  2 * x + 1 = c;
+  z * z * z + z = c;
+equation
+  der(x) = -x;
+  der(z) = -z;
+end SeedInit;
+"#;
+
+/// Two lanes; lane 1 overrides `c` before initializing.
+const SEED_HARNESS: &str = r#"
+static int slot(const char *name) {
+    for (int i = 0; i < SEEDINIT_Y_LEN; ++i) {
+        if (std::strcmp(SeedInit_y_names[i], name) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void lane(int index) {
+    blockIdx.x = 0;
+    blockDim.x = 2;
+    threadIdx.x = index;
+}
+
+int main() {
+    const int x = slot("x"), z = slot("z");
+    if (x < 0 || z < 0) { std::printf("no states x, z\n"); return 1; }
+    double y[2 * SEEDINIT_Y_LEN] = {0.0};
+    double p[2 * SEEDINIT_P_LEN] = {0.0};
+    int status[2] = {-1, -1};
+    void *lanes = std::malloc(2 * SEEDINIT_LANE_WORKSPACE_BYTES);
+    for (int k = 0; k < 2; ++k) { lane(k); SeedInit_workspace_init_batch(lanes, 2); }
+    for (int k = 0; k < 2; ++k) { lane(k); SeedInit_load_starts_batch(y, p, SEEDINIT_Y_LEN, SEEDINIT_P_LEN, 2); }
+    int c = -1;
+    for (int i = 0; i < SEEDINIT_P_LEN; ++i) if (p[i] == 10.0) c = i;
+    if (c < 0) { std::printf("no parameter c\n"); return 1; }
+    p[SEEDINIT_P_LEN + c] = 30.0;
+    for (int k = 0; k < 2; ++k) { lane(k); SeedInit_initialize_batch(0.0, y, p, status, SEEDINIT_Y_LEN, SEEDINIT_P_LEN, 2); }
+    const double values[2] = {10.0, 30.0};
+    for (int k = 0; k < 2; ++k) {
+        const double xk = y[k * SEEDINIT_Y_LEN + x], zk = y[k * SEEDINIT_Y_LEN + z];
+        if (status[k] != 0 || std::fabs(2.0 * xk + 1.0 - values[k]) > 1e-9 * values[k]
+            || std::fabs(zk * zk * zk + zk - values[k]) > 1e-9 * values[k]) {
+            std::printf("lane %d: status %d, x %.17g, z %.17g\n", k, status[k], xk, zk);
+            return 1;
+        }
+    }
+    std::free(lanes);
+    return 0;
+}
+"#;
+
+#[test]
+fn cuda_ode_lanes_solve_initial_equations_over_state_seeds() {
+    run_lane_harness(SEED_INIT, "SeedInit", SEED_HARNESS);
 }
