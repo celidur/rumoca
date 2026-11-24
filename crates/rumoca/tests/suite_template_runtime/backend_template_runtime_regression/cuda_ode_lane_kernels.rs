@@ -111,6 +111,24 @@ fn cuda_ode_lane_switches_its_relation_only_in_the_event_update() {
 }
 
 #[test]
+fn cuda_ode_refreshes_once_after_a_settled_event_pass() {
+    let (_directory, source) = relay_kernel();
+    // A settled event pass leaves the slots settled: one refresh per pass,
+    // and one after the loop only when the last pass did not settle.
+    let start = source
+        .content
+        .find("int Relay_event_iterate(")
+        .expect("cuda-ode emits the event iteration");
+    let body = &source.content[start..];
+    let body = &body[..body.find("\n}\n").expect("the event iteration ends")];
+    assert_eq!(body.matches("Relay_refresh(time").count(), 2);
+    assert!(
+        body.contains("if (!settled) {\n        Relay_refresh(time"),
+        "the refresh after the loop runs only after an unsettled last pass"
+    );
+}
+
+#[test]
 fn cuda_ode_refuses_an_initialization_it_would_have_to_solve() {
     // The initial equation is implicit in the start value; solving it belongs
     // to the one projection kernel, which this target does not embed.
