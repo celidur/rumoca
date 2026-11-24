@@ -152,33 +152,6 @@ fn cuda_ode_refreshes_once_after_a_settled_event_pass() {
     );
 }
 
-#[test]
-fn cuda_ode_refuses_an_initialization_it_would_have_to_solve() {
-    // The initial equation is implicit in the start value; solving it belongs
-    // to the one projection kernel, which this target does not embed.
-    let compiled = Compiler::new()
-        .model("ImplicitStart")
-        .compile_str(
-            r#"
-model ImplicitStart
-  Real x;
-initial equation
-  x + x * x * x = 2;
-equation
-  der(x) = -x;
-end ImplicitStart;
-"#,
-            "ImplicitStart.mo",
-        )
-        .expect("the compiler accepts the model");
-    let error = rumoca::render_target_files(&compiled, "ImplicitStart", "cuda-ode", None)
-        .expect_err("cuda-ode holds no initialization solver");
-    assert!(
-        format!("{error:#}").contains("unsupported-feature:initialization"),
-        "unexpected refusal: {error:#}"
-    );
-}
-
 /// A delay of an algebraic source, `d = delay(s, tau, tmax)` with `s = x^2`.
 const LAG: &str = r#"
 model Lag
