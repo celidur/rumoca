@@ -42,6 +42,10 @@ and integration (including event location and stopping at time events).
   the call, which makes that lane's results NaN as a domain error does; the
   lane does not locate it as an event.
 - `<model>_EVENT_MAX_PASSES` can be overridden with `-D`.
+- Build option: `-DRUMOCA_OMIT_INITIALIZATION` leaves out what only
+  initialization uses (parameter and start initialization, start tables,
+  bindings, `<model>_initialize_batch`), for a device build whose host
+  initializes the lanes.
 
 ## Unsupported
 

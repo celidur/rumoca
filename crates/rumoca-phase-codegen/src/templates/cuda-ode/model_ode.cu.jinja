@@ -332,6 +332,11 @@ __device__ __noinline__ void {{ name }}_derivative_rows(double time, const doubl
 {%- endfor %}
 }
 
+// RUMOCA_OMIT_INITIALIZATION: leave out what only initialization uses
+// (parameter and start-value initialization, start tables, bindings,
+// initialize_batch). A device build whose host initializes the lanes
+// compiles only the step kernels.
+#ifndef RUMOCA_OMIT_INITIALIZATION
 // Compute the parameters defined by other parameters in place, for each batch
 // slot of p (stride p_stride), from the base parameters already there. Launch
 // after changing any parameter, before the derivative kernel.
@@ -374,6 +379,7 @@ extern "C" __global__ void {{ name }}_init_state_batch(
 {{ programs(sinit, y="batch_y", out="batch_y") }}
 {%- endif %}
 }
+#endif  // RUMOCA_OMIT_INITIALIZATION
 
 // The derivative of the states of every lane. Only the state slots of `y`
 // are read: the algebraic slots are settled on a per-thread copy first.
@@ -460,6 +466,7 @@ extern "C" __global__ void {{ name }}_refresh_batch(
     const double *batch_p = p + ((long long)batch * (long long)p_stride);
     {{ name }}_refresh(time, batch_y, batch_p);
 }
+#ifndef RUMOCA_OMIT_INITIALIZATION
 
 {%- if starts %}
 
@@ -505,6 +512,7 @@ extern "C" __global__ void {{ name }}_load_starts_batch(
     }
 }
 {%- endif %}
+#endif  // RUMOCA_OMIT_INITIALIZATION
 
 // ---------------------------------------------------------------------------
 // Events. Relations of the continuous rows read frozen relation memories in
@@ -692,6 +700,7 @@ extern "C" __global__ void {{ name }}_event_update_batch(
     }
 }
 
+#ifndef RUMOCA_OMIT_INITIALIZATION
 // ---------------------------------------------------------------------------
 // Initialization (MLS 8.6): parameter and start bindings, the algebraic
 // refresh, and the initial event. Launch after `{{ name }}_load_starts_batch`
@@ -739,6 +748,7 @@ extern "C" __global__ void {{ name }}_initialize_batch(
         status[batch] = unsettled;
     }
 }
+#endif  // RUMOCA_OMIT_INITIALIZATION
 
 // ---------------------------------------------------------------------------
 // delay(): each lane keeps a ring buffer of accepted (time, source) points in
