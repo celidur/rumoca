@@ -4,44 +4,42 @@
 //! chart transfer, which keeps the coordinate and its row outputs while it
 //! refreshes the target chart.
 //!
-//! The harness fills the arena with a marker before each call and reads back
-//! the highest double the call wrote; every call must succeed without an
-//! exhausted workspace, its high-water mark inside the arena.
+//! The harness compiles its own copy of the generated sources, in which the
+//! double allocator also records the highest top it reaches: the doubles a
+//! chain allocates, written or not. Every chain must fit the generated arena.
+//! The same chains then run in an arena of exactly the highest peak, where
+//! all succeed, and of one double less, where the chain that reached the peak
+//! reports an exhausted workspace and fails with its frames released. The
+//! generated sources themselves are not changed.
 
 use super::*;
 
 /// The checks: settle the start point, refresh, and (for a switching
-/// component) decide a completed step and transfer to the chart it latches,
-/// each from a marked arena.
+/// component) decide completed steps and transfer to the chart one latches,
+/// a transfer from a non-finite coordinate failing first. Each call is one
+/// chain, reported with its status, the doubles it allocated, whether it
+/// reported an exhausted workspace, and whether it released its frames; the
+/// run stops at the first chain that does not answer as expected.
 const CHECKS: &str = r#"
 #include <stdio.h>
-static int failures, exhausted;
-#define CHECK(condition, what) do { if (!(condition)) { printf("FAILED: %s\n", what); failures += 1; } } while (0)
+static int exhausted;
 static void capture(fmi3InstanceEnvironment environment, fmi3Status status, fmi3String category, fmi3String message) {
     (void)environment; (void)status; (void)category;
     if (strstr(message, "workspace exhausted")) exhausted += 1;
 }
-static const uint64_t MARK = 0x7ff4deadbeefcafeull;
-static void mark(ModelInstance* m) {
-    for (size_t i = 0; i < RMC_DWORK; ++i) memcpy(&m->rmc_d[i], &MARK, sizeof(double));
+static int chain(const ModelInstance* m, const char* name, fmi3Status status, fmi3Status expected) {
+    printf("chain %s status=%d peak=%zu exhausted=%d released=%d\n", name, (int)status, arena_peak, exhausted, m->rmc_dtop == 0 && m->rmc_stop == 0);
+    arena_peak = 0; exhausted = 0;
+    return status == expected;
 }
-static size_t high_water(const ModelInstance* m) {
-    size_t top = 0;
-    for (size_t i = 0; i < RMC_DWORK; ++i) if (memcmp(&m->rmc_d[i], &MARK, sizeof(double)) != 0) top = i + 1;
-    return top;
-}
+#define CHAIN(name, call, expected) do { if (!chain(m, name, (call), (expected))) goto done; } while (0)
 int main(void) {
     ModelInstance* m = calloc(1, sizeof *m);
-    CHECK(m != NULL, "allocate the instance");
+    if (!m) return 1;
     initialize_values(m);
     m->logger = capture;
-    size_t peak = 0;
-    mark(m);
-    CHECK(settle_values(m) == fmi3OK, "settle the start point");
-    peak = high_water(m) > peak ? high_water(m) : peak;
-    mark(m);
-    CHECK(refresh_algebraics(m) == fmi3OK, "refresh");
-    peak = high_water(m) > peak ? high_water(m) : peak;
+    CHAIN("settle", settle_values(m), fmi3OK);
+    CHAIN("refresh", refresh_algebraics(m), fmi3OK);
 #ifdef RMC_NCHARTS
     /* Round the circle, an unreachable keep reference makes a completed step
        latch the other chart where it is regular, and the transfer runs to
@@ -49,35 +47,28 @@ int main(void) {
     bool request = false, changed = false, nominals = false;
     for (int step = 1; step < 100 && !request; ++step) {
         m->y[0] = (double)step / 100.0;
-        CHECK(refresh_algebraics(m) == fmi3OK, "refresh round the circle");
+        CHAIN("refresh-circle", refresh_algebraics(m), fmi3OK);
         m->rmc_chart_reference = 1e300;
-        mark(m);
-        CHECK(rmc_chart_completed(m, &request) == fmi3OK, "decide a completed step");
-        CHECK(m->rmc_dtop == 0 && m->rmc_stop == 0, "the decision releases its frame");
-        peak = high_water(m) > peak ? high_water(m) : peak;
+        CHAIN("decide", rmc_chart_completed(m, &request), fmi3OK);
     }
-    CHECK(request, "a completed step requests a switch");
+    if (!request) { printf("no switch requested\n"); goto done; }
     double latched[Y_LEN]; memcpy(latched, m->rmc_chart_y, sizeof(latched));
-    /* A transfer that cannot establish its target releases its frame too. */
     for (size_t k = 0; k < Y_LEN; ++k) m->rmc_chart_y[k] = NAN;
-    mark(m);
-    CHECK(rmc_chart_transfer(m, &changed, &nominals) == fmi3Error, "a transfer from a non-finite coordinate fails");
-    CHECK(m->rmc_dtop == 0 && m->rmc_stop == 0, "the failed transfer releases its frame");
-    peak = high_water(m) > peak ? high_water(m) : peak;
+    CHAIN("transfer-non-finite", rmc_chart_transfer(m, &changed, &nominals), fmi3Error);
     memcpy(m->rmc_chart_y, latched, sizeof(latched)); m->rmc_chart_pending = true;
-    mark(m);
-    CHECK(rmc_chart_transfer(m, &changed, &nominals) == fmi3OK, "transfer to the latched chart");
-    CHECK(m->rmc_dtop == 0 && m->rmc_stop == 0, "the transfer releases its frame");
-    peak = high_water(m) > peak ? high_water(m) : peak;
+    CHAIN("transfer", rmc_chart_transfer(m, &changed, &nominals), fmi3OK);
 #endif
-    CHECK(exhausted == 0, "no call exhausts the workspace");
-    CHECK(peak <= RMC_DWORK, "the high-water mark stays inside the arena");
-    printf("peak %zu of %d\n", peak, RMC_DWORK);
-    if (failures == 0) printf("ok\n");
+    printf("complete\n");
+done:
+    printf("arena %d\n", RMC_DWORK);
     free(m);
-    return failures != 0;
+    return 0;
 }
 "#;
+
+/// The allocation of the double arena in the generated `model.c`, in both
+/// its zeroing and its raw form.
+const ALLOCATION: &str = "m->rmc_dtop += count;";
 
 fn headers() -> Option<PathBuf> {
     if !conformance_prerequisites_are_available() {
@@ -87,13 +78,91 @@ fn headers() -> Option<PathBuf> {
     headers.join("fmi3Functions.h").is_file().then_some(headers)
 }
 
-fn run(compiled: &rumoca::CompilationResult, model: &str) -> String {
+/// One reported chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Chain {
+    name: String,
+    status: i32,
+    peak: usize,
+    exhausted: bool,
+    released: bool,
+}
+
+/// What one run reports: its chains, whether it completed, and its arena.
+#[derive(Debug)]
+struct Report {
+    chains: Vec<Chain>,
+    complete: bool,
+    arena: usize,
+}
+
+fn field<'a>(line: &'a str, key: &str) -> &'a str {
+    line.split_whitespace()
+        .find_map(|word| word.strip_prefix(key)?.strip_prefix('='))
+        .unwrap_or_else(|| panic!("no {key} in {line:?}"))
+}
+
+fn parse(stdout: &str) -> Report {
+    let chains = stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("chain "))
+        .map(|line| Chain {
+            name: line.split_whitespace().next().unwrap_or("").to_string(),
+            status: field(line, "status").parse().expect("a status"),
+            peak: field(line, "peak").parse().expect("a peak"),
+            exhausted: field(line, "exhausted") != "0",
+            released: field(line, "released") == "1",
+        })
+        .collect();
+    let arena = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("arena "))
+        .and_then(|arena| arena.trim().parse().ok())
+        .unwrap_or_else(|| panic!("no arena size in {stdout}"));
+    Report {
+        chains,
+        complete: stdout.lines().any(|line| line == "complete"),
+        arena,
+    }
+}
+
+/// The harness's copy of the sources: the allocator records its peak, and
+/// with `arena`, the arena is that many doubles.
+fn patch_sources(sources: &Path, arena: Option<usize>) {
+    let path = sources.join("model.c");
+    let source = fs::read_to_string(&path).expect("read the generated model source");
+    assert_eq!(
+        source.matches(ALLOCATION).count(),
+        2,
+        "the generated double allocator changed"
+    );
+    let mut patched = source.replace(
+        ALLOCATION,
+        "m->rmc_dtop += count; if (m->rmc_dtop > arena_peak) arena_peak = m->rmc_dtop;",
+    );
+    if let Some(arena) = arena {
+        let define = patched
+            .lines()
+            .find(|line| line.starts_with("#define RMC_DWORK "))
+            .expect("the generated source sizes its arena")
+            .to_string();
+        patched = patched.replace(&define, &format!("#define RMC_DWORK {arena}"));
+    }
+    fs::write(&path, patched).expect("write the harness copy of the model source");
+}
+
+fn run(compiled: &rumoca::CompilationResult, model: &str, arena: Option<usize>) -> Report {
     let headers = headers().expect("checked by the caller");
     let work = tempdir().expect("arena harness work directory");
     let fmu = build_named_fmu(work.path(), compiled, "fmi3", model);
     let sources = fmu.root.join("sources");
+    patch_sources(&sources, arena);
     let harness = work.path().join("arena.c");
-    fs::write(&harness, format!("#include \"model.c\"\n{CHECKS}")).expect("write the harness");
+    fs::write(
+        &harness,
+        format!("#include <stddef.h>\nstatic size_t arena_peak;\n#include \"model.c\"\n{CHECKS}"),
+    )
+    .expect("write the harness");
     let binary = work.path().join("arena");
     let units = [
         "rmc_rows.c",
@@ -123,11 +192,49 @@ fn run(compiled: &rumoca::CompilationResult, model: &str) -> String {
         .output()
         .expect("run the arena harness");
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    assert!(
-        output.status.success() && stdout.contains("\nok"),
-        "{model}: {stdout}"
+    assert!(output.status.success(), "{model}: {stdout}");
+    parse(&stdout)
+}
+
+/// Every chain fits the generated arena; an arena of exactly the highest
+/// peak still holds every chain, and one double less exhausts the chain
+/// that reached it, which fails with its frames released.
+fn check_arena(compiled: &rumoca::CompilationResult, model: &str) -> (usize, usize) {
+    let full = run(compiled, model, None);
+    assert!(full.complete, "{model}: {full:?}");
+    for chain in &full.chains {
+        assert!(
+            !chain.exhausted && chain.released,
+            "{model}: {chain:?} in the generated arena"
+        );
+    }
+    let peak = full
+        .chains
+        .iter()
+        .map(|chain| chain.peak)
+        .max()
+        .unwrap_or(0);
+    assert!(peak > 0, "{model}: no chain allocated");
+    let exact = run(compiled, model, Some(peak));
+    assert!(exact.complete, "{model}: {exact:?} in an arena of {peak}");
+    assert_eq!(exact.chains, full.chains, "{model}: at the peak");
+    let short = run(compiled, model, Some(peak - 1));
+    let first = full
+        .chains
+        .iter()
+        .position(|chain| chain.peak == peak)
+        .expect("a chain reached the peak");
+    assert_eq!(
+        short.chains[..first],
+        full.chains[..first],
+        "{model}: the chains before the peak"
     );
-    stdout
+    let failed = &short.chains[first];
+    assert!(
+        failed.exhausted && failed.released && failed.status == 3 && !short.complete,
+        "{model}: {failed:?} one double short of the peak"
+    );
+    (peak, full.arena)
 }
 
 /// Every frame chain fits the arena, a chart transfer's included.
@@ -158,13 +265,7 @@ fn every_frame_chain_fits_the_projection_arena() {
         ),
     ];
     for (compiled, model) in &models {
-        let output = run(compiled, model);
-        eprintln!(
-            "{model}: {}",
-            output
-                .lines()
-                .find(|line| line.starts_with("peak"))
-                .unwrap_or("")
-        );
+        let (peak, arena) = check_arena(compiled, model);
+        eprintln!("{model}: peak {peak} of {arena}");
     }
 }

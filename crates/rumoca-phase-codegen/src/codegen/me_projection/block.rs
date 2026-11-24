@@ -377,10 +377,11 @@ fn record_rows(
 
 /// The slice each row runs, or `None` for a row that runs its full residual
 /// program. A row reads one output of its program; the slice that computes
-/// it alone stores it as output 0. A residual sweep runs every row, so a
-/// program keeps its full form when its rows' slices would repeat more work
-/// than the program does once; its slicing stops at the first row past that
-/// bound.
+/// it alone stores it as output 0. The rows of one program slice together in
+/// one backward pass (`slice_to_outputs`). A residual sweep runs every row,
+/// so a program keeps its full form when its rows' slices would compute
+/// more register elements than the program does once; the pass stops once
+/// they pass that bound.
 fn row_slices(
     source: &solve::ScalarProgramBlock,
     positions: &[(usize, usize)],
@@ -396,8 +397,9 @@ fn row_slices(
     }
     let programs = source.programs();
     for (program, rows) in rows_of {
-        let offsets = rows.iter().map(|&row| positions[row].1);
-        let Some(program_slices) = program_slices(&programs[program], offsets) else {
+        let program = &programs[program];
+        let offsets: Vec<usize> = rows.iter().map(|&row| positions[row].1).collect();
+        let Some(program_slices) = solve::slice_to_outputs(program, &offsets, true) else {
             continue;
         };
         for (row, slice) in rows.into_iter().zip(program_slices) {
@@ -405,25 +407,6 @@ fn row_slices(
         }
     }
     slices
-}
-
-/// The slices of one program's rows, or `None` once their operations, a
-/// row that does not slice counting the whole program, exceed the program's.
-fn program_slices(
-    program: &[solve::LinearOp],
-    offsets: impl Iterator<Item = usize>,
-) -> Option<Vec<Option<Vec<solve::LinearOp>>>> {
-    let mut total = 0usize;
-    let mut slices = Vec::new();
-    for offset in offsets {
-        let slice = solve::slice_to_output(program, offset);
-        total += slice.as_ref().map_or(program.len(), Vec::len);
-        if total > program.len() {
-            return None;
-        }
-        slices.push(slice);
-    }
-    Some(slices)
 }
 
 /// The issued colored forward application of the block Jacobian, flattened

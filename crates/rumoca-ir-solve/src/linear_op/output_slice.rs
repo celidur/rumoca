@@ -8,7 +8,11 @@
 //! of a row of an `n`-element equation does about `1/n` of the work.
 
 use super::*;
+use crate::FaultClass;
 use std::collections::BTreeSet;
+
+mod rows;
+pub use rows::slice_to_outputs;
 
 /// The program that computes stored output `output` of `program` and stores
 /// it as its only output, or `None` when `output` is out of range or the
@@ -17,9 +21,17 @@ use std::collections::BTreeSet;
 /// as in `program` and keeps its order, so the stored value is the same bit
 /// for bit. Only the operations before the store of `output` can produce the
 /// value it stores; a later write to its register is another value.
+///
+/// A slice only drops operations that cannot fail: the full program fails
+/// every output with any of its calls, lookups or solves, so an output stored
+/// before one of them declines. Every operation the sweep models cannot fail
+/// either, and any other declines before its store.
 #[must_use]
 pub fn slice_to_output(program: &[LinearOp], output: usize) -> Option<Vec<LinearOp>> {
     let (store, target) = output_register(program, output)?;
+    if program[store + 1..].iter().any(can_fail) {
+        return None;
+    }
     let mut live = BTreeSet::from([target]);
     // The elements each kept operation must still write, in program order.
     let mut keep: Vec<Option<Kept>> = vec![None; program.len()];
@@ -77,6 +89,25 @@ fn output_register(program: &[LinearOp], output: usize) -> Option<(usize, Reg)> 
         }
     }
     None
+}
+
+/// The register elements `op` writes, one for a scalar or a store: the work
+/// a residual sweep weighs a program and its slices by.
+pub(super) fn work(op: &LinearOp) -> usize {
+    op.dst_register_count().max(1)
+}
+
+pub(super) fn program_work(program: &[LinearOp]) -> usize {
+    program.iter().map(work).fold(0usize, usize::saturating_add)
+}
+
+/// Whether `op` can fail the program, a store aside: the operations its
+/// fault class lets no pass drop.
+fn can_fail(op: &LinearOp) -> bool {
+    !matches!(
+        op,
+        LinearOp::StoreOutput { .. } | LinearOp::StoreOutputRange { .. }
+    ) && op.fault_class() != FaultClass::CannotFault
 }
 
 fn register(base: Reg, offset: usize) -> Option<Reg> {
@@ -532,6 +563,31 @@ mod tests {
             *width = 2;
         }
         assert!(slice_to_output(&lanes, 1).is_none());
+    }
+
+    /// r0 = y0; store r0; r1 = 0; r4 = table(r1, r1, r0); store r4. The
+    /// lookup after the first store can fail, and the full program fails
+    /// every row with it, so no row may slice it away.
+    pub(super) fn a_store_before_a_fallible_operation() -> Vec<LinearOp> {
+        vec![
+            LinearOp::LoadY { dst: 0, index: 0 },
+            LinearOp::StoreOutput { src: 0 },
+            LinearOp::Const { dst: 1, value: 0.0 },
+            LinearOp::TableLookup {
+                dst: 4,
+                table_id: 1,
+                column: 1,
+                input: 0,
+            },
+            LinearOp::StoreOutput { src: 4 },
+        ]
+    }
+
+    #[test]
+    fn a_fallible_operation_after_the_store_declines() {
+        let program = a_store_before_a_fallible_operation();
+        assert!(slice_to_output(&program, 0).is_none());
+        assert!(slice_to_output(&program, 1).is_none());
     }
 
     #[test]
