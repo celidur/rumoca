@@ -146,8 +146,38 @@ equation
   der(x) = -k * x;
 end DeviceInitDelayAlgebraic;";
 
+/// A parameter binding that passes a transposed parameter matrix to a
+/// function (a `TensorTranspose` operand, as in `inv(transpose(Ti))`), read by
+/// the initial equation of a `fixed = false` parameter.
+const TRANSPOSED_BINDING: &str = "model DeviceInitTranspose
+  function scaled
+    input Real M[2, 2];
+    input Real s;
+    output Real y[2, 2];
+  algorithm
+    for i in 1:2 loop
+      for j in 1:2 loop
+        y[i, j] := s * M[i, j] + i;
+      end for;
+    end for;
+  end scaled;
+  parameter Real A[2, 2] = {{1, 2}, {3, 4}};
+  parameter Real g = 2;
+  parameter Real B[2, 2] = scaled(transpose(A), g);
+  parameter Real k(fixed = false, start = 1);
+  Real x(start = 1, fixed = true);
+initial equation
+  k * k * k + k = B[1, 2] + B[2, 1] * x;
+equation
+  der(x) = -k * x;
+end DeviceInitTranspose;";
+
 pub(crate) fn models() -> Vec<(rumoca::CompilationResult, &'static str)> {
     vec![
+        (
+            compile(TRANSPOSED_BINDING, "DeviceInitTranspose"),
+            "DeviceInitTranspose",
+        ),
         (compile(STATE_SEEDS, "DeviceInitSeeds"), "DeviceInitSeeds"),
         (
             compile(PARAMETER_OVER_SEEDS, "DeviceInitParameterSeed"),
