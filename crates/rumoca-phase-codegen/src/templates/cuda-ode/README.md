@@ -53,7 +53,8 @@ and integration (including event location and stopping at time events).
   the C FMI components do (`status` adds 2 when it does not converge;
   `<MODEL>_INIT_TOLERANCE` can be overridden with `-D`). The shared kernel
   admits the initial equations of the C profile: rows evaluated on the
-  settled algebraic refresh.
+  settled algebraic refresh, and rows over state and parameter seeds that
+  read no continuous algebraic.
 - Functions: pure-function bodies that cannot be inlined (data-dependent
   loops, such as table interpolation or sorting) are emitted as typed
   `__device__` functions. A failed error-level assertion inside one fails
@@ -68,10 +69,11 @@ and integration (including event location and stopping at time events).
 ## Unsupported
 
 This is not an NVRTC executor, an FMU, or a full simulator: there is no
-integrator. Initial equations outside the C initialization profile (rows
-over state starts alone, homotopy, delays during initialization), a retained
-state-manifold projection, a reduced chart set with alternate charts,
-error-level model assertions, linear-solve tensor ops, clocks, external
+integrator. Initial equations outside the C initialization profile (a row
+reading an algebraic without a settled row role, homotopy, delays during
+initialization), a retained state-manifold projection, a reduced chart set
+with alternate charts, error-level model assertions, linear-solve tensor ops,
+clocks, external
 functions, callbacks, and unsupported operations fail before source is
 written. No GPU availability
 is inferred from successful source generation.
