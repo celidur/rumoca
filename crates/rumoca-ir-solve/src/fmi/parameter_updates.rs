@@ -216,13 +216,20 @@ pub(super) fn stable_parameters(problem: &SolveProblem) -> Vec<bool> {
 }
 
 /// The initialization projection the C kernel runs: the runtime's
-/// `settle_initialization_system` without a homotopy sweep, delay history,
-/// or retained manifold rows. Its residual rows are evaluated on the settled
-/// coordinates (the bindings and the algebraic refresh applied first) when a
-/// row role reads a reconstructed algebraic, as the runtime does
+/// `settle_initialization_system` without a homotopy sweep or retained
+/// manifold rows. Its residual rows are evaluated on the settled coordinates
+/// (the bindings and the algebraic refresh applied first) when a row role
+/// reads a reconstructed algebraic, as the runtime does
 /// ([`initial_rows_read_settled_view`]); otherwise on the instance
 /// coordinates, with single-row isolation and the forward initial Jacobian,
 /// which matches the runtime only when no row reads a continuous algebraic.
+///
+/// Delays need no history while initializing: `delay(u, ...) = u` (MLS
+/// §3.7.2), so the kernel holds each delayed value at its source before every
+/// pass and refreshes it after the projection, as the runtime's
+/// `refresh_delay_values` does before any history is committed. The history
+/// itself belongs to the target that steps the model; the FMI C profile
+/// still refuses delays as runtime events.
 fn validate_projection(problem: &SolveProblem) -> Result<(), &'static str> {
     let init = &problem.initialization;
     if init.projection_plan().iterates_discretes {
@@ -248,10 +255,6 @@ fn validate_projection(problem: &SolveProblem) -> Result<(), &'static str> {
         .is_some()
     {
         return Err("C initialization cannot run the homotopy continuation");
-    }
-    let delays = &problem.events.delays;
-    if !delays.source_rhs.is_empty() || !delays.value_parameter_indices.is_empty() {
-        return Err("C initialization cannot synchronize delay histories");
     }
     if !initial_rows_read_settled_view(problem) && !residuals_read_no_algebraic(problem) {
         return Err(

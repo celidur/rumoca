@@ -571,6 +571,7 @@ fn row_unknowns<'dae>(
         substituted: BTreeSet::new(),
         expanded: BTreeSet::new(),
         algebraics: BTreeSet::new(),
+        delays: BTreeSet::new(),
         pending,
     };
     if let InitialRowIncidence::AlgebraicValue {
@@ -709,6 +710,8 @@ struct InitialIncidence<'dae> {
     expanded: BTreeSet<(u32, usize)>,
     /// Algebraic coordinates already expanded, including coupled-loop members.
     algebraics: BTreeSet<(u32, usize)>,
+    /// Delayed values already followed into their sources.
+    delays: BTreeSet<(u32, usize)>,
     pending: Vec<ScalarRowSource<'dae>>,
 }
 
@@ -731,6 +734,7 @@ impl<'dae> InitialIncidence<'dae> {
             dae::CoordinateView::Algebraic(variable) => {
                 self.visit_algebraic(space, variable, scalar);
             }
+            dae::CoordinateView::Delay(delay) => self.visit_delay(space, delay, scalar),
             // A discrete whose initial definition settles before the projection
             // is a known value of it, and so is its `pre` storage, which the
             // same definition writes.
@@ -787,6 +791,40 @@ impl<'dae> InitialIncidence<'dae> {
             Some(definition) => self.pending.push(definition.into_owned()),
             None => self.exclude(solve::InitializationCoordinateKind::Algebraic),
         }
+    }
+
+    /// Follow a delayed value into its source.
+    ///
+    /// MLS 3.6 §3.7.2: `delay(expr, ...)` is `expr` during initialization, and
+    /// `settle_initialization_system` holds every delayed value at its source
+    /// before each projection pass and refreshes it after the pass, so the
+    /// value a row reads is a function of what the source reads. Within one
+    /// pass the delayed value is held, like a held discrete: the pass solves
+    /// the unknowns the source reaches through the other rows, and a moved
+    /// source sends the settle loop round again.
+    fn visit_delay(
+        &mut self,
+        space: &InitializationUnknownSpace<'_, 'dae>,
+        delay: dae::DelayId<'dae>,
+        scalar: usize,
+    ) {
+        if !self.delays.insert((delay.index(), scalar)) {
+            return;
+        }
+        let Some(view) = space.view.delay(delay) else {
+            self.exclude(solve::InitializationCoordinateKind::Unreadable);
+            return;
+        };
+        let source = view.source();
+        self.pending.push(ScalarRowSource {
+            expression: source,
+            scalar: if scalar_count(space.view, source) == 1 {
+                0
+            } else {
+                scalar
+            },
+            domain_point: None,
+        });
     }
 
     /// Record why the row cannot be planned, keeping the loudest reason found.
