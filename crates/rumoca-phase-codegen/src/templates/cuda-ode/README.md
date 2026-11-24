@@ -33,6 +33,10 @@ and integration (including event location and stopping at time events).
   `__device__` functions. A failed error-level assertion inside one is
   observed as an event root; a domain error makes that lane's results NaN.
 - `<model>_EVENT_MAX_PASSES` can be overridden with `-D`.
+- Build option: `-DRUMOCA_OMIT_INITIALIZATION` leaves out what only
+  initialization uses (parameter and start initialization, start tables,
+  bindings, `<model>_initialize_batch`), for a device build whose host
+  initializes the lanes.
 
 ## Unsupported
 
