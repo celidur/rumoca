@@ -23,6 +23,10 @@ fn cuda_ode_shared_projection_kernel_compiles_with_required_nvcc() {
             state_count(&compiled),
         );
         fs::write(&source, unit).expect("write the device unit");
+        // As in the host build (`-Wno-unused-function`), the unit holds every
+        // refresh entry and this kernel reaches only the algebraic refresh, so
+        // the entries a lane kernel calls elsewhere stand unreferenced here
+        // (diagnostic 177).
         run_checked(
             Command::new("nvcc")
                 .args([
@@ -30,6 +34,8 @@ fn cuda_ode_shared_projection_kernel_compiles_with_required_nvcc() {
                     "--fmad=false",
                     "-Werror",
                     "all-warnings",
+                    "-diag-suppress",
+                    "177",
                     "-c",
                 ])
                 .arg(&source)

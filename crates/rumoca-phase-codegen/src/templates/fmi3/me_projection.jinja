@@ -1100,7 +1100,7 @@ RMC_COLD {{ q }} int rmc_nudge(ModelInstance* m, const RmcBlock* b, const double
             double candidate = current + step;
             if (!isfinite(step) || !isfinite(candidate)) { finite = false; break; }
             changed = changed || candidate != current;
-            at_resolution = at_resolution && (candidate == current || candidate == nextafter(current, INFINITY) || candidate == nextafter(current, -INFINITY));
+            at_resolution = at_resolution && (candidate == current || candidate == nextafter(current, {{ "HUGE_VAL" if device else "INFINITY" }}) || candidate == nextafter(current, {{ "-HUGE_VAL" if device else "-INFINITY" }}));
             m->y[b_y_pool[i]] = candidate;
         }
         if (!finite || !changed) break;
@@ -1375,7 +1375,7 @@ typedef struct { unsigned char kind; size_t first; size_t count; size_t block; s
     if (complete) { m->rmc_fb_calls[RMC_FB_PLAN] += 1; m->rmc_fb_active[RMC_FB_PLAN] = true; }
 {%- endif %}
     for (size_t s = 0; s < nsteps; ++s) {
-        const RmcStep* step = &steps[s]; int result = 0; (void)result;
+        const RmcStep* step = &steps[s];{% if assigns or not device %} int result = 0; (void)result;{% endif %}
         switch (step->kind) {
 {%- if assigns %}
         case RMC_STEP_ASSIGN:
