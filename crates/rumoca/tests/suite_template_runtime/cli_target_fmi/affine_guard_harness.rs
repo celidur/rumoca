@@ -28,7 +28,7 @@ const HARNESS: &str = r#"#include <stddef.h>
    kernel reads for that descriptor (RMC_BLOCK_POOL). */
 static const void* h_desc;
 static const size_t H_POOL[38];
-#define RMC_BLOCK_POOL(b) ((const void*)(b)->d == h_desc ? H_POOL : rmc_pool)
+#define RMC_BLOCK_POOL(b) ((const void*)(b) == h_desc ? H_POOL : rmc_pool)
 #include "model.c"
 #include <stdio.h>
 
@@ -97,7 +97,7 @@ static int run(const char* label, double a[4][4], size_t want_k) {
     d.guard_step = 32;
     d.elim_capacity = 5;
     h_desc = &d;
-    RmcBlock b = { 0, &d };
+    const RmcBlock* b = &d;
 
     double jac[16];
     double rscale[4] = {1, 2, 1, 0.5};
@@ -111,8 +111,8 @@ static int run(const char* label, double a[4][4], size_t want_k) {
     }
 
     RmcElimination e = { .state = -1 };
-    int prepared = rmc_eliminate_prepare(m, &b, jac, rscale, vscale, &e);
-    int solved = prepared == 1 ? rmc_eliminate_solve(m, &b, &e, residual, rscale, vscale, delta) : -9;
+    int prepared = rmc_eliminate_prepare(m, b, jac, rscale, vscale, &e);
+    int solved = prepared == 1 ? rmc_eliminate_solve(m, b, &e, residual, rscale, vscale, delta) : -9;
 
     double reference[4] = {-residual[0], -residual[1], -residual[2], -residual[3]};
     dense_solve(a, reference);

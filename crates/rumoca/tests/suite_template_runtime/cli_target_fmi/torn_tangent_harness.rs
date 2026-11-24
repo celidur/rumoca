@@ -95,8 +95,7 @@ int main(void) {
     bits("p", m->p, P_LEN);
     bits("t", &m->time, 1);
     for (size_t index = 0; index < sizeof(rmc_block_desc) / sizeof(rmc_block_desc[0]); ++index) {
-        RmcBlock view;
-        const RmcBlock* b = rmc_block_view(index, &view);
+        const RmcBlock* b = rmc_block(index);
         if (!RMC_BS(b, torn)) continue;
         size_t k = RMC_BS(b, k);
         double* jac = calloc(k * k + 1, sizeof(double));

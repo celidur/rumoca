@@ -119,7 +119,8 @@ fn model_c(model: &str, source: &str, target: &str) -> String {
 }
 
 /// `RmcBlockDesc` field names in their C initializer order.
-const FIELDS: [&str; 55] = [
+const FIELDS: [&str; 56] = [
+    "id",
     "canonical",
     "n",
     "y",
@@ -245,8 +246,11 @@ fn parse_tables(source: &str) -> Option<Tables> {
             Some(Block(inner.split(',').map(parse_value).collect()))
         })
         .collect::<Vec<_>>();
-    for block in &blocks {
+    for (index, block) in blocks.iter().enumerate() {
         assert_eq!(block.0.len(), FIELDS.len(), "descriptor arity: {block:?}");
+        // A descriptor names its own row: the kernel reads a block's
+        // fallback site from it, not from a second pointer.
+        assert_eq!(block.0[0], index, "descriptor id is its row: {block:?}");
     }
     let pool = braced_body(source, "static const size_t rmc_pool[")?
         .split(',')
