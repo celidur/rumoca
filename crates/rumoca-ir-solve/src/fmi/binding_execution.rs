@@ -91,10 +91,13 @@ pub struct SolveBindingExecution {
 
 impl SolveBindingExecution {
     /// Admit the parameter bindings and the C initialization shape
-    /// (`parameter_updates::validate`) and issue their execution rows.
+    /// (`parameter_updates::validate`) and issue their execution rows. The
+    /// target projects onto the retained state manifold itself, so its
+    /// initialization certifies the settled states there
+    /// (`rmc_certify_state_manifold`) and admits the retained manifold rows.
     pub fn checked(model: &crate::SolveModel) -> Result<Self, &'static str> {
         let (order, levels) =
-            super::parameter_updates::validate(&model.problem, &model.pure_calls)?;
+            super::parameter_updates::validate(&model.problem, &model.pure_calls, true)?;
         let init = &model.problem.initialization;
         let execution =
             BindingExecution::checked(init.update_rhs(), init.update_targets(), &order)?;

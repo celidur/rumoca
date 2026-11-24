@@ -126,9 +126,10 @@ fn classify_initialized_coordinates(problem: &SolveProblem, variables: &mut [Fmi
 pub(super) fn validate(
     problem: &SolveProblem,
     calls: &SolvePureCallTable,
+    certifies_state_manifold: bool,
 ) -> Result<(Vec<usize>, usize), &'static str> {
     let init = &problem.initialization;
-    validate_projection(problem, calls)?;
+    validate_projection(problem, calls, certifies_state_manifold)?;
     let mut p = stable_parameters(problem);
     let y = vec![false; problem.layout.y_scalars()];
     // A parameter target is settled once its binding runs; a state target is a
@@ -216,15 +217,23 @@ pub(super) fn stable_parameters(problem: &SolveProblem) -> Vec<bool> {
 }
 
 /// The initialization projection the C kernel runs: the runtime's
-/// `settle_initialization_system` without a homotopy sweep, delay history,
-/// or retained manifold rows, for residual rows evaluated on the settled
+/// `settle_initialization_system` without a homotopy sweep or delay history,
+/// for residual rows evaluated on the settled
 /// coordinates (the bindings and the algebraic refresh applied first, as the
 /// runtime does whenever a row reads a reconstructed algebraic). Rows over
 /// declaration seeds need single-row isolation and the forward-mode initial
 /// Jacobian, which the C kernel does not emit.
+///
+/// The retained state-manifold rows close the residual as ordinary rows,
+/// which the runtime settles with the others; the linked kernel then
+/// certifies the settled states on the manifold (`certify_state_manifold`).
+/// A target that certifies them (`certifies_state_manifold`: the shared
+/// kernel's `rmc_initialize` calling `rmc_certify_state_manifold`) admits
+/// them; the FMI C component, which never emits that projection, does not.
 fn validate_projection(
     problem: &SolveProblem,
     calls: &SolvePureCallTable,
+    certifies_state_manifold: bool,
 ) -> Result<(), &'static str> {
     use crate::{InitializationCoordinateKind, InitializationRowRole};
     let init = &problem.initialization;
@@ -242,7 +251,7 @@ fn validate_projection(
             Err("C initialization projects blocks without residual rows")
         };
     }
-    if init.manifold_row_count() > 0 {
+    if init.manifold_row_count() > 0 && !certifies_state_manifold {
         return Err("C initialization cannot certify retained state-manifold rows");
     }
     if problem

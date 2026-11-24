@@ -52,7 +52,9 @@ settled initialization (bindings and the initialization projection alternate
 until the bindings stop changing, each residual row evaluated after the
 algebraic refresh) through the shared projection kernel at the FMI tolerance.
 Initialization rows over declaration seeds, homotopy continuation, delay
-histories, and retained state-manifold rows are refused.
+histories, and retained state-manifold rows are refused. A lane target that
+emits `manifold_kernel` admits the manifold rows: its `rmc_initialize`
+certifies the settled states on the manifold, as the linked kernel does.
 A retained state-manifold projection is refused too: FMI 3 Model Exchange has
 no call that moves the continuous states at an accepted point. The shared
 kernel's `manifold_kernel` projects onto that manifold for a target that drives
