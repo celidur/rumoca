@@ -39,7 +39,8 @@ pub(super) fn validate(
     // The lane kernels run a staged refresh made of exact-assignment stages
     // themselves (`solve_blocks.lanes.refresh`) and one that retains
     // projection stages with the shared ME projection kernel, built per lane
-    // (SPEC_0044 ME-PROJ-001), so neither needs residual export.
+    // (SPEC_0044 ME-PROJ-001), so neither needs residual export. That kernel
+    // also projects the lane's states onto a retained state manifold.
     let problem = &lowered.model().problem;
     // A lane refreshes on the primary chart alone: no lane kernel switches
     // among the executable alternate charts of a reduced chart set (SPEC_0040
@@ -58,7 +59,7 @@ pub(super) fn validate(
     let mut capabilities = capabilities.clone();
     if capabilities.exact_algebraic_assignments == Some(true)
         && (rumoca_phase_codegen::lane_refresh_admissible(problem)
-            || rumoca_phase_codegen::me_refresh_admissible(problem))
+            || rumoca_phase_codegen::me_refresh_admissible_with_state_manifold(problem))
     {
         capabilities.residual_equations = Some(true);
     }

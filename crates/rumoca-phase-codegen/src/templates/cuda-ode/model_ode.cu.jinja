@@ -226,13 +226,17 @@
 // own capability and differential evidence before this target may advertise
 // them.
 
+{#- The shared projection kernel is compiled into the unit when the refresh
+    retains projection stages, the initialization has residual rows, or the
+    model retains a state manifold. -#}
+{%- set kernel_unit = me_refresh is defined and (me_refresh.blocks | length > 0 or me_refresh.init.rows > 0 or solve_blocks.state_manifold.blocks | length > 0) %}
 // NVRTC (runtime compilation) provides the math builtins but no libc headers.
 #ifndef __CUDACC_RTC__
 #include <math.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
-{%- if me_refresh is defined and (me_refresh.blocks | length > 0 or me_refresh.init.rows > 0) %}
+{%- if kernel_unit %}
 #include <float.h>
 #include <stdbool.h>
 {%- endif %}
@@ -253,7 +257,7 @@ typedef unsigned long long uint64_t;
 #endif
 {%- set lane_functions = solve_blocks.lanes.functions %}
 {%- set has_functions = lane_functions.table.owners | length > 0 %}
-{{ real_extremum_prelude("cuda", has_functions or (me_refresh is defined and me_refresh.blocks | length > 0)) }}
+{{ real_extremum_prelude("cuda", has_functions or kernel_unit) }}
 {%- if has_functions %}
 // Typed pure functions the lane programs call (bodies with data-dependent
 // loops, which cannot be inlined into the scalar rows).
@@ -282,7 +286,10 @@ typedef unsigned long long uint64_t;
     parameter bindings and the initialization projection alternate until the
     bindings stop changing. -#}
 {%- set shared_init = me_refresh is defined and me_refresh.init.rows > 0 %}
-{%- set kernel = shared or shared_init %}
+{#- A retained state manifold is projected by the shared kernel after each
+    accepted step (`rmc_project_state_manifold`). -#}
+{%- set manifold = solve_blocks.state_manifold if kernel_unit and solve_blocks.state_manifold.blocks | length > 0 else none %}
+{%- set kernel = kernel_unit %}
 {%- set refresh = lanes.refresh if staged and not shared else none %}
 {%- set ev = lanes.events %}
 {%- set delays = lanes.delays %}
@@ -296,6 +303,9 @@ typedef unsigned long long uint64_t;
 #define {{ NAME }}_EVENT_INDICATORS {{ nroots }}
 #define {{ NAME }}_TIME_EVENTS {{ ev.time_events | length }}
 #define {{ NAME }}_DELAYS {{ delays.count }}
+// Blocks of the retained state manifold. When it is not 0, launch
+// `{{ name }}_project_states_batch` after each accepted step.
+#define {{ NAME }}_MANIFOLD_BLOCKS {{ manifold.blocks | length if manifold else 0 }}
 // Passes an event iteration may take. Override with -D before compiling.
 #ifndef {{ NAME }}_EVENT_MAX_PASSES
 #define {{ NAME }}_EVENT_MAX_PASSES 32
@@ -334,7 +344,7 @@ const double {{ name }}_time_events[{{ ev.time_events | length }}] = { {% for ti
 // initial event iteration settles the discrete rows after initialization.
 static __device__ rmcStatus update_discrete_equations(ModelInstance* m) { (void)m; return rmcOK; }
 {{ binding_updates(solve, me_bindings, "rmc", device=true) }}
-{{ device_kernel(solve, me_refresh, "rmc") }}
+{{ device_kernel(solve, me_refresh, "rmc", manifold) }}
 #if defined(__GNUC__) && !defined(__CUDACC__)
 #pragma GCC diagnostic pop
 #endif
@@ -361,6 +371,48 @@ extern "C" __global__ void {{ name }}_workspace_init_batch(void *instances, int 
         rmc_lane_reset(m);
     }
 }
+{%- if manifold %}
+
+// Move the accepted states of every lane back onto the retained state
+// manifold (the constraints index reduction replaced). Launch after each
+// accepted step, before the next event update or right-hand side. `status`
+// (may be null) receives, per lane, 0 or 1 when the projection failed; the
+// states of a failed lane are left as they were.
+extern "C" __global__ void {{ name }}_project_states_batch(
+    double time,
+    double *y,
+    const double *p,
+    int *status,
+    int y_stride,
+    int p_stride,
+    int batch_count)
+{
+    int batch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (batch >= batch_count) {
+        return;
+    }
+    double *batch_y = y + ((long long)batch * (long long)y_stride);
+    const double *batch_p = p + ((long long)batch * (long long)p_stride);
+    ModelInstance *m = {{ name }}_lane_instances + RUMOCA_LANE_INDEX;
+    m->time = time;
+    for (int i = 0; i < {{ y_len }}; ++i) {
+        m->y[i] = batch_y[i];
+    }
+    for (int i = 0; i < {{ p_len }}; ++i) {
+        m->p[i] = batch_p[i];
+    }
+    bool changed = false;
+    int failed = rmc_project_state_manifold(m, m->rmc_tol, &changed) != 0;
+    if (changed && !failed) {
+        for (int i = 0; i < {{ state_count }}; ++i) {
+            batch_y[i] = m->y[i];
+        }
+    }
+    if (status) {
+        status[batch] = failed;
+    }
+}
+{%- endif %}
 {%- else %}
 #define {{ NAME }}_LANE_WORKSPACE_BYTES 0
 {%- endif %}

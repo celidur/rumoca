@@ -30,6 +30,11 @@ and integration (including event location and stopping at time events).
   projections (SPEC_0044 ME-PROJ-005).
   `<model>_refresh_batch` and `<model>_rhs_batch` report a failed refresh in
   `status`, and `<model>_event_update_batch` reports it as `-1` passes.
+- State manifold: when index reduction retains constraints over the states
+  (`<model>_MANIFOLD_BLOCKS` is not 0), the same kernel certifies the
+  initialized states on them and `<model>_project_states_batch` moves the
+  accepted states of every lane back onto them. Launch it after each
+  accepted step; it reports a failed projection in `status`.
 - Events: `<model>_event_indicators_batch` returns the root functions,
   `<model>_event_update_batch` iterates relation memories and discrete
   equations to a fixed point, and reports a non-finite root as `-1` passes.
@@ -70,9 +75,9 @@ and integration (including event location and stopping at time events).
 
 This is not an NVRTC executor, an FMU, or a full simulator: there is no
 integrator. Initial equations outside the C initialization profile (a row
-reading an algebraic without a settled row role, homotopy), a retained
-state-manifold projection, a reduced chart set with alternate charts,
-error-level model assertions, linear-solve tensor ops, clocks, external
+reading an algebraic without a settled row role, homotopy), a reduced chart
+set with alternate charts, error-level model assertions, linear-solve tensor
+ops, clocks, external
 functions, callbacks, and unsupported operations fail before source is
 written. No GPU availability
 is inferred from successful source generation.
