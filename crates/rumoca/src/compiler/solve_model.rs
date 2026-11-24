@@ -21,8 +21,8 @@ pub(super) fn build_solve_model_template_renderer(
     let prepared = lowered.prepared_dae();
     let model = Arc::new(lowered.model().clone());
     // A refresh made of exact assignments and an initialization made of
-    // bindings need no projection kernel; one that retains a projection stage
-    // or initialization residual rows is rendered with the ME refresh view,
+    // bindings need no projection kernel; one that retains a projection stage,
+    // initialization residual rows or a state manifold is rendered with the ME refresh view,
     // from which the target compiles the shared kernel per lane.
     let initial_rows = model
         .problem
@@ -30,7 +30,8 @@ pub(super) fn build_solve_model_template_renderer(
         .residual()
         .len()
         .is_ok_and(|rows| rows > 0);
-    if rumoca_phase_codegen::lane_refresh_admissible(&model.problem) && !initial_rows {
+    let manifold = !model.problem.continuous.manifold_projection_plan.is_empty();
+    if rumoca_phase_codegen::lane_refresh_admissible(&model.problem) && !initial_rows && !manifold {
         SolveTemplateRenderer::new_owned_model_with_dae(model, prepared)
     } else {
         SolveTemplateRenderer::new_owned_model_with_me_projection(model, prepared)
