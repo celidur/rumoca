@@ -39,6 +39,30 @@ impl SolveTemplateRenderer {
         })
     }
 
+    /// [`Self::new_owned_model_with_dae`] with the ME refresh view of the
+    /// model (`me_refresh`), for a target that compiles the shared projection
+    /// kernel for a device (`fmi-me-projection.jinja`: `device_instance` and
+    /// `device_kernel`), and the pure-call families its programs and typed
+    /// functions name, as the FMI renderer supplies them.
+    pub fn new_owned_model_with_me_projection(
+        model: std::sync::Arc<solve::SolveModel>,
+        dae_model: &dae::Dae,
+    ) -> Result<Self, CodegenError> {
+        let me_refresh = super::me_projection::me_refresh_value(model.as_ref())?;
+        let pure_calls = super::pure_call_families::PureCallFamilies::new(&model.pure_calls)?;
+        let renderer = Self::new_owned_model_with_dae(model, dae_model)?;
+        Ok(Self {
+            context: minijinja::context! {
+                me_refresh => me_refresh,
+                typed_pure_calls => pure_calls.owners_value(),
+                typed_directional_calls => pure_calls.directional_value(),
+                pure_call_symbols => pure_calls.symbols_value(),
+                ..renderer.context
+            },
+            ..renderer
+        })
+    }
+
     pub fn new(
         problem: &solve::SolveProblem,
         artifacts: &solve::SolveArtifacts,
