@@ -204,12 +204,11 @@ fn optional_initialization_tangent_admission_preserves_both_primal_c_exports() {
 }
 
 #[test]
-fn parameter_only_admission_does_not_waive_declaration_y_isolation() {
+fn a_declaration_y_row_is_admitted_through_its_isolation() {
     let source = "model DeclaredState\nReal x(start=0,fixed=false);\ninitial equation\nx=1;\nequation\nder(x)=-x;\nend DeclaredState;";
-    let error = lower_component("DeclaredState", source)
+    lower_component("DeclaredState", source)
         .try_c()
-        .expect_err("a declaration-Y row still needs its missing isolated initializer owner");
-    assert!(error.to_string().contains("declaration seeds"));
+        .expect("a row over a state seed is evaluated on the instance coordinates");
 }
 
 #[test]

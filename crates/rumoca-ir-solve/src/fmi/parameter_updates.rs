@@ -128,7 +128,7 @@ pub(super) fn validate(
     calls: &SolvePureCallTable,
 ) -> Result<(Vec<usize>, usize), &'static str> {
     let init = &problem.initialization;
-    validate_projection(problem, calls)?;
+    validate_projection(problem)?;
     let mut p = stable_parameters(problem);
     let y = vec![false; problem.layout.y_scalars()];
     // A parameter target is settled once its binding runs; a state target is a
@@ -217,16 +217,13 @@ pub(super) fn stable_parameters(problem: &SolveProblem) -> Vec<bool> {
 
 /// The initialization projection the C kernel runs: the runtime's
 /// `settle_initialization_system` without a homotopy sweep, delay history,
-/// or retained manifold rows, for residual rows evaluated on the settled
-/// coordinates (the bindings and the algebraic refresh applied first, as the
-/// runtime does whenever a row reads a reconstructed algebraic). Rows over
-/// declaration seeds need single-row isolation and the forward-mode initial
-/// Jacobian, which the C kernel does not emit.
-fn validate_projection(
-    problem: &SolveProblem,
-    calls: &SolvePureCallTable,
-) -> Result<(), &'static str> {
-    use crate::{InitializationCoordinateKind, InitializationRowRole};
+/// or retained manifold rows. Its residual rows are evaluated on the settled
+/// coordinates (the bindings and the algebraic refresh applied first) when a
+/// row role reads a reconstructed algebraic, as the runtime does
+/// ([`initial_rows_read_settled_view`]); otherwise on the instance
+/// coordinates, with single-row isolation and the forward initial Jacobian,
+/// which matches the runtime only when no row reads a continuous algebraic.
+fn validate_projection(problem: &SolveProblem) -> Result<(), &'static str> {
     let init = &problem.initialization;
     if init.projection_plan().iterates_discretes {
         return Err("C initialization cannot alternate the projection with held discretes");
@@ -256,17 +253,9 @@ fn validate_projection(
     if !delays.source_rhs.is_empty() || !delays.value_parameter_indices.is_empty() {
         return Err("C initialization cannot synchronize delay histories");
     }
-    let settled = init.row_roles().iter().any(|role| {
-        matches!(
-            role,
-            InitializationRowRole::UnownedCoordinate(InitializationCoordinateKind::Algebraic)
-                | InitializationRowRole::SolvedThroughAlgebraicRefresh
-                | InitializationRowRole::SurplusAlgebraicCheck
-        )
-    });
-    if !settled && !parameter_input_residuals(problem, calls) {
+    if !initial_rows_read_settled_view(problem) && !residuals_read_no_algebraic(problem) {
         return Err(
-            "C initialization evaluates residual rows only on the settled algebraic refresh; rows over declaration seeds need row isolation and a forward initial Jacobian",
+            "C initialization evaluates a row that reads a continuous algebraic only on the settled algebraic refresh, which its row roles do not select",
         );
     }
     if problem.solve_layout.solver_scalar_count() != problem.layout.y_scalars() {
@@ -275,122 +264,107 @@ fn validate_projection(
     Ok(())
 }
 
-/// A scalar row reading only parameters, constants and importer inputs that
-/// the binding/discrete refresh does not write has the same value before and after
-/// settling. The existing full Y|P JVP initialization kernel therefore needs no declaration-Y isolation
-/// for these rows. Hidden pre/history lanes are not ordinary P declarations.
-/// Compact tensor/Y/time/history cases retain their existing admission rule.
-fn parameter_input_residuals(problem: &SolveProblem, calls: &SolvePureCallTable) -> bool {
-    let mut p = stable_parameters(problem);
-    for run in &problem.solve_layout.variable_storage_runs {
-        if run.role != SolveVariableStorageRole::ExternalInput {
-            continue;
-        }
-        let ScalarSlot::P { index, .. } = run.base else {
-            return false;
-        };
-        let Some(end) = index.checked_add(run.scalar_count) else {
-            return false;
-        };
-        let Some(values) = p.get_mut(index..end) else {
-            return false;
-        };
-        values.fill(true);
-    }
-    for binding in &problem.solve_layout.pre_param_bindings {
-        let Some(value) = p.get_mut(binding.dest_p_index) else {
-            return false;
-        };
-        *value = false;
-    }
-    for target in problem
-        .initialization
-        .update_targets()
-        .iter()
-        .chain(problem.discrete.update_targets.iter())
-    {
-        if let ScalarSlot::P { index, .. } = *target {
-            let Some(value) = p.get_mut(index) else {
-                return false;
-            };
-            *value = false;
-        }
-    }
-    let y = vec![false; problem.layout.y_scalars()];
-    residuals_over_stable_storage(problem.initialization.residual(), calls, &y, &p)
+/// Whether the initialization residual rows are evaluated on the settled
+/// view: a row role reads a continuous algebraic the refresh reconstructs
+/// (`initial_rows_read_settled_view` of the runtime's initial projection).
+/// The C profile admits the other view only when no row reads a continuous
+/// algebraic, where the runtime's read cones are empty as well.
+pub fn initial_rows_read_settled_view(problem: &SolveProblem) -> bool {
+    use crate::{InitializationCoordinateKind, InitializationRowRole};
+    problem.initialization.row_roles().iter().any(|role| {
+        matches!(
+            role,
+            InitializationRowRole::UnownedCoordinate(InitializationCoordinateKind::Algebraic)
+                | InitializationRowRole::SolvedThroughAlgebraicRefresh
+                | InitializationRowRole::SurplusAlgebraicCheck
+        )
+    })
 }
 
-fn residuals_over_stable_storage(
-    residual: &crate::ComputeBlock,
-    calls: &SolvePureCallTable,
-    y: &[bool],
-    p: &[bool],
-) -> bool {
-    residual.nodes.iter().all(|node| {
+/// Whether every initialization residual row is a scalar program reading no
+/// continuous algebraic (a solver coordinate past the states), so its value
+/// on the instance coordinates is the one the runtime evaluates.
+fn residuals_read_no_algebraic(problem: &SolveProblem) -> bool {
+    let state_count = problem.solve_layout.state_scalar_count();
+    problem.initialization.residual().nodes.iter().all(|node| {
         let crate::ComputeNode::ScalarPrograms(block) = node else {
             return false;
         };
-        block.programs().iter().all(|program| {
-            super::static_assertions::scalar_dependencies::program_outputs(calls, program, y, p)
-                .is_some_and(|outputs| outputs.into_iter().all(|stable| stable))
-        })
+        block
+            .programs()
+            .iter()
+            .all(|program| !reads_algebraic(program, state_count))
     })
+}
+
+/// Whether `ops` (nested regions included) loads a solver coordinate at or
+/// past `state_count`.
+fn reads_algebraic(ops: &[crate::LinearOp], state_count: usize) -> bool {
+    struct Reads {
+        state_count: usize,
+        found: bool,
+    }
+    impl crate::visitor::SolveVisitor for Reads {
+        type Error = std::convert::Infallible;
+
+        fn visit_linear_op(
+            &mut self,
+            _kind: crate::visitor::LinearOpSliceKind,
+            _index: usize,
+            op: &crate::LinearOp,
+        ) -> Result<(), Self::Error> {
+            self.found |= match op {
+                crate::LinearOp::LoadY { index, .. } => *index >= self.state_count,
+                crate::LinearOp::TensorLoad {
+                    input: crate::TensorInputKind::Y,
+                    input_start,
+                    count,
+                    ..
+                } => input_start.saturating_add(*count) > self.state_count,
+                _ => false,
+            };
+            Ok(())
+        }
+    }
+    let mut reads = Reads {
+        state_count,
+        found: false,
+    };
+    let kind = crate::visitor::LinearOpSliceKind::ScalarProgram {
+        program_index: 0,
+        span: None,
+    };
+    let Ok(()) = crate::visitor::walk_linear_op_slice(&mut reads, kind, ops);
+    reads.found
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{LinearOp, ScalarProgramBlock};
-
-    fn row(load: LinearOp) -> crate::ComputeBlock {
-        let mut sources = rumoca_core::SourceMap::new();
-        let source = sources.add(
-            "initial-parameter-admission.mo",
-            "source-owned initial residual",
-        );
-        let span = rumoca_core::Span::from_offsets(source, 0, 29);
-        crate::ComputeBlock::from_scalar_program_block(
-            ScalarProgramBlock::with_output_indices(
-                vec![vec![load, LinearOp::StoreOutput { src: 0 }]],
-                vec![span],
-                vec![0],
-            )
-            .unwrap(),
-        )
-    }
+    use crate::LinearOp;
 
     #[test]
-    fn parameter_input_residual_proof_does_not_admit_y_time_or_hidden_history() {
-        let calls = SolvePureCallTable::default();
-        assert!(residuals_over_stable_storage(
-            &row(LinearOp::LoadP { dst: 0, index: 0 }),
-            &calls,
-            &[false],
-            &[true, false]
+    fn an_algebraic_read_is_found_through_scalar_and_tensor_loads() {
+        assert!(!reads_algebraic(
+            &[
+                LinearOp::LoadY { dst: 0, index: 1 },
+                LinearOp::StoreOutput { src: 0 }
+            ],
+            2
         ));
-        assert!(!residuals_over_stable_storage(
-            &row(LinearOp::LoadY { dst: 0, index: 0 }),
-            &calls,
-            &[false],
-            &[true, false]
+        assert!(reads_algebraic(
+            &[
+                LinearOp::LoadY { dst: 0, index: 2 },
+                LinearOp::StoreOutput { src: 0 }
+            ],
+            2
         ));
-        assert!(!residuals_over_stable_storage(
-            &row(LinearOp::LoadP { dst: 0, index: 1 }),
-            &calls,
-            &[false],
-            &[true, false]
-        ));
-        assert!(!residuals_over_stable_storage(
-            &row(LinearOp::LoadP { dst: 0, index: 2 }),
-            &calls,
-            &[false],
-            &[true, false]
-        ));
-        assert!(!residuals_over_stable_storage(
-            &row(LinearOp::LoadTime { dst: 0 }),
-            &calls,
-            &[false],
-            &[true, false]
+        assert!(!reads_algebraic(
+            &[
+                LinearOp::LoadP { dst: 0, index: 7 },
+                LinearOp::StoreOutput { src: 0 }
+            ],
+            0
         ));
     }
 }
