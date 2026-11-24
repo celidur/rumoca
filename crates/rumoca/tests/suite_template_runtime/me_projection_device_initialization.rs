@@ -109,6 +109,43 @@ equation
   der(x) = -k * x;
 end DeviceInitParameterSeed;";
 
+/// A delayed value the initial equation reads through an algebraic: while
+/// initializing, `delay(x, 0.2) = x` (MLS §3.7.2), held at its source before
+/// each pass and refreshed after the projection.
+const DELAYED: &str = "model DeviceInitDelay
+  parameter Real g = 3;
+  parameter Real k(fixed = false, start = 1);
+  Real x(start = 1, fixed = true);
+  Real w;
+  Real d;
+initial equation
+  w = g + 0.5 * x;
+equation
+  d = delay(x, 0.2);
+  w = k * k * k + k + d;
+  der(x) = -k * x;
+end DeviceInitDelay;";
+
+/// A delay of an algebraic: while initializing, `delay(y, 0.1) = y`, the
+/// value the continuous equations give `y` (MLS §3.7.2, §8.6), not its
+/// stored seed. The initial equations give `y = 2`, so `k^3 + k = 1.25`.
+const DELAYED_ALGEBRAIC: &str = "model DeviceInitDelayAlgebraic
+  parameter Real g = 3.25;
+  parameter Real k(fixed = false, start = 1);
+  Real x(start = 0.5);
+  Real y;
+  Real w;
+  Real d;
+initial equation
+  y = 2;
+  w = g;
+equation
+  y = x + x * x * x;
+  d = delay(y, 0.1);
+  w = k * k * k + k + d;
+  der(x) = -k * x;
+end DeviceInitDelayAlgebraic;";
+
 pub(crate) fn models() -> Vec<(rumoca::CompilationResult, &'static str)> {
     vec![
         (compile(STATE_SEEDS, "DeviceInitSeeds"), "DeviceInitSeeds"),
@@ -125,6 +162,18 @@ pub(crate) fn models() -> Vec<(rumoca::CompilationResult, &'static str)> {
             "DeviceInitParameter",
         ),
         (compile(TORN_LOOP, "DeviceInitTorn"), "DeviceInitTorn"),
+    ]
+}
+
+/// Models the FMI C profile refuses (a delay is a runtime event there), so
+/// only the linked runtime is compared with.
+fn runtime_only_models() -> Vec<(rumoca::CompilationResult, &'static str)> {
+    vec![
+        (compile(DELAYED, "DeviceInitDelay"), "DeviceInitDelay"),
+        (
+            compile(DELAYED_ALGEBRAIC, "DeviceInitDelayAlgebraic"),
+            "DeviceInitDelayAlgebraic",
+        ),
     ]
 }
 
@@ -305,7 +354,7 @@ fn close(device: &[f64], runtime: &[f64]) -> bool {
 
 #[test]
 fn a_device_build_initializes_every_lane_as_the_linked_runtime() {
-    for (compiled, model) in models() {
+    for (compiled, model) in models().into_iter().chain(runtime_only_models()) {
         let device = device_lanes(&compiled, model);
         let runtime = runtime_lanes(&compiled);
         assert_eq!(device.len(), GUESSES, "{model}: one line per lane");
@@ -316,5 +365,35 @@ fn a_device_build_initializes_every_lane_as_the_linked_runtime() {
                 "{model}: lane {k} differs from the runtime\n device  y {y:?} p {p:?}\n runtime y {ry:?} p {rp:?}"
             );
         }
+    }
+}
+
+/// The linked runtime holds a delayed algebraic at the value the continuous
+/// equations settle, so the parameter its initial equation solves for sees
+/// `delay(y, 0.1) = y = 2`.
+#[test]
+fn a_delayed_algebraic_initializes_at_its_settled_value() {
+    let compiled = compile(DELAYED_ALGEBRAIC, "DeviceInitDelayAlgebraic");
+    let solve = lowered(&compiled);
+    let [delayed] = solve.problem.events.delays.value_parameter_indices[..] else {
+        panic!("one delay channel");
+    };
+    for (k, (_, p)) in runtime_lanes(&compiled).into_iter().enumerate() {
+        let gain = p
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(index, value)| *index != delayed && *value != 3.25)
+            .map(|(_, value)| value)
+            .expect("the solved parameter");
+        assert!(
+            (p[delayed] - 2.0).abs() <= 1.0e-9,
+            "guess {k}: the delayed value is its settled source, got {}",
+            p[delayed]
+        );
+        assert!(
+            (gain * gain * gain + gain - 1.25).abs() <= 1.0e-9,
+            "guess {k}: k^3 + k + delay(y) = g, got k = {gain}"
+        );
     }
 }
