@@ -1152,20 +1152,26 @@ int main() {{
         ),
     )
     .expect("write CUDA CPU-emulation harness");
-    let executable = directory.path().join("cuda-ode-emulation");
-    run_checked(
-        Command::new("c++")
-            .args(["-std=c++17", "-Wall", "-Wextra", "-Werror"])
-            .arg(&harness)
-            .arg("-o")
-            .arg(&executable)
-            .current_dir(directory.path()),
-        "compile CUDA ODE CPU emulation",
-    );
-    run_checked(
-        &mut Command::new(executable),
-        "execute CUDA ODE CPU emulation",
-    );
+    // The default build, then a step-only build: the derivative kernel must
+    // not depend on what the option leaves out.
+    let builds: [&[&str]; 2] = [&[], &["-DRUMOCA_OMIT_INITIALIZATION"]];
+    for (index, options) in builds.into_iter().enumerate() {
+        let executable = directory.path().join(format!("cuda-ode-emulation-{index}"));
+        run_checked(
+            Command::new("c++")
+                .args(["-std=c++17", "-Wall", "-Wextra", "-Werror"])
+                .args(options)
+                .arg(&harness)
+                .arg("-o")
+                .arg(&executable)
+                .current_dir(directory.path()),
+            "compile CUDA ODE CPU emulation",
+        );
+        run_checked(
+            &mut Command::new(executable),
+            "execute CUDA ODE CPU emulation",
+        );
+    }
 }
 
 #[test]
