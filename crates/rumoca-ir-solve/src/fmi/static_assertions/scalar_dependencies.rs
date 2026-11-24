@@ -220,9 +220,10 @@ fn transfer(
             let start = *dst_start as usize;
             r.get_mut(start..start + count * lanes)?.fill(stable);
         }
-        Op::MatrixMultiply { .. } | Op::TensorCross { .. } | Op::TensorConcatenate { .. } => {
-            tensor_kernel(op, r)?
-        }
+        Op::MatrixMultiply { .. }
+        | Op::TensorCross { .. }
+        | Op::TensorConcatenate { .. }
+        | Op::TensorTranspose { .. } => tensor_kernel(op, r)?,
         Op::StoreOutput { src } => outputs.push(r[*src as usize]),
         Op::StoreOutputRange {
             start,
@@ -345,6 +346,17 @@ fn tensor_kernel(op: &Op, r: &mut [bool]) -> Option<()> {
                 .map(|source| (source.start, extent(&source.dimensions)))
                 .collect::<Vec<_>>();
             settle_from_ranges(r, &ranges, *dst_start, extent(dimensions))
+        }
+        Op::TensorTranspose {
+            dst_start,
+            src_start,
+            rows,
+            columns,
+            element_width,
+            lanes,
+        } => {
+            let count = rows * columns * element_width * lanes;
+            settle_from_ranges(r, &[(*src_start, count)], *dst_start, count)
         }
         _ => None,
     }
