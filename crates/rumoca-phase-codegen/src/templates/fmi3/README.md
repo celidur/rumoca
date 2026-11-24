@@ -61,7 +61,9 @@ product (`J * der(w) = f`) lowers to a Solve IR `LinSolve` that the state
 derivative kernel evaluates by the linked kernel's Gauss-Jordan elimination
 with partial pivoting; a singular matrix fails the evaluation. A `LinSolve` in
 a residual, projection, or initialization block is refused. Algebraic systems
-run the shared ME projection kernel of SPEC_0044 ME-PROJ-001. Non-finite
+run the shared ME projection kernel of SPEC_0044 ME-PROJ-001, which logs its
+fallbacks and faults or, built with `RMC_LANE_STATUS`, keeps them on the
+instance for `rmc_lane_report` (ME-PROJ-003). Non-finite
 refreshed values fail the FMI call and a failed CS step rolls back its state.
 Unimplemented FMI capabilities are absent from metadata and reject at the ABI.
 
