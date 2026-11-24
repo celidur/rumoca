@@ -119,7 +119,7 @@ fn model_c(model: &str, source: &str, target: &str) -> String {
 }
 
 /// `RmcBlockDesc` field names in their C initializer order.
-const FIELDS: [&str; 55] = [
+const FIELDS: [&str; 58] = [
     "canonical",
     "n",
     "y",
@@ -175,6 +175,9 @@ const FIELDS: [&str; 55] = [
     "ntangent_steps",
     "tangent_steps",
     "tangent_residuals",
+    "keep",
+    "keep_d",
+    "keep_s",
 ];
 
 const ISOLATION_KINDS: std::ops::RangeInclusive<usize> = 0..=2;
@@ -521,6 +524,34 @@ fn small_affine_loop_is_eliminated_along_its_tearing() {
         0,
         "a coupled affine block is settled by its affine solve, never by isolation"
     );
+}
+
+/// A coupled affine block keeps its factorization from one call to the next,
+/// as the linked `SparseNewtonCache` does; no other block retains anything,
+/// and a component without such a block emits no retention code.
+#[test]
+fn coupled_affine_blocks_retain_their_factorization() {
+    let (model_c, tables) = rendered("AffineLoop", AFFINE);
+    let block = single_block("AffineLoop", &tables);
+    assert!(block.flag("affine") && block.get("n") > 1 && block.flag("keep"));
+    assert_eq!((block.get("keep_d"), block.get("keep_s")), (0, 0));
+    assert!(
+        model_c.contains("rmc_keep_bind(m, b, jac, rscale, vscale)"),
+        "AffineLoop: the affine projection binds its retained factors to the Jacobian and scale bits"
+    );
+    for (model, source) in [("DenseSeeded", DENSE), ("SeededLoop", SINGULAR)] {
+        let (model_c, tables) = rendered(model, source);
+        for block in &tables.blocks {
+            assert!(
+                !block.flag("keep"),
+                "{model}: only a coupled affine block retains"
+            );
+        }
+        assert!(
+            !model_c.contains("rmc_keep_bind("),
+            "{model}: a component without a retaining block emits no retention"
+        );
+    }
 }
 
 #[test]

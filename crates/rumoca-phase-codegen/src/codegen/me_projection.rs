@@ -527,8 +527,9 @@ pub(super) fn me_refresh_value(component: &impl RefreshSource) -> Result<Value, 
     let ComponentTables {
         mut table,
         assignments,
-        records,
+        mut records,
     } = tables;
+    let keep = place_retained(&mut records);
     let lane_max = records.iter().map(BlockRecord::lane_max).max().unwrap_or(0);
     let (block_doubles, block_sizes) = records
         .iter()
@@ -561,6 +562,7 @@ pub(super) fn me_refresh_value(component: &impl RefreshSource) -> Result<Value, 
         assign => assignments.into_value()?,
         init => init,
         work => minijinja::context! { doubles => doubles, sizes => sizes },
+        keep => minijinja::context! { doubles => keep.0, sizes => keep.1 },
         seed_len => seed_len,
         lane_max => lane_max,
         variable_scales => variable_scales,
@@ -589,6 +591,19 @@ fn arena_doubles(
         y_doubles + workspace.unwrap_or(0)
     });
     refresh_doubles + init_doubles.max(chart_frame)
+}
+
+/// Lay the retained factorizations of the affine blocks end to end in the
+/// instance storage; the total (doubles, size indices), zero when no block
+/// keeps one.
+fn place_retained(records: &mut [BlockRecord]) -> (usize, usize) {
+    records.iter_mut().fold((0, 0), |(doubles, sizes), record| {
+        let Some((d, s)) = record.retained() else {
+            return (doubles, sizes);
+        };
+        record.keep_at((doubles, sizes));
+        (doubles + d, sizes + s)
+    })
 }
 
 /// The one numerical policy both executors read.

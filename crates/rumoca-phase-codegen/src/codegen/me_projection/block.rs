@@ -42,6 +42,8 @@ const NO_TARGET: usize = 0;
 /// chain, or one step answered by its row's grouped isolator.
 const RUN_CHAIN: usize = 0;
 const RUN_ISOLATOR: usize = 1;
+/// The flags that lead a block's retained sizes (`RMC_KEEP_FLAGS`).
+const KEEP_FLAGS: usize = 4;
 
 /// One block descriptor: counts, flags, and pool offsets, in the field order
 /// of the C `RmcBlockDesc`.
@@ -113,6 +115,12 @@ pub(super) struct BlockRecord {
     /// Reduced residual rows of the torn tangent plan: `(lane function, lane
     /// outputs, output offset, group)` per tear row.
     tangent_residuals: usize,
+    /// Whether an affine block keeps its factorization from one call to the
+    /// next, and the offsets of its retained doubles and sizes in the
+    /// instance storage (`BlockRecord::retained`).
+    keep: bool,
+    keep_d: usize,
+    keep_s: usize,
     /// The block's ES016 fold message, read from the problem of the chart
     /// the block belongs to; the C table holds its offset in a pool instead.
     #[serde(skip)]
@@ -1023,6 +1031,35 @@ fn program_span(
 }
 
 impl BlockRecord {
+    /// The instance storage a coupled affine block keeps its factorization
+    /// in from one call to the next (the linked `SparseNewtonCache`), as
+    /// (doubles, size indices): the bits of the Jacobian and both scale
+    /// vectors the factors were formed from, then the elimination at its
+    /// promotion capacity when the block has one, else the dense LU with its
+    /// pivots and the nonzero lists of its triangular factors. `None` for
+    /// any other block.
+    pub(super) fn retained(&self) -> Option<(usize, usize)> {
+        if !self.affine || self.n < 2 {
+            return None;
+        }
+        let (n, nnz) = (self.n, self.nnz);
+        let key = nnz + 2 * n;
+        Some(if self.elimination {
+            let cap = self.elim_capacity;
+            (
+                key + (nnz + 1) + (n * cap + 1) + (cap * cap + 1),
+                KEEP_FLAGS + 3 * (cap + 1) + self.nelim + 1,
+            )
+        } else {
+            (key + n * n, KEEP_FLAGS + n + 2 * (n + 1) + n * (n - 1))
+        })
+    }
+
+    /// Place the retained storage at these offsets.
+    pub(super) fn keep_at(&mut self, (doubles, sizes): (usize, usize)) {
+        (self.keep, self.keep_d, self.keep_s) = (true, doubles, sizes);
+    }
+
     /// The block's ES016 fold message, if it has one.
     pub(super) fn fold(&self) -> Option<&[u8]> {
         self.fold.as_deref()
