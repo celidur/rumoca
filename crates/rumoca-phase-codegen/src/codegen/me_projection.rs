@@ -166,6 +166,31 @@ pub fn me_refresh_admissible(problem: &solve::SolveProblem) -> bool {
             .all(|plan| refresh_plans_admissible(&chart::alternate_problem(problem, plan)))
 }
 
+/// Solve-only admissibility of the staged refresh for a target that runs
+/// each lane on its own without a projection kernel
+/// (`solve_blocks.lanes.refresh`): every dispatch of the derivative and
+/// algebraic plans is made of exact-assignment stages only, and the algebraic
+/// plan settles every algebraic coordinate.
+#[must_use]
+pub fn lane_refresh_admissible(problem: &solve::SolveProblem) -> bool {
+    if problem.validate().is_err() {
+        return false;
+    }
+    let owners = &problem.continuous.refresh_owners;
+    component_plans(owners).into_iter().all(|(label, plan)| {
+        plan.possible_stage_schedules().iter().all(|&schedule| {
+            owners
+                .staged_refresh_steps(plan, schedule)
+                .is_ok_and(|steps| {
+                    steps
+                        .iter()
+                        .all(|step| matches!(step, solve::StagedRefreshStep::Assignments(_)))
+                        && (label != "algebraic" || algebraic_refresh_covers(problem, plan, &steps))
+                })
+        })
+    })
+}
+
 /// Canonical blocks of one chart referenced by any step or complete-plan
 /// fallback, each described once over the shared program table.
 struct BlockCatalog<'a> {
