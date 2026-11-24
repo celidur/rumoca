@@ -1,5 +1,5 @@
 {%- from "cuda-typed-functions.jinja" import functions as typed_functions %}
-{%- from "fmi-me-projection.jinja" import device_instance, device_kernel %}
+{%- from "fmi-me-projection.jinja" import device_instance, device_kernel, binding_updates %}
 {%- macro scalar_const(op) -%}
 {%- if op.value_class == "finite" -%}{{ op.value }}
 {%- elif op.value_class == "positive_infinity" -%}INFINITY
@@ -232,7 +232,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
-{%- if me_refresh is defined and me_refresh.blocks | length > 0 %}
+{%- if me_refresh is defined and (me_refresh.blocks | length > 0 or me_refresh.init.rows > 0) %}
 #include <float.h>
 #include <stdbool.h>
 {%- endif %}
@@ -277,10 +277,16 @@ typedef unsigned long long uint64_t;
 {#- A refresh that retains projection stages runs the shared ME projection
     kernel, one instance per lane (SPEC_0044 ME-PROJ-001). -#}
 {%- set shared = me_refresh is defined and me_refresh.blocks | length > 0 %}
+{#- An initialization with residual rows runs the shared kernel's
+    `rmc_initialize` per lane (MLS §8.6, `settle_initialization_system`): the
+    parameter bindings and the initialization projection alternate until the
+    bindings stop changing. -#}
+{%- set shared_init = me_refresh is defined and me_refresh.init.rows > 0 %}
+{%- set kernel = shared or shared_init %}
 {%- set refresh = lanes.refresh if staged and not shared else none %}
 {%- set ev = lanes.events %}
 {%- set delays = lanes.delays %}
-{%- set init = lanes.initialization %}
+{%- set init = none if shared_init else lanes.initialization %}
 {%- set starts = lanes.starts %}
 {%- set nroots = ev.event_roots | length %}
 {%- set ncross = ev.crossings | length %}
@@ -308,11 +314,12 @@ const double {{ name }}_time_events[{{ ev.time_events | length }}] = { {% for ti
 #endif
 {%- endif %}
 
-{%- if shared %}
+{%- if kernel %}
 
 // ---------------------------------------------------------------------------
 // The shared Model-Exchange projection kernel, built for the device: the
-// staged refresh plans and block projection algorithms of the linked kernel.
+// staged refresh plans and block projection algorithms of the linked kernel,
+// and its initialization.
 // Each lane owns one instance (its coordinate, its projection workspace and
 // its fallback counters) in a device buffer the host allocates:
 // {{ NAME }}_LANE_WORKSPACE_BYTES bytes per lane, attached once with
@@ -323,11 +330,11 @@ const double {{ name }}_time_events[{{ ev.time_events | length }}] = { {% for ti
 #pragma GCC diagnostic ignored "-Wunused-function"
 #endif
 {{ device_instance(solve, me_refresh, "rmc") }}
-// The lane's parameters are the values it was given.
-static __device__ rmcStatus refresh_parameters(ModelInstance* m) { m->parameters_dirty = false; return rmcOK; }
-{%- if me_refresh.init.rows > 0 %}
-static __device__ int rmc_apply_updates(ModelInstance* m, bool initializing) { (void)m; (void)initializing; return 0; }
-{%- endif %}
+// The lane's parameter bindings, as the linked runtime applies them
+// (`SolveBindingExecution`). No discrete equation settles with them: the
+// initial event iteration settles the discrete rows after initialization.
+static __device__ rmcStatus update_discrete_equations(ModelInstance* m) { (void)m; return rmcOK; }
+{{ binding_updates(solve, me_bindings, "rmc", device=true) }}
 {{ device_kernel(solve, me_refresh, "rmc") }}
 #if defined(__GNUC__) && !defined(__CUDACC__)
 #pragma GCC diagnostic pop
@@ -795,11 +802,50 @@ extern "C" __global__ void {{ name }}_event_update_batch(
 
 #ifndef RUMOCA_OMIT_INITIALIZATION
 // ---------------------------------------------------------------------------
-// Initialization (MLS 8.6): parameter and start bindings, the algebraic
-// refresh, and the initial event. Launch after `{{ name }}_load_starts_batch`
-// (and after overriding any parameter) at the start time. `status` (may be
-// null) receives 0, or 1 when the initial event did not settle or a refresh
-// failed.
+// Initialization (MLS 8.6). Launch after `{{ name }}_load_starts_batch`
+// (and after overriding any parameter) at the start time.
+{%- if shared_init %}
+// Each lane initializes its own instance of the shared projection kernel
+// (`rmc_initialize`, the initialization `fmi3ExitInitializationMode` runs):
+// the parameter bindings and the initial equations solved for their
+// unknowns, states and `fixed = false` parameters, from the lane's start
+// values as guesses. The initial event and the algebraic refresh follow.
+// `status` (may be null) receives 0, or the sum of 1 when the initial event
+// did not settle or a refresh failed and 2 when the initialization did not
+// converge. The tolerance of the initial equations is
+// {{ NAME }}_INIT_TOLERANCE (0 takes the kernel's refresh tolerance);
+// override it with -D before compiling.
+#ifndef {{ NAME }}_INIT_TOLERANCE
+#define {{ NAME }}_INIT_TOLERANCE 0.0
+#endif
+
+__device__ int {{ name }}_initial_projection(double time, double *batch_y, double *batch_p)
+{
+    ModelInstance *m = {{ name }}_lane_instances + RUMOCA_LANE_INDEX;
+    rmc_lane_reset(m);
+    m->time = time;
+    m->parameters_dirty = false;
+    m->rmc_nonfinite = false;
+    m->assertion_failed = false;
+    for (int i = 0; i < {{ y_len }}; ++i) {
+        m->y[i] = batch_y[i];
+    }
+    for (int i = 0; i < {{ p_len }}; ++i) {
+        m->p[i] = batch_p[i];
+    }
+    int failed = rmc_initialize(m, {{ NAME }}_INIT_TOLERANCE) != rmcOK || m->assertion_failed;
+    for (int i = 0; i < {{ y_len }}; ++i) {
+        batch_y[i] = m->y[i];
+    }
+    for (int i = 0; i < {{ p_len }}; ++i) {
+        batch_p[i] = m->p[i];
+    }
+    return failed;
+}
+{%- else %}
+// Parameter and start bindings, the algebraic refresh, and the initial
+// event. `status` (may be null) receives 0, or 1 when the initial event did
+// not settle or a refresh failed.
 
 __device__ void {{ name }}_bindings(double time, double *batch_y, double *batch_p)
 {
@@ -810,6 +856,7 @@ __device__ void {{ name }}_bindings(double time, double *batch_y, double *batch_
 {{ programs(run.rows, out="batch_" ~ run.column) }}
 {%- endfor %}
 }
+{%- endif %}
 
 extern "C" __global__ void {{ name }}_initialize_batch(
     double time,
@@ -832,14 +879,18 @@ extern "C" __global__ void {{ name }}_initialize_batch(
 {%- if ev.initial_flag is not none %}
     batch_p[{{ ev.initial_flag }}] = 1.0;
 {%- endif %}
+{%- if shared_init %}
+    int unconverged = {{ name }}_initial_projection(time, batch_y, batch_p);
+{%- else %}
     {{ name }}_bindings(time, batch_y, batch_p);
+{%- endif %}
     int unsettled = {{ name }}_event_iterate(time, batch_y, batch_p) < 0;
 {%- if ev.initial_flag is not none %}
     batch_p[{{ ev.initial_flag }}] = 0.0;
 {%- endif %}
     unsettled |= {{ name }}_refresh(time, batch_y, batch_p);
     if (status) {
-        status[batch] = unsettled;
+        status[batch] = unsettled{% if shared_init %} + 2 * unconverged{% endif %};
     }
 }
 #endif  // RUMOCA_OMIT_INITIALIZATION
