@@ -57,6 +57,9 @@ coordinates, with each one-row block's isolation of its unknown and the
 residual's partial forward Jacobian, as the runtime does. A row reading an
 algebraic without such a role, homotopy continuation, delay histories, and
 retained state-manifold rows are refused.
+A lane target that emits `manifold_kernel` admits the manifold rows: its
+`rmc_initialize` certifies the settled states on the manifold, as the linked
+kernel does.
 A retained state-manifold projection is refused too: FMI 3 Model Exchange has
 no call that moves the continuous states at an accepted point. The shared
 kernel's `manifold_kernel` projects onto that manifold for a target that drives
