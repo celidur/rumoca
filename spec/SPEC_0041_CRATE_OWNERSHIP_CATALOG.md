@@ -317,23 +317,34 @@ schedule as a WGSL value function (#734); they resolve no group, and R003
 re-pins the six macro regions #733 moved or changed. R005 (decision
 `d-pending-owner-741-unused-helper-attribute-20261124`): the projection
 kernel's `rmc_dalloc_raw` carries an unused attribute, so Clang accepts a
-model that emits no caller; it resolves no group.
-R006 (decision `d-pending-owner-me-projection-c-emission-20261124`): the FMI
+model that emits no caller; it resolves no group. R006 (decision
+`d-pending-owner-593-accepted-point-assertions-20261124`): the FMI templates
+render the accepted-point error assertions rumoca-ir-solve issues (#593); it
+resolves no group. R007 (decision
+`d-pending-owner-655-657-658-modelica-printing-20261124`): the Modelica
+templates print fixed by value and follow the Base Modelica grammar (#655,
+#657, #658); it resolves no group. R008 (decision
+`d-pending-owner-unused-text-helper-attribute-20261124`): the scalar kernel's
+`rmc_own_text` carries the same unused attribute; it resolves no group. R009 (Nov 24, 2026) adds the initially seeded discrete rows to `rmc_events_initialize` in `fmi3/scalar_events.jinja`, rendered before the first algebraic settle when Solve IR issues a nonempty set. R010 (decision
+`d-pending-owner-rust-fixed-ode-events-20261124`): `rust-fixed-ode` renders
+the issued scalar event profile and includes a hand-written event runtime;
+it resolves no group.
+R011 (decision `d-pending-owner-me-projection-c-emission-20261124`): the FMI
 projection kernel and its plan views render failed trials that restore their
 coordinate, offset descriptors, switch dispatch, model-prefixed shared
 symbols, per-chart fold messages, sliced and packed programs, shared row
 functions, arena coordinate copies and a declined singleton's residual
 reused by the dense Newton; it resolves no group.
-R007 (decision `d-pending-owner-me-projection-device-build-20261125`): the FMI
+R012 (decision `d-pending-owner-me-projection-device-build-20261125`): the FMI
 projection kernel, its typed pure functions and the scalar kernel render a
 device build of the kernel, and the refresh view reads a lowered SolveModel; it
 resolves no group.
-R008 (decision `d-pending-owner-cuda-ode-shared-projection-20261125`): the
+R013 (decision `d-pending-owner-cuda-ode-shared-projection-20261125`): the
 projection kernel renders its binding runs, initialization on the instance
 coordinates, delays held at initialization, the retained state manifold and
 bounded device functions, and the cuda-ode target renders one model instance
-per lane through it; it resolves no group. Every other group,
-including D085, remains open.
+per lane through it; it resolves no group.
+Every other group, including D085, remains open.
 
 The non-active successor design is DRAFT
 [SPEC_0037 §2a](SPEC_0037_FORMALLY_VERIFIED_COMPILER.md#2a-source-bound-backend-retirement),

@@ -1761,18 +1761,10 @@ RMC_COLD {{ api }} int rmc_bad_program(ModelInstance* m, size_t program) {
 {%- set blocks = me.blocks|length > 0 %}
 {%- set assigns = me.assign.plan.programs|length > 0 %}
 {%- if me.derivative.steps|length > 0 or me.algebraic.steps|length > 0 or me.switching %}
-/* The coordinate copy of the refresh and of the chart decisions. A device `memcpy` of an unknown
-   alignment may move single bytes, so a device compiler copies one double
-   per access; a host compiler keeps `memcpy`, which its library moves in
-   vector words. Either copies the same values. */
-{{ q }} inline void rmc_copy_y(double* dst, const double* src) {
-#if defined(__CUDACC__)
-    for (size_t i = 0; i < Y_LEN; ++i) dst[i] = src[i];
-#else
-    memcpy(dst, src, Y_LEN * sizeof(double));
-#endif
-}
-/* The same word copy of `count` doubles: the rollback runs of a refresh. */
+/* The coordinate copies of the refresh and of the chart decisions. A device
+   `memcpy` of an unknown alignment may move single bytes, so a device
+   compiler copies one double per access; a host compiler keeps `memcpy`,
+   which its library moves in vector words. Either copies the same values. */
 {{ q }} inline void rmc_copy_doubles(double* dst, const double* src, size_t count) {
 #if defined(__CUDACC__)
     for (size_t i = 0; i < count; ++i) dst[i] = src[i];
@@ -1855,7 +1847,7 @@ failure:
 {%- if blocks %}
     if (complete) {
         rmc_fb_note(m, failed_site); m->rmc_fb_active[RMC_FB_PLAN] = false;
-        rmc_copy_y(m->y, incoming);
+        rmc_copy_doubles(m->y, incoming, Y_LEN);
         const int rescued = rmc_project_complete(m, complete, ncomplete);
         /* A program fault during the rescue is neither a convergence failure
            nor a non-finite trial value. */
@@ -2171,7 +2163,7 @@ typedef struct { size_t nrows; size_t ncols; size_t ndep; size_t dep; size_t nen
     RMC_MARK;
     double* saved = rmc_dalloc_raw(m, Y_LEN);
     if (!saved) { (void)rmc_exhausted(m); return {{ prefix }}Error; }
-    rmc_copy_y(saved, m->y);
+    rmc_copy_doubles(saved, m->y, Y_LEN);
     bool certify = m->rmc_certify;
     m->rmc_certify = false;
     {{ prefix }}Status status = refresh_algebraics(m);
@@ -2207,11 +2199,11 @@ typedef struct { size_t nrows; size_t ncols; size_t ndep; size_t dep; size_t nen
             RMC_INFO(m, "chart", text);
         }
     }
-    rmc_copy_y(m->y, saved);
+    rmc_copy_doubles(m->y, saved, Y_LEN);
     RMC_RELEASE;
     return {{ prefix }}OK;
 {{ "} " if device }}fail:
-    rmc_copy_y(m->y, saved);
+    rmc_copy_doubles(m->y, saved, Y_LEN);
     RMC_RELEASE;
     return {{ prefix }}Error;
 }
@@ -2240,8 +2232,8 @@ typedef struct { size_t nrows; size_t ncols; size_t ndep; size_t dep; size_t nen
     double* before = rmc_dalloc_raw(m, Y_LEN);
     double* out = before ? rmc_dalloc_raw(m, target->row_max_outputs) : NULL;
     if (!out) { RMC_RELEASE; m->rmc_chart_pending = false; (void)rmc_exhausted(m); return {{ prefix }}Error; }
-    rmc_copy_y(before, m->y);
-    rmc_copy_y(m->y, m->rmc_chart_y);
+    rmc_copy_doubles(before, m->y, Y_LEN);
+    rmc_copy_doubles(m->y, m->rmc_chart_y, Y_LEN);
     {{- "\n    {" if device }}
     for (size_t k = 0; k < {{ solve.solve_layout.state_scalar_count }}; ++k) {
         if (rmc_row_call(rmc_pool[target->binding + 2 * k], m, out) != 0) goto fail;
@@ -2262,7 +2254,7 @@ typedef struct { size_t nrows; size_t ncols; size_t ndep; size_t dep; size_t nen
     return {{ prefix }}OK;
 {{ "} " if device }}fail:
     m->rmc_chart = active;
-    rmc_copy_y(m->y, before);
+    rmc_copy_doubles(m->y, before, Y_LEN);
     RMC_RELEASE;
     if (m->rmc_fatal) return {{ prefix }}Error;
     m->rmc_chart_pending = false;

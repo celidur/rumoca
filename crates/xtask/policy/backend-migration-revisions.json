@@ -228,6 +228,141 @@
     },
     {
       "id": "R006",
+      "decision": "d-pending-owner-593-accepted-point-assertions-20261124",
+      "change": "The FMI2 and FMI3 model templates, the FMI3 kernel and event templates render the accepted-point error assertions rumoca-ir-solve classifies (#593): each is checked by check_accepted_assertions_at at initialization, a completed integrator step, an accepted Co-Simulation substep or interval end and an event commit, never at a trial evaluation; no renderer decides which assertions those are.",
+      "resolves": [],
+      "files": [
+        {
+          "path": "crates/rumoca-phase-codegen/src/templates/fmi2/model.c.jinja",
+          "before": "dd308051f13b26825a5484db93abc9a82895a111fd203c0f0e92439c79f4ea0c",
+          "after": "db83f0fb0c9390ef10533e0ed7a789742bd48f151a39cbd3880260f9edaa5047"
+        },
+        {
+          "path": "crates/rumoca-phase-codegen/src/templates/fmi3/model.c.jinja",
+          "before": "6241d891a003e5bd4c50ab0cb8d1a0c80fc5ad42529da89b0409dec67d0b1e06",
+          "after": "ad1c6d4f567c8ee8e50f44e4139d2a4ba9aa7765c8771020292b240fcdfb2851"
+        },
+        {
+          "path": "crates/rumoca-phase-codegen/src/templates/fmi3/scalar_events.jinja",
+          "before": "0a117ef62d678d3dc6d1df08ed95d842120749dd7460f04c53798044b3170955",
+          "after": "431ad0a5e53af9dfeee2376178dba35399ca7e3c09fd77ba5f74301e0b290fba"
+        },
+        {
+          "path": "crates/rumoca-phase-codegen/src/templates/fmi3/scalar_kernel.jinja",
+          "before": "739224aa8262d8b30b98c3fa125984ef248c0579d9d821a49104ce090cc72c76",
+          "after": "93bb4c1195187178b337f4bce5eecc03e43d9b0c10629253ec1f807b26685d96"
+        }
+      ]
+    },
+    {
+      "id": "R007",
+      "decision": "d-pending-owner-655-657-658-modelica-printing-20261124",
+      "change": "The flat-modelica and base-modelica templates print the value of fixed, one value per element where the elements differ (#655); base-modelica puts array dimensions after the component name (#657) and writes neither each nor a protected section, giving a value for all elements with fill (#658), as the Base Modelica grammar (MCP-0031) requires. No plan decision moves into the templates.",
+      "resolves": [],
+      "files": [
+        {
+          "path": "crates/rumoca-phase-codegen/src/templates/base-modelica/base_modelica.mo.jinja",
+          "before": "435d72b4fc40b46e45a248df3933dd05ba4d8e9e71f3235b607e969edf32aed4",
+          "after": "a2a8ae8d32232f99cda9cdf26a069e38155da3c778dcc17d584512537829d56f"
+        },
+        {
+          "path": "crates/rumoca-phase-codegen/src/templates/flat-modelica/flat_modelica.mo.jinja",
+          "before": "eff15e8d92c01ce6022edd75fbde73c3f030abdbe3e16f145e7a4e7f350c2924",
+          "after": "0784b473fe478cb30fbe742f845d3178f211ea6ca299a11d067f367eb57061fb"
+        }
+      ]
+    },
+    {
+      "id": "R008",
+      "decision": "d-pending-owner-unused-text-helper-attribute-20261124",
+      "change": "The scalar kernel's rmc_own_text, a static inline helper a model may not call, carries RMC_UNUSED (defined in kernel_declarations by R005), in both its String-text and text-free forms, so Clang's -Wunused-function accepts a model that emits no caller. Printing only; no rendered decision changes.",
+      "resolves": [],
+      "files": [
+        {
+          "path": "crates/rumoca-phase-codegen/src/templates/fmi3/scalar_kernel.jinja",
+          "before": "93bb4c1195187178b337f4bce5eecc03e43d9b0c10629253ec1f807b26685d96",
+          "after": "df24339418eee104ecfd457fbd7b295e8b369a3ce5b07f0bf7aacbd12a704c80"
+        }
+      ]
+    },
+    {
+      "id": "R009",
+      "decision": "d-pending-owner-initial-seed-rows-20261124",
+      "change": "rmc_events_initialize applies the discrete equation rows that Solve IR issues as initially seeded (initial_seed_rows.rs: unclocked equations whose programs read only time, parameter, constant and input slots, or the targets of rows seeded before them) before the first settle_values, in the issued dependency order, so a continuous row that reads such a discrete value at initialization sees the equation value, not the declaration default (MLS 3.7 §8.6). After the history copy, each seeded target's pre slot is kept at the start it had before the seed: the owners pass publishes the row, and the event iteration after initialization sees its change as before. Rendered only when the set is nonempty; every other model renders byte for byte as before.",
+      "resolves": [],
+      "files": [
+        {
+          "path": "crates/rumoca-phase-codegen/src/templates/fmi3/scalar_events.jinja",
+          "before": "431ad0a5e53af9dfeee2376178dba35399ca7e3c09fd77ba5f74301e0b290fba",
+          "after": "405af81ffdfd52202b38bb8d144e57f1aaa56ab5e265048f8421503d0c877fcd"
+        }
+      ]
+    },
+    {
+      "id": "R010",
+      "decision": "d-pending-owner-rust-fixed-ode-events-20261124",
+      "change": "rust-fixed-ode renders the scalar event profile issued by rumoca-ir-solve as model facts and includes a hand-written event runtime partial (fixed-step Simulator, RootBracket location, Appendix B iteration); the DAE context carries Boolean start values so discrete Boolean parameters get their defaults.",
+      "resolves": [],
+      "files": [
+        {
+          "path": "crates/rumoca-phase-codegen/build.rs",
+          "before": "9e3260e40aa48f9575f00da4d79f4d6ef70e22cde6a14375ac8ef6a8e4831fee",
+          "after": "5c92b765bd85ea268a3318895dceb3be0f7522d3a7e74e468e854a29bd371f56"
+        },
+        {
+          "path": "crates/rumoca-phase-codegen/src/codegen/dae_backend.rs",
+          "before": "2e45cc434c72442dbb02f0ba8e82b3ae9e3d171f97b79664752cfd9d3529ee84",
+          "after": "0a885cdd99e5a1aaba0cb3f23f70baab562bb5c1ef00e700a454488cd2794951"
+        },
+        {
+          "path": "crates/rumoca-phase-codegen/src/codegen/galec_manifest_template_tests.rs",
+          "before": "17e7811784ae156799effc611a64823a7c34cdce06007f5f751b258edabdfbd0",
+          "after": "7d1fffd5462bed3f1e027b13d1f93be8f5e44f8bc197f8d34a5d7f31f58effcb"
+        },
+        {
+          "path": "crates/rumoca-phase-codegen/src/codegen/solve_lazy.rs",
+          "before": "5b1747099075f0926fa660fd8e080f5c2b3ea9c7e7bb48be0412d89d0cefea98",
+          "after": "2d1b8fd6149cc29445ae1bb8f22b5127809e359f810f9fd1a88b270c7709da18"
+        },
+        {
+          "path": "crates/rumoca-phase-codegen/src/codegen/solve_renderer.rs",
+          "before": "7d2013dcf42e53dba352e57ed905d7b95380077fefdae60e7d30cc903fbb4658",
+          "after": "2b2269072f550f2d999eb542ea27fc0748548cdd4675f8e632285a5e9fd6915a"
+        },
+        {
+          "path": "crates/rumoca-phase-codegen/src/templates/rust-fixed-ode/README.md",
+          "before": "90b119d9bbbfc6a347478fd958cf75c9f6b77a137c3d25d820bd9e378b4de8e0",
+          "after": "b6c37b7b0e64b3585715ec3300abd2490b86cd9eac557f07b52d7df7e198ef51"
+        },
+        {
+          "path": "crates/rumoca-phase-codegen/src/templates/rust-fixed-ode/events.rs",
+          "before": null,
+          "after": "a4dfc1a3f269353ca82051f502fdda7c2aaf314aa385fa271a0c63134afa2b94"
+        },
+        {
+          "path": "crates/rumoca-phase-codegen/src/templates/rust-fixed-ode/model_fixed_ode.rs.jinja",
+          "before": "546d563cf493b20ab51684713630b8bc676cfa1396994ba7eb2f0c50d88562bd",
+          "after": "2d643cc527f7c5ee1847ffb8f7c3c3a9dd971901bfa395fa1398a0840fef10a3"
+        },
+        {
+          "path": "crates/rumoca-phase-codegen/src/templates/rust-fixed-ode/target.toml",
+          "before": "b99069252a727a126a9ed2356cd7565b28c43a9c8686baa0dc339df4307fadd5",
+          "after": "27c7afe77e3cd718144fa754fe6ad6c72ad78b9a821365920bb7bd97c17ad853"
+        },
+        {
+          "path": "crates/rumoca-phase-codegen/tests/rust_fixed_ode_event_runtime.rs",
+          "before": null,
+          "after": "5ce5e1536cfb60442f8611cf06fa080ee59fdb988be1c696dd724217d993c0a9"
+        },
+        {
+          "path": "crates/rumoca-phase-codegen/tests/rust_fixed_ode_event_runtime_mock.rs",
+          "before": null,
+          "after": "2a098ef728a1ebbb8cc72d929f58dfbf6476c51f407adb1d1f0cbaa9f43619e0"
+        }
+      ]
+    },
+    {
+      "id": "R011",
       "decision": "d-pending-owner-me-projection-c-emission-20261124",
       "change": "The FMI3 projection kernel, the FMI2 and FMI3 model headers and their plan views render projection block and chart descriptors as offsets into the index pool instead of pointers, reach each program family through one switch dispatcher instead of function-pointer tables, and carry the model identifier on the shared kernel and typed-function symbols. An out-of-range program index answers a logged fatal status that later kernel entries refuse until reset. A block's ES016 fold message is read from the block's own chart, and a block projection whose trial evaluation fails restores the coordinate it saved before it returns the error. Row, isolator and assignment functions render the output slices and packed registers issued by rumoca-ir-solve (slice_to_outputs, pack_registers), and rows equal up to their load indices (load_index_classes) share one row function. With a projection arena, the coordinate copies of the refresh and of the chart functions are arena frames. A one-row block whose singleton assignment declines passes its residual to the dense Newton. No in-range value or decision changes.",
       "resolves": [],
@@ -285,7 +420,7 @@
         {
           "path": "crates/rumoca-phase-codegen/src/templates/fmi3/me_projection.jinja",
           "before": "73af5da1993be9eec46d8abb9ef17e0cbbf2a4d125f0b7b34fa084a68c6d92ea",
-          "after": "5f75b853530c02b9c008d941c5ca93be8315448edbdbafd9769ea0220449b048"
+          "after": "3ad1e96b98c7ba6e2686c3b8923ff8515cd47a9143d143386de8793f3e97671a"
         },
         {
           "path": "crates/rumoca-phase-codegen/src/templates/fmi3/model.h.jinja",
@@ -294,8 +429,8 @@
         },
         {
           "path": "crates/rumoca-phase-codegen/src/templates/fmi3/scalar_kernel.jinja",
-          "before": "739224aa8262d8b30b98c3fa125984ef248c0579d9d821a49104ce090cc72c76",
-          "after": "ef12c4d2e710773245ffda238f6f9fa0a8f0b9dddf6c28aa94512d9c892bb4d1"
+          "before": "df24339418eee104ecfd457fbd7b295e8b369a3ce5b07f0bf7aacbd12a704c80",
+          "after": "a54e5d3a5e266804333656108ae98df11ab94bb72aa08411cabc520c7cc1d098"
         },
         {
           "path": "crates/rumoca-phase-codegen/src/templates/fmi3/typed_functions.jinja",
@@ -387,7 +522,7 @@
       ]
     },
     {
-      "id": "R007",
+      "id": "R012",
       "decision": "d-pending-owner-me-projection-device-build-20261125",
       "change": "The FMI3 projection kernel, its typed pure functions and the scalar kernel take a device flag. In a device build every kernel function and table is static __device__, the exported RMC_API declarations are left out, compound literals become named argument arrays, the two chart functions whose goto fail crosses an initialization open a block that closes before the label, and nextafter steps towards HUGE_VAL. The refresh view reads either the checked FMI C component or a complete lowered SolveModel (RefreshSource), and SolveTemplateRenderer supplies that view and the pure-call families to a target template. With the flag false the emitted C is unchanged.",
       "resolves": [],
@@ -399,23 +534,22 @@
         },
         {
           "path": "crates/rumoca-phase-codegen/src/codegen/me_projection/source.rs",
-          "before": null,
           "after": "ed4ff97f0a2e1ce1cd8ca350b0799cbea7b9ea57f65199559dd440d0456c4d00"
         },
         {
           "path": "crates/rumoca-phase-codegen/src/codegen/solve_renderer.rs",
-          "before": "7d2013dcf42e53dba352e57ed905d7b95380077fefdae60e7d30cc903fbb4658",
-          "after": "f0b07e090ab755ea9b0f176dead01924aeefd1649ff2633900d92c2cb928334c"
+          "before": "2b2269072f550f2d999eb542ea27fc0748548cdd4675f8e632285a5e9fd6915a",
+          "after": "9399aa8dc0e1c28f97cef238185d6a9a1ffeba2c5ef2e9890b563072150e9b97"
         },
         {
           "path": "crates/rumoca-phase-codegen/src/templates/fmi3/me_projection.jinja",
-          "before": "5f75b853530c02b9c008d941c5ca93be8315448edbdbafd9769ea0220449b048",
-          "after": "40caba2d93852cd4e1f353ff581c8d34b75d91504dbd62f44e4957e6587db103"
+          "before": "3ad1e96b98c7ba6e2686c3b8923ff8515cd47a9143d143386de8793f3e97671a",
+          "after": "629a4ebbd9d6f86300cf8494067f06810788353bd048792758f878d7ef2d2bb3"
         },
         {
           "path": "crates/rumoca-phase-codegen/src/templates/fmi3/scalar_kernel.jinja",
-          "before": "ef12c4d2e710773245ffda238f6f9fa0a8f0b9dddf6c28aa94512d9c892bb4d1",
-          "after": "d13f8dfd0a65cb5512d3452d69795b9c13a137a8e7b73df74722df92e4a76b7b"
+          "before": "a54e5d3a5e266804333656108ae98df11ab94bb72aa08411cabc520c7cc1d098",
+          "after": "5334c900c88cbd668dfda44c447878210d6d7acb2ad7b6dcd946444117423ba4"
         },
         {
           "path": "crates/rumoca-phase-codegen/src/templates/fmi3/typed_functions.jinja",
@@ -483,7 +617,7 @@
       ]
     },
     {
-      "id": "R008",
+      "id": "R013",
       "decision": "d-pending-owner-cuda-ode-shared-projection-20261125",
       "change": "The FMI3 projection kernel renders its parameter-binding runs, the initialization on the instance coordinates with its row isolators and partial forward Jacobian, the delays held at their source during initialization and the projection onto the retained state manifold, each from the plans issued by rumoca-ir-solve. In a device build, runs of whole programs and switch dispatchers are split into out-of-line groups of bounded size; the host components render as before. The cuda-ode target renders one model instance per lane through that kernel (refresh, initialization, state manifold, step-only builds) from a per-lane execution view of the Solve model. No renderer derives a plan.",
       "resolves": [],
@@ -495,8 +629,8 @@
         },
         {
           "path": "crates/rumoca-phase-codegen/src/codegen/galec_manifest_template_tests.rs",
-          "before": "17e7811784ae156799effc611a64823a7c34cdce06007f5f751b258edabdfbd0",
-          "after": "5a183ba7aa92c6b255b3c781bc05b8e08fbafcd4f41e7843fbe3ab43c7dea60b"
+          "before": "7d1fffd5462bed3f1e027b13d1f93be8f5e44f8bc197f8d34a5d7f31f58effcb",
+          "after": "ae5c7ef46fb7fa186fd92c9a01bf0750528713f100d88aeade39ab8e0b24fb94"
         },
         {
           "path": "crates/rumoca-phase-codegen/src/codegen/lane_execution.rs",
@@ -541,13 +675,13 @@
         },
         {
           "path": "crates/rumoca-phase-codegen/src/codegen/solve_lazy.rs",
-          "before": "5b1747099075f0926fa660fd8e080f5c2b3ea9c7e7bb48be0412d89d0cefea98",
-          "after": "280e356ed2fef09d88d1a31c1ed55625d0c09376b7da5f3a88b31526a369b434"
+          "before": "2d1b8fd6149cc29445ae1bb8f22b5127809e359f810f9fd1a88b270c7709da18",
+          "after": "26fb3f6affd23ce0f702ccb4052949514224ef452f2cc2577afa253d938506fa"
         },
         {
           "path": "crates/rumoca-phase-codegen/src/codegen/solve_renderer.rs",
-          "before": "f0b07e090ab755ea9b0f176dead01924aeefd1649ff2633900d92c2cb928334c",
-          "after": "37f339415f208bc39d9cc2af6124b877dd184163e50f1dd2362d08bdb88bc08e"
+          "before": "9399aa8dc0e1c28f97cef238185d6a9a1ffeba2c5ef2e9890b563072150e9b97",
+          "after": "d3b5ec5e8b906f8b7bf3d6b3d2966df1b73814514a3a3dd0a32e72529eba81e8"
         },
         {
           "path": "crates/rumoca-phase-codegen/src/lib.rs",
@@ -580,8 +714,8 @@
         },
         {
           "path": "crates/rumoca-phase-codegen/src/templates/fmi3/me_projection.jinja",
-          "before": "40caba2d93852cd4e1f353ff581c8d34b75d91504dbd62f44e4957e6587db103",
-          "after": "1e2f56a10124d0aea220f2c03a567a84a20479d49365681a190499a4c4bc2e27"
+          "before": "629a4ebbd9d6f86300cf8494067f06810788353bd048792758f878d7ef2d2bb3",
+          "after": "1dc956e202702fa57f0c7caeda0c828ddd68e4ee6d74aa1c6bb318518d9300cf"
         },
         {
           "path": "crates/rumoca-phase-codegen/src/templates/fmi3/typed_functions.jinja",

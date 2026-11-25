@@ -109,7 +109,7 @@ impl ImplicitProjectionModel for TrialFault {
 /// Project block 0 of `model` from `incoming`: the error, and `y` after it.
 fn project(model: &TrialFault, incoming: &[f64]) -> (RuntimeSolveError, Vec<f64>) {
     let mut y = incoming.to_vec();
-    let block = &model.plan.blocks.scalar_blocks()[0];
+    let block = &model.algebraic_projection_plan().blocks.scalar_blocks()[0];
     let error = project_algebraic_block(
         model,
         &mut y,
@@ -138,6 +138,10 @@ fn assert_restored(model: &TrialFault, incoming: &[f64]) {
             .collect::<Vec<_>>()
     };
     assert_eq!(bits(&y), bits(incoming));
+    let mut residual = vec![f64::NAN; y.len()];
+    model
+        .eval_residual(&y, &[], 0.0, &mut residual)
+        .expect("the restored point evaluates again");
 }
 
 /// The singleton assignment writes the isolated value and evaluates its row.

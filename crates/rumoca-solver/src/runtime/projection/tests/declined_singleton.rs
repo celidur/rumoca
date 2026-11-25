@@ -77,8 +77,11 @@ fn a_declined_singleton_hands_its_residual_to_the_dense_path() {
     project_algebraics(&model, &mut y, &[], 0.0, 0, 1.0e-12)
         .expect("the dense path should solve the unisolated singleton");
 
-    let root = y[0];
-    assert!((root + 0.3 * root.sin() - 1.0).abs() <= 1.0e-12);
+    let mut residual = [f64::NAN];
+    model
+        .eval_residual(&y, &[], 0.0, &mut residual)
+        .expect("the residual evaluates at the root");
+    assert!(residual[0].abs() <= 1.0e-12, "{residual:?}");
     let evaluations = model.evaluations.borrow();
     assert_eq!(
         evaluations[0], 0.0,

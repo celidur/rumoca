@@ -20,6 +20,7 @@ mod derivative_kinks;
 mod device_initialization;
 mod device_projection;
 mod directional_derivatives;
+mod discrete_index_initialization;
 mod enumerations;
 mod fatal_paths_harness;
 mod input_defaults;
