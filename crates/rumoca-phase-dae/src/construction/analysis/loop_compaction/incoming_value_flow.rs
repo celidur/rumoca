@@ -273,7 +273,7 @@ impl Query<'_> {
     ) {
         for index in undefined.keys().copied().collect::<Vec<_>>() {
             let name = self.names[index];
-            if expression_reads_name(value, name) {
+            if self.reads_on_paths(value, name, &undefined[&index]) {
                 self.mark_read(undefined, index);
             } else if target == name {
                 undefined.remove(&index);
@@ -285,6 +285,45 @@ impl Query<'_> {
             after.assign(target, value, scope);
             after
         });
+    }
+
+    /// A branch-selection snapshot uses an if-expression to evaluate its source
+    /// predicate only on paths where its enclosing branch is active. A local
+    /// defined by that branch is never read on the complementary paths.
+    fn reads_on_paths(&self, expr: &Expression, name: &VarName, paths: &PathSet) -> bool {
+        if !self.guarded {
+            return expression_reads_name(expr, name);
+        }
+        if paths.is_unreachable() || !expression_reads_name(expr, name) {
+            return false;
+        }
+        let Expression::If {
+            branches,
+            else_branch,
+            ..
+        } = expr
+        else {
+            return true;
+        };
+        let conditions = branches
+            .iter()
+            .map(|(condition, _)| condition)
+            .collect::<Vec<_>>();
+        for (i, (condition, value)) in branches.iter().enumerate() {
+            if self.reads_on_paths(
+                condition,
+                name,
+                &paths.entering(&conditions[..i], i, self.scope),
+            ) || self.reads_on_paths(value, name, &paths.entering(&conditions, i, self.scope))
+            {
+                return true;
+            }
+        }
+        self.reads_on_paths(
+            else_branch,
+            name,
+            &paths.entering(&conditions, branches.len(), self.scope),
+        )
     }
 
     /// A statement that owns no nested statements: each name is read by it,
@@ -331,10 +370,7 @@ impl Query<'_> {
         };
         for index in undefined.keys().copied().collect::<Vec<_>>() {
             let name = self.names[index];
-            if indices
-                .iter()
-                .any(|index| expression_reads_name(&index.range, name))
-            {
+            if ranges_read_name(&indices, name) {
                 self.mark_read(undefined, index);
             }
         }
@@ -349,6 +385,7 @@ impl Query<'_> {
         // entry's undefined paths, and facts about anything it writes do not
         // survive it.
         let mut after = entry.clone();
+        entry.retain(|index, _| !binders.contains(self.names[*index]));
         self.sequence(
             StatementSequence {
                 statements: body,
@@ -561,6 +598,21 @@ mod structural_tests {
         ];
         assert_eq!(structural_reads(&program, &[&a, &b]), vec![false, true]);
     }
+}
+
+/// Whether a loop range reads `name`. The range is in the enclosing scope;
+/// after evaluating it, the iterator shadows a same-named local for
+/// subsequent ranges and the loop body (MLS §11.2.2).
+fn ranges_read_name(binders: &[&rumoca_core::ForIndex], name: &VarName) -> bool {
+    for binder in binders {
+        if expression_reads_name(&binder.range, name) {
+            return true;
+        }
+        if binder.ident == name.as_str() {
+            return false;
+        }
+    }
+    false
 }
 
 #[cfg(test)]

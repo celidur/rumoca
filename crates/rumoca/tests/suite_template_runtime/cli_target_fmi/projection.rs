@@ -79,7 +79,20 @@ end ArrayLoop;"
 }
 
 fn fixtures() -> Vec<Fixture> {
-    vec![
+    let mut fixtures = vec![
+        Fixture {
+            model: "StateStart",
+            source: "model StateStart
+  output Real q(start=0, fixed=false);
+initial equation
+  q = 2;
+equation
+  der(q) = -q;
+end StateStart;"
+                .to_string(),
+            outputs: &["q"],
+            marker: None,
+        },
         Fixture {
             model: "TornLoop",
             source: "model TornLoop
@@ -123,6 +136,14 @@ end ImplicitSquare;"
             outputs: &["x", "u"],
             marker: Some("rmc_project_stage"),
         },
+    ];
+    fixtures.extend(affine_and_seeded_fixtures());
+    fixtures
+}
+
+/// Loops the projection solves by elimination or from a seed.
+fn affine_and_seeded_fixtures() -> Vec<Fixture> {
+    vec![
         Fixture {
             model: "AffineLoop",
             source: "model AffineLoop

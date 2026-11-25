@@ -1,7 +1,10 @@
 #if defined(__GNUC__) || defined(__clang__)
 #define RMC_COLD __attribute__((cold))
+/* A helper a model may not call; clang warns on an unused static inline. */
+#define RMC_UNUSED __attribute__((unused))
 #else
 #define RMC_COLD
+#define RMC_UNUSED
 #endif
 /* Symbols shared between the component's translation units stay out of the
    dynamic symbol table; Windows objects have no such attribute and a static
@@ -196,7 +199,7 @@ RMC_COLD {{ q }} int rmc_exhausted(ModelInstance* m) { RMC_LOG(m, "algebraic pro
     return values;
 }
 /* A buffer its caller writes completely before reading it. */
-{{ q }} inline double* rmc_dalloc_raw(ModelInstance* m, size_t count) {
+RMC_UNUSED {{ q }} inline double* rmc_dalloc_raw(ModelInstance* m, size_t count) {
     if (count > RMC_DWORK - m->rmc_dtop) return NULL;
     double* values = m->rmc_d + m->rmc_dtop; m->rmc_dtop += count;
     return values;
@@ -1760,14 +1763,19 @@ RMC_COLD {{ api }} int rmc_bad_program(ModelInstance* m, size_t program) {
     memcpy(dst, src, Y_LEN * sizeof(double));
 #endif
 }
+/* The same word copy of `count` doubles: the rollback runs of a refresh. */
+{{ q }} inline void rmc_copy_doubles(double* dst, const double* src, size_t count) {
+#if defined(__CUDACC__)
+    for (size_t i = 0; i < count; ++i) dst[i] = src[i];
+#else
+    memcpy(dst, src, count * sizeof(double));
+#endif
+}
 {%- endif %}
 {%- if me.derivative.steps|length > 0 or me.algebraic.steps|length > 0 %}
 enum { RMC_STEP_ASSIGN, RMC_STEP_COMPLETE, RMC_STEP_PROJECT };
 typedef struct { unsigned char kind; size_t first; size_t count; size_t block; size_t seed_first; size_t seed_count; size_t rescue; size_t nrescue; } RmcStep;
-{{ q }} {{ prefix }}Status rmc_refresh(ModelInstance* m, const RmcStep* steps, size_t nsteps, const size_t* complete, size_t ncomplete) {
-{%- if not me.kernel %}
-    double incoming[Y_LEN];
-{%- endif %}
+{{ q }} {{ prefix }}Status rmc_refresh(ModelInstance* m, const RmcStep* steps, size_t nsteps, const size_t* complete, size_t ncomplete, double* incoming, const size_t (*runs)[2], size_t nruns) {
     /* A faulted instance runs no step, logs nothing more and opens no frame. */
     if (RMC_FAULTED(m)) return {{ prefix }}Error;
     if (refresh_parameters(m) != {{ prefix }}OK) return {{ prefix }}Error;
@@ -1775,10 +1783,13 @@ typedef struct { unsigned char kind; size_t first; size_t count; size_t block; s
     /* The incoming coordinate lives in the arena, below every frame the
        steps open, so no caller holds a Y-sized stack array. */
     RMC_MARK;
-    double* incoming = rmc_dalloc_raw(m, Y_LEN);
+    size_t backup = 0;
+    for (size_t j = 0; j < nruns; ++j) backup += runs[j][1];
+    incoming = rmc_dalloc_raw(m, backup);
     if (!incoming) { (void)rmc_exhausted(m); return {{ prefix }}Error; }
 {%- endif %}
-    rmc_copy_y(incoming, m->y);
+    for (size_t j=0, offset=0; j<nruns; offset+=runs[j++][1])
+        rmc_copy_doubles(incoming+offset, m->y+runs[j][0], runs[j][1]);
     (void)complete; (void)ncomplete;
 {%- if blocks and assigns %}
     size_t failed_site = RMC_FB_PLAN; (void)failed_site;
@@ -1852,7 +1863,8 @@ failure:
     m->rmc_nonfinite = true;
 {%- endif %}
 fail:
-    rmc_copy_y(m->y, incoming);
+    for (size_t j=0, offset=0; j<nruns; offset+=runs[j++][1])
+        rmc_copy_doubles(m->y+runs[j][0], incoming+offset, runs[j][1]);
 {%- if blocks and assigns %}
     m->rmc_fb_active[RMC_FB_PLAN] = false;
 {%- endif %}
@@ -1861,7 +1873,7 @@ fail:
 {%- endif %}
 {%- endmacro %}
 
-{%- macro refresh_function(name, plan, prefix, device=false) %}{%- set q = "static __device__" if device else "static" %}{%- set api = "static __device__" if device else "RMC_API" %}
+{%- macro refresh_function(name, plan, prefix, arena=false, device=false) %}{%- set q = "static __device__" if device else "static" %}{%- set api = "static __device__" if device else "RMC_API" %}
 {%- if plan.steps|length > 0 %}
 {{ q }} const RmcStep rmc_steps_{{ name }}[{{ plan.steps|length }}] = {
 {%- for step in plan.steps %}
@@ -1871,7 +1883,18 @@ fail:
 {%- endif %}
 {{ q }} {{ prefix }}Status ({{ name }})(ModelInstance* m) {
 {%- if plan.steps|length > 0 %}
-    return rmc_refresh(m, rmc_steps_{{ name }}, {{ plan.steps|length }}, {% if plan.complete %}RMC_P({{ plan.complete[0] }}), {{ plan.complete[1] }}{% else %}NULL, 0{% endif %});
+{%- if plan.backup_size > 0 %}
+    static const size_t runs[][2] = { {% for run in plan.backup_runs %}{ {{ run[0] }}, {{ run[1] }} }, {% endfor %} };
+{%- if not arena %}
+    double incoming[{{ plan.backup_size }}];
+{%- endif %}
+{%- else %}
+    static const size_t runs[][2] = { { 0, Y_LEN } };
+{%- if not arena %}
+    double incoming[Y_LEN];
+{%- endif %}
+{%- endif %}
+    return rmc_refresh(m, rmc_steps_{{ name }}, {{ plan.steps|length }}, {% if plan.complete %}RMC_P({{ plan.complete[0] }}), {{ plan.complete[1] }}{% else %}NULL, 0{% endif %}, {% if arena %}NULL{% else %}incoming{% endif %}, runs, sizeof(runs)/sizeof(runs[0]));
 {%- else %}
     if (RMC_FAULTED(m)) return {{ prefix }}Error;
     return refresh_parameters(m);
@@ -1890,7 +1913,7 @@ fail:
 {%- for op in program.ops %}
 {{ scalar_op(op, "binding_output", "-1", device=device) }}
 {%- endfor %}
-{%- for row in execution.parameter_rows %}{% set target = targets[row] %}
+{%- for row in execution.parameter_rows + execution.quotient_seed_rows %}{% set target = targets[row] %}
     m->p[{{ target.P.index }}] = binding_output[{{ row }}];
 {%- endfor %}
 {%- if execution.state_start_rows|length > 0 %}
@@ -1982,14 +2005,14 @@ fail:
 {%- set plan_suffix = "_plan" if me.blocks|length > 0 and me.seed_rule == "CommittedAcceptedPoint" else "" %}
 {%- if me.switching %}
 {%- for chart in me.charts %}
-{{ refresh_function("refresh_derivative_values" ~ plan_suffix ~ "_c" ~ loop.index0, chart.derivative, prefix, device=device) }}
-{{ refresh_function("refresh_algebraics" ~ plan_suffix ~ "_c" ~ loop.index0, chart.algebraic, prefix, device=device) }}
+{{ refresh_function("refresh_derivative_values" ~ plan_suffix ~ "_c" ~ loop.index0, chart.derivative, prefix, me.kernel, device=device) }}
+{{ refresh_function("refresh_algebraics" ~ plan_suffix ~ "_c" ~ loop.index0, chart.algebraic, prefix, me.kernel, device=device) }}
 {%- endfor %}
 {{ chart_dispatch("refresh_derivative_values" ~ plan_suffix, me, prefix, device=device) }}
 {{ chart_dispatch("refresh_algebraics" ~ plan_suffix, me, prefix, device=device) }}
 {%- else %}
-{{ refresh_function("refresh_derivative_values" ~ plan_suffix, me.derivative, prefix, device=device) }}
-{{ refresh_function("refresh_algebraics" ~ plan_suffix, me.algebraic, prefix, device=device) }}
+{{ refresh_function("refresh_derivative_values" ~ plan_suffix, me.derivative, prefix, me.kernel, device=device) }}
+{{ refresh_function("refresh_algebraics" ~ plan_suffix, me.algebraic, prefix, me.kernel, device=device) }}
 {%- endif %}
 {{ committed_seed(me, prefix, device=device) }}
 {{ initialization_kernel(me, prefix, device=device) }}
@@ -2885,8 +2908,10 @@ RMC_COLD {{ q }} {{ prefix }}Status rmc_initialize(ModelInstance* m, double tole
    build links the units beside other components. */
 {{ shared_prefix() }}{% for name in ["rmc_assign", "rmc_bad_program", "rmc_row_call", "rmc_inv_call", "rmc_dep_call", "rmc_jvp_call", "rmc_lane_call", "rmc_iso_call", "rmc_causal_call", "rmc_iso_group", "rmc_iso_slot", "rmc_model_assertion", "rmc_finish_assertion_observation"] %}{{ shared_symbol(name) }}{% endfor %}#if defined(__GNUC__) || defined(__clang__)
 #define RMC_COLD __attribute__((cold))
+#define RMC_UNUSED __attribute__((unused))
 #else
 #define RMC_COLD
+#define RMC_UNUSED
 #endif
 /* A dispatcher calls each large program of its family out of line: inlined
    into its switch, a family's programs become one large function, which slows

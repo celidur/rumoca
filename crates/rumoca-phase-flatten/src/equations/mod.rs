@@ -10,7 +10,7 @@ use std::{collections::HashSet, sync::Arc};
 mod shape_inference;
 pub(crate) use shape_inference::{
     ExpressionShape, infer_component_ref_shape, infer_simple_equation_dims,
-    infer_simple_equation_scalar_count, is_tuple_receiver_equation_lhs,
+    infer_simple_equation_scalar_count, is_tuple_receiver_equation_lhs, one_element_array_dims,
 };
 
 // Conditional tracing support (SPEC_0008)
@@ -485,24 +485,14 @@ pub(crate) fn flatten_equation_with_def_map(
             if scalar_count == 0 {
                 return Ok(FlattenedEquations::default());
             }
-            let equation_dims = infer_simple_equation_dims(&lhs, &rhs, prefix, ctx, scalar_count);
 
             let equation = if scalar_count == 1 {
                 flat::Equation::new(residual, span, origin)
             } else {
                 flat::Equation::new_array(residual, span, origin, scalar_count)
             };
-            let structured_equations = if is_tuple_receiver_equation_lhs(&lhs) {
-                Vec::new()
-            } else {
-                array_family::structured_array_equation_family(
-                    0,
-                    &equation,
-                    equation_dims.as_deref(),
-                )?
-                .into_iter()
-                .collect()
-            };
+            let structured_equations =
+                simple_equation_families(ctx, &lhs, &rhs, prefix, &equation)?;
             Ok(FlattenedEquations {
                 equations: vec![equation],
                 structured_equations,
@@ -1158,7 +1148,15 @@ fn expand_for_equation(
         &mut result,
         cheapen_plan.as_ref(),
     )?;
-    if iterations.is_empty() {
+    // A tuple equation defines one residual per retained result (MLS §12.4.3).
+    // Its materialized rows carry the receivers and ordinal projections; a
+    // structured arithmetic residual would try to subtract a call from a tuple.
+    let projected_results = interiors.materialized()
+        && result.equations.iter().any(|row| {
+            matches!(&row.residual, rumoca_core::Expression::Binary { lhs, .. }
+            if matches!(lhs.as_ref(), rumoca_core::Expression::Tuple { .. }))
+        });
+    if iterations.is_empty() || projected_results {
         return Ok(result);
     }
     let domain = compact_domain_from_iterations(indices, &iterations, span)?;
@@ -1220,6 +1218,35 @@ fn expand_for_equation(
         });
 
     Ok(result)
+}
+
+/// The array family of the simple equation `lhs = rhs` flattened to
+/// `equation`. A tuple receiver and a scalar equation own none. A one-element
+/// array equation owns one like any other extent (MLS §10.6.1): its residual
+/// is an array, which a loop over it must project and cannot substitute.
+fn simple_equation_families(
+    ctx: &Context,
+    lhs: &ast::Expression,
+    rhs: &ast::Expression,
+    prefix: &ast::QualifiedName,
+    equation: &flat::Equation,
+) -> Result<Vec<flat::StructuredEquationFamily>, FlattenError> {
+    if is_tuple_receiver_equation_lhs(lhs) {
+        return Ok(Vec::new());
+    }
+    if let Some(dims) = one_element_array_dims(lhs, rhs, prefix, ctx) {
+        return Ok(vec![array_family::array_equation_family(
+            0,
+            equation,
+            Some(&dims),
+        )?]);
+    }
+    let dims = infer_simple_equation_dims(lhs, rhs, prefix, ctx, equation.scalar_count);
+    Ok(
+        array_family::structured_array_equation_family(0, equation, dims.as_deref())?
+            .into_iter()
+            .collect(),
+    )
 }
 
 /// Rows a family body issues at its domain points.

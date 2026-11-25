@@ -117,6 +117,7 @@ pub(crate) fn lower_selection(
     package.problem.continuous.reduced_chart_set.exchanges = selection.exchanges.clone();
     attach_alternate_chart_plans(
         &mut package.problem,
+        &package.pure_calls,
         &selection.alternates,
         overrides,
         profile,
@@ -138,6 +139,7 @@ pub(crate) fn lower_selection(
 /// relies on. A first-integral mirror keeps its existing failure semantics.
 fn attach_alternate_chart_plans(
     problem: &mut solve::SolveProblem,
+    primary_calls: &solve::SolvePureCallTable,
     alternates: &[Option<rumoca_phase_structural::PreparedDae<'_>>],
     overrides: &std::collections::HashMap<String, f64>,
     profile: RefreshProfile,
@@ -180,7 +182,12 @@ fn attach_alternate_chart_plans(
             }
             Err(error) => return Err(error),
         };
-        if exchange && !same_solver_layout(&lowered, &base) {
+        // Alternate plans execute under the primary's call table after the local
+        // lowering package is dropped. Site ABIs are part of that shared layout.
+        if exchange
+            && (!same_solver_layout(&lowered, &base)
+                || solve::validate_problem_pure_call_sites(&lowered, primary_calls).is_err())
+        {
             withheld.push((offset + 1, solve::ChartExchangeStatus::WithheldByLayout));
             continue;
         }
@@ -295,6 +302,7 @@ pub(crate) fn continuous_refresh_owners(
         build_continuous_refresh_owners_from_with_calls, build_continuous_refresh_owners_with_calls,
     };
     proven_tearing::retear_unproven_blocks(problem)?;
+    rumoca_eval_solve::order_algebraic_projection_by_execution_reads(problem)?;
     let Some(primary) = primary else {
         return build_continuous_refresh_owners_with_calls(problem, calls, profile);
     };

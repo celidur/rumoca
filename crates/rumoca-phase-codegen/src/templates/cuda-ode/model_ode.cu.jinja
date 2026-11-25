@@ -42,17 +42,17 @@
 {%- endmacro %}
 {%- macro scalar_op(op, y="batch_y", out="batch_out") %}
 {%- if op.kind == "Const" %}
-    const double __r{{ op.dst }} = {{ scalar_const(op) }};
+    const double __r{{ op.dst }} = {{ scalar_const(op) }}; (void)__r{{ op.dst }};
 {%- elif op.kind == "LoadTime" %}
-    const double __r{{ op.dst }} = time;
+    const double __r{{ op.dst }} = time; (void)__r{{ op.dst }};
 {%- elif op.kind == "LoadY" %}
-    const double __r{{ op.dst }} = {{ y }}[{{ op.index }}];
+    const double __r{{ op.dst }} = {{ y }}[{{ op.index }}]; (void)__r{{ op.dst }};
 {%- elif op.kind == "LoadP" %}
-    const double __r{{ op.dst }} = batch_p[{{ op.index }}];
+    const double __r{{ op.dst }} = batch_p[{{ op.index }}]; (void)__r{{ op.dst }};
 {%- elif op.kind == "LoadIndexedP" %}
-    const double __r{{ op.dst }} = batch_p[{{ op.base }} + (size_t)fmin(fmax(round(__r{{ op.index_ref }}), 0.0), {{ op.count - 1 if op.count > 0 else 0 }}.0)];
+    const double __r{{ op.dst }} = batch_p[{{ op.base }} + (size_t)fmin(fmax(round(__r{{ op.index_ref }}), 0.0), {{ op.count - 1 if op.count > 0 else 0 }}.0)]; (void)__r{{ op.dst }};
 {%- elif op.kind == "Move" %}
-    const double __r{{ op.dst }} = __r{{ op.src }};
+    const double __r{{ op.dst }} = __r{{ op.src }}; (void)__r{{ op.dst }};
 {%- elif op.kind == "TensorLoad" %}
 {%- if op.lanes != 1 or op.seed_start is defined %}
 {{ fail("unsupported-feature:scalar.op.TensorLoad.directional") }}

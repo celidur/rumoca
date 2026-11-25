@@ -236,7 +236,12 @@ fn expand_comprehension(
     for &val in first_values {
         let substituted = substitute_index_in_expression(expr, *first_name, val);
         let inner = expand_comprehension(&substituted, remaining);
-        result.extend(inner);
+        // Each iterator contributes one array axis (MLS §10.4.1.2).
+        result.push(ast::Expression::Array {
+            elements: inner,
+            kind: rumoca_core::ArrayConstructor::Array,
+            span: expr.span(),
+        });
     }
     result
 }
@@ -339,7 +344,21 @@ mod tests {
                 (IndexSubstitution::Generated("j"), vec![10, 20]),
             ],
         );
-        assert_eq!(expanded.len(), 4);
+        assert_eq!(expanded.len(), 2);
+        for (row, i) in expanded.iter().zip([1, 2]) {
+            let elements = array_elements(row, "row");
+            assert_eq!(elements.len(), 2);
+            for (item, j) in elements.iter().zip([10, 20]) {
+                assert_eq!(array_elements(item, "element"), [int_lit(i), int_lit(j)]);
+            }
+        }
+    }
+
+    fn array_elements<'a>(expression: &'a ast::Expression, axis: &str) -> &'a [ast::Expression] {
+        let ast::Expression::Array { elements, .. } = expression else {
+            panic!("missing {axis} axis")
+        };
+        elements
     }
 
     #[test]

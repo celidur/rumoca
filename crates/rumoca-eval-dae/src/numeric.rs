@@ -5,6 +5,7 @@ mod linear_solve;
 mod native_calls;
 mod scalar;
 mod tensor_values;
+mod value_checks;
 pub use scalar::Scalar;
 /// Exact typed source runs; construction stays private to this evaluator.
 pub type SourceValues = NumericInitialValues<Scalar>;
@@ -29,6 +30,7 @@ use tensor_values::{
     function_loop_point, identity_values, multiply_values, outer_product_values, range_values,
     skew_values, transpose_values,
 };
+use value_checks::{host_scalar, require_finite};
 
 pub(crate) use dae::InputInitializationPolicy;
 
@@ -396,9 +398,34 @@ where
     ) -> Result<SourceValues, NumericEvaluationError> {
         let mut values = SourceValues::default();
         for field in fields.iter() {
-            values.append(self.source_values(field)?);
+            values.append(self.operand_values(field)?);
         }
         Ok(values)
+    }
+
+    /// The lanes of one call argument or record field.
+    ///
+    /// Text carries no numeric value (the runtime owns no String storage), so
+    /// a String operand, such as the `name` of an
+    /// `IdealGases.Common.DataRecord`, holds its lanes unread: the checked
+    /// DAE reads text only as text, which this evaluator never executes. The
+    /// lanes hold the invalid value, so a numeric use of one cannot pass as
+    /// a number.
+    fn operand_values(
+        &mut self,
+        operand: dae::ExprId<'dae>,
+    ) -> Result<SourceValues, NumericEvaluationError> {
+        let value_type = self
+            .view
+            .expression(operand)
+            .expect("finalized expression identity resolves")
+            .value_type();
+        if value_type.scalar_type() == dae::ScalarType::String
+            && let Some(count) = value_type.scalar_count()
+        {
+            return Ok(NumericInitialValues::repeat(Scalar::Invalid, count));
+        }
+        self.source_values(operand)
     }
 
     fn record_field(
@@ -688,7 +715,7 @@ where
         }
         let arguments = arguments
             .iter()
-            .map(|argument| self.source_values(argument))
+            .map(|argument| self.operand_values(argument))
             .collect::<Result<Vec<_>, _>>()?;
         let definition = self.view.function(function).ok_or_else(|| {
             failure(
@@ -1824,39 +1851,6 @@ fn no_override(_variable: dae::VariableView<'_>, _scalar: usize) -> Option<f64> 
     None
 }
 
-fn host_scalar(
-    variable: dae::VariableView<'_>,
-    value: f64,
-) -> Result<Scalar, NumericEvaluationError> {
-    let payload = match variable.value_type().scalar_type() {
-        dae::ScalarType::Real => Some(Scalar::Real(value)),
-        dae::ScalarType::Integer | dae::ScalarType::Enumeration
-            if value.is_finite()
-                && value.fract() == 0.0
-                && value.abs() <= 9_007_199_254_740_992.0 =>
-        {
-            Some(
-                if variable.value_type().scalar_type() == dae::ScalarType::Integer {
-                    Scalar::Integer(value as i64)
-                } else {
-                    Scalar::Enumeration(value as i64)
-                },
-            )
-        }
-        dae::ScalarType::Boolean if value == 0.0 || value == 1.0 => {
-            Some(Scalar::Boolean(value == 1.0))
-        }
-        _ => None,
-    };
-    payload.ok_or_else(|| {
-        failure(
-            NumericEvaluationErrorKind::InvalidOverride,
-            "numerical host override cannot represent the declared exact scalar type",
-            variable.declaration().span(),
-        )
-    })
-}
-
 fn function_parameter_error(span: Span) -> NumericEvaluationError {
     failure(
         NumericEvaluationErrorKind::NonStaticCoordinate,
@@ -1943,33 +1937,6 @@ fn source_binary(operator: dae::BinaryOperator, lhs: Scalar, rhs: Scalar) -> Sca
 
 const fn bool_value(value: bool) -> Scalar {
     Scalar::Boolean(value)
-}
-
-fn require_finite(values: &SourceValues, span: Span) -> Result<(), NumericEvaluationError> {
-    if values.runs().any(|run| match run {
-        NumericInitialRun::Repeat { value, .. } => matches!(value, Scalar::Invalid),
-        NumericInitialRun::Literal(values) => {
-            values.iter().any(|value| matches!(value, Scalar::Invalid))
-        }
-    }) {
-        return Err(failure(
-            NumericEvaluationErrorKind::Overflow,
-            "exact Integer operation has no supported checked result",
-            span,
-        ));
-    }
-    if values.runs().all(|run| match run {
-        NumericInitialRun::Repeat { value, .. } => value.is_finite(),
-        NumericInitialRun::Literal(values) => values.iter().all(|value| value.is_finite()),
-    }) {
-        Ok(())
-    } else {
-        Err(failure(
-            NumericEvaluationErrorKind::InvalidValue,
-            "numeric evaluation produced a non-finite result",
-            span,
-        ))
-    }
 }
 
 const fn role_name(role: dae::VariableRole) -> &'static str {

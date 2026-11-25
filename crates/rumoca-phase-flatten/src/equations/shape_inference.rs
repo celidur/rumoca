@@ -46,6 +46,17 @@ fn infer_component_ref_dims(
     if let Some(dims) = ctx.get_array_dimensions(&qualified) {
         return Some(dims.clone());
     }
+    // A field occurrence may retain its parent indices in the dimension
+    // table (e.g. cloth[2].mid). Project only the final field's subscripts.
+    if cr.parts.len() > 1 && cr.parts.last()?.subs.is_some() {
+        let mut owner = cr.clone();
+        owner.parts.last_mut()?.subs = None;
+        if let Some(dims) = ctx.get_array_dimensions(&build_qualified_name(prefix, &owner)) {
+            let mut selector = cr.clone();
+            selector.parts.drain(..selector.parts.len() - 1);
+            return project_component_dims_by_subscripts(dims, &selector, prefix, ctx);
+        }
+    }
     if ctx.declared_dimensions.proves_scalar_reference(cr) {
         return Some(Vec::new());
     }
@@ -574,6 +585,20 @@ pub(crate) fn infer_simple_equation_dims(
         .flatten()
         .find(|dims| dims_scalar_size(dims) == scalar_count)
         .or_else(|| i64::try_from(scalar_count).ok().map(|count| vec![count]))
+}
+
+/// The dimensions of a simple equation that is provably an array equation of
+/// one element: either side's shape is the equation's shape (MLS §10.6.1).
+pub(crate) fn one_element_array_dims(
+    lhs: &ast::Expression,
+    rhs: &ast::Expression,
+    prefix: &ast::QualifiedName,
+    ctx: &Context,
+) -> Option<Vec<i64>> {
+    [lhs, rhs]
+        .into_iter()
+        .filter_map(|side| dims_for_shape(infer_expression_shape(side, prefix, ctx)))
+        .find(|dims| dims_scalar_size(dims) == 1)
 }
 
 fn dims_for_shape(shape: ExpressionShape) -> Option<Vec<i64>> {

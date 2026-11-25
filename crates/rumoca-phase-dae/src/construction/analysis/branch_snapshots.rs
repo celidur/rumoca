@@ -76,8 +76,18 @@ impl Snapshots<'_> {
         active: Option<&Expression>,
     ) -> Result<Vec<rumoca_core::Statement>, ToDaeError> {
         let mut normalized = Vec::with_capacity(statements.len());
-        for statement in statements {
-            self.statement(statement, active, &mut normalized)?;
+        let mut remaining = statements;
+        while let Some((first, rest)) = remaining.split_first() {
+            // A straight-line region executes under one captured selection.
+            // Keeping its definitions and uses together preserves dominance.
+            let length = active.map_or(0, |_| straight_line_length(remaining));
+            if let (Some(selection), true) = (active, length > 0) {
+                normalized.push(captured_region(selection, &remaining[..length])?);
+                remaining = &remaining[length..];
+                continue;
+            }
+            self.statement(first, active, &mut normalized)?;
+            remaining = rest;
         }
         Ok(normalized)
     }
@@ -89,6 +99,28 @@ impl Snapshots<'_> {
         normalized: &mut Vec<rumoca_core::Statement>,
     ) -> Result<(), ToDaeError> {
         match statement {
+            // Each generated exit state is reset before the loop that owns it.
+            // If an enclosing selection moves into that loop, its reset must
+            // dominate the selected iteration as well. A false initialization
+            // only initializes that private exit state; true exit stores still
+            // execute under their original branch selection.
+            rumoca_core::Statement::Empty {
+                generated_boolean: Some(_),
+                ..
+            } if super::function_returns::generated_boolean_definition(statement, self.guards)?
+                .is_some_and(|guard| {
+                    guard.mutable
+                        && matches!(
+                            guard.value,
+                            Expression::Literal {
+                                value: Literal::Boolean(false),
+                                ..
+                            }
+                        )
+                }) =>
+            {
+                normalized.push(statement.clone());
+            }
             // The selection is invariant in the loop and the static range is
             // evaluated by no runtime path, so `if g then for .. B` is
             // `for .. if g then B`, and B's own conditionals are captured on
@@ -309,6 +341,39 @@ fn branches_contain_loop(
         .flat_map(|block| &block.stmts)
         .chain(else_block.into_iter().flatten())
         .any(statement_contains_loop)
+}
+
+/// The statements at the head of `statements` that neither loop nor define a
+/// generated Boolean.
+fn straight_line_length(statements: &[rumoca_core::Statement]) -> usize {
+    statements
+        .iter()
+        .take_while(|stmt| {
+            !statement_contains_loop(stmt)
+                && !matches!(
+                    stmt,
+                    rumoca_core::Statement::Empty {
+                        generated_boolean: Some(_),
+                        ..
+                    }
+                )
+        })
+        .count()
+}
+
+/// `statements` under the captured `selection`.
+fn captured_region(
+    selection: &Expression,
+    statements: &[rumoca_core::Statement],
+) -> Result<rumoca_core::Statement, ToDaeError> {
+    Ok(rumoca_core::Statement::If {
+        cond_blocks: vec![rumoca_core::StatementBlock {
+            cond: selection.clone(),
+            stmts: statements.to_vec(),
+        }],
+        else_block: None,
+        span: expression_span(selection)?,
+    })
 }
 
 fn statement_contains_loop(statement: &rumoca_core::Statement) -> bool {

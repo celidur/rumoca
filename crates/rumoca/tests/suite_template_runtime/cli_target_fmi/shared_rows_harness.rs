@@ -21,7 +21,7 @@ int main(void) {
     printf("y"); for (size_t k = 0; k < Y_LEN; ++k) printf(" %" PRIu64, bits(m->y[k])); printf("\n");
     printf("p"); for (size_t k = 0; k < P_LEN; ++k) printf(" %" PRIu64, bits(m->p[k])); printf("\n");
     for (size_t id = 0; id < sizeof(rmc_block_desc) / sizeof(rmc_block_desc[0]); ++id) {
-        RmcBlock view; const RmcBlock* b = rmc_block_view(id, &view);
+        const RmcBlock* b = rmc_block(id);
         for (size_t row = 0; row < RMC_BS(b, n); ++row) {
             double value = 0.0;
             int status = rmc_row(m, b, row, &value);
