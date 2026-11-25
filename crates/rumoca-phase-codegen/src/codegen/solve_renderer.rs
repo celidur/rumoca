@@ -11,6 +11,7 @@ use super::{
     CodegenError, LazyDerivativeNodesValue, LazyScalarRowsValue, create_environment,
     dae_template_json_for_solve_context, solve_template_blocks_value,
 };
+use crate::views::solve_variables::solve_variables;
 
 #[derive(Debug)]
 pub struct SolveTemplateRenderer {
@@ -44,30 +45,29 @@ impl SolveTemplateRenderer {
     /// kernel for a device (`fmi-me-projection.jinja`: `device_instance` and
     /// `device_kernel`), the parameter bindings its `binding_updates` runs
     /// (`me_bindings`, [`solve::fmi::SolveBindingExecution`]), and the
-    /// pure-call families its programs and typed functions name, as the FMI
-    /// renderer supplies them.
+    /// pure-call families its programs and typed functions name and the
+    /// assertion observations of its pure calls, as the FMI renderer supplies
+    /// them. The model is admitted to the C kernel first
+    /// (`AdmittedSolveModel`), so a model the kernel refuses renders nothing.
     pub fn new_owned_model_with_me_projection(
         model: std::sync::Arc<solve::SolveModel>,
         dae_model: &dae::Dae,
     ) -> Result<Self, CodegenError> {
-        let me_refresh = super::me_projection::me_refresh_value(model.as_ref())?;
-        // The refresh view has admitted these bindings (their levels).
-        let me_bindings =
-            solve::fmi::SolveBindingExecution::checked(model.as_ref()).map_err(|reason| {
-                CodegenError::dae_preparation_failed(
-                    format!("unsupported-feature:initialization: {reason}"),
-                    None,
-                )
-            })?;
+        let admitted = super::me_projection::AdmittedSolveModel::new(model.as_ref())?;
+        let me_refresh = super::me_projection::me_refresh_value(&admitted)?;
+        let me_bindings = Value::from_serialize(admitted.bindings());
         let pure_calls = super::pure_call_families::PureCallFamilies::new(&model.pure_calls)?;
+        let assertion_observations =
+            super::fmi_c_assertions::observations(&model.problem, &model.pure_calls)?;
         let renderer = Self::new_owned_model_with_dae(model, dae_model)?;
         Ok(Self {
             context: minijinja::context! {
                 me_refresh => me_refresh,
-                me_bindings => Value::from_serialize(&me_bindings),
+                me_bindings => me_bindings,
                 typed_pure_calls => pure_calls.owners_value(),
                 typed_directional_calls => pure_calls.directional_value(),
                 pure_call_symbols => pure_calls.symbols_value(),
+                fmi_assertion_observations => assertion_observations,
                 ..renderer.context
             },
             ..renderer
@@ -455,11 +455,13 @@ fn solve_render_context_value_with_handles(
     let parameter_defaults = Value::from(parameter_defaults(solve_problem, &dae_entry));
     let parameter_names = Value::from(parameter_names(solve_problem));
     let parameter_inputs = Value::from(parameter_inputs(solve_problem));
+    let variables = Value::from_serialize(solve_variables(solve_problem, &dae_entry));
     let context = match model_name {
         Some(name) => minijinja::context! {
             solve_parameter_defaults => parameter_defaults.clone(),
             solve_parameter_names => parameter_names.clone(),
             solve_parameter_inputs => parameter_inputs.clone(),
+            solve_variables => variables.clone(),
             dae => dae_entry.clone(),
             fmi => fmi_entry.clone(),
             solve => solve_value.clone(),
@@ -479,6 +481,7 @@ fn solve_render_context_value_with_handles(
             solve_parameter_defaults => parameter_defaults,
             solve_parameter_names => parameter_names,
             solve_parameter_inputs => parameter_inputs,
+            solve_variables => variables,
             dae => dae_entry.clone(),
             fmi => fmi_entry.clone(),
             solve => solve_value.clone(),

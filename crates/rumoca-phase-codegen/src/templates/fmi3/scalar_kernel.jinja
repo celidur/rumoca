@@ -933,7 +933,7 @@ RMC_UNUSED static inline bool rmc_own_text(ModelInstance* dst, const ModelInstan
     solution, refuses the evaluation. `work` holds the n x (n + 1) augmented
     matrix. -#}
 {%- macro linear_solve_kernel(device=false) %}
-{{ "static __device__" if device else "static" }} inline bool rmc_linear_solve_component(const double* matrix, const double* rhs, size_t n, size_t component, double* work, double* value) {
+{{ "RMC_UNUSED static __device__" if device else "static" }} inline bool rmc_linear_solve_component(const double* matrix, const double* rhs, size_t n, size_t component, double* work, double* value) {
     size_t stride = n + 1;
     for (size_t row = 0; row < n; ++row) {
         for (size_t col = 0; col < n; ++col) work[row * stride + col] = matrix[row * n + col];
@@ -1117,7 +1117,7 @@ static {{ prefix }}Status {{ cs_integrator(fmi) }}(ModelInstance* m, double star
    exactly zero multiplier or pivot-row entry contributes nothing to a finite
    update, so those products are skipped; the arithmetic that remains is the
    dense factorization's, in its order. */
-{{ "static __device__" if device else "static" }} void rmc_lu(double* a, size_t n, size_t* ipiv, size_t* columns) {
+{{ "RMC_UNUSED static __device__" if device else "static" }} void rmc_lu(double* a, size_t n, size_t* ipiv, size_t* columns) {
     for (size_t i = 0; i < n; ++i) {
         size_t piv = i; double best = fabs(a[i * n + i]);
         for (size_t row = i + 1; row < n; ++row) { double value = fabs(a[row * n + i]); if (value > best) { best = value; piv = row; } }
@@ -1147,7 +1147,7 @@ static {{ prefix }}Status {{ cs_integrator(fmi) }}(ModelInstance* m, double star
     }
 }
 /* nalgebra LU::solve_mut */
-{{ "static __device__" if device else "static" }} bool rmc_lu_solve(const double* lu, size_t n, const size_t* ipiv, double* b) {
+{{ "RMC_UNUSED static __device__" if device else "static" }} bool rmc_lu_solve(const double* lu, size_t n, const size_t* ipiv, double* b) {
     for (size_t i = 0; i < n; ++i) if (ipiv[i] != i) { double tmp = b[i]; b[i] = b[ipiv[i]]; b[ipiv[i]] = tmp; }
     for (size_t i = 0; i < n; ++i) { double coeff = b[i]; for (size_t row = i + 1; row < n; ++row) b[row] += -coeff * lu[row * n + i]; }
     for (size_t i = n; i-- > 0;) {

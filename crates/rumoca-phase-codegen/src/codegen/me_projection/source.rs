@@ -2,8 +2,8 @@
 //!
 //! The view reads the same facts of either source: the checked FMI C
 //! component, whose C settles the algebraic coordinates of one instance, or a
-//! complete lowered model, whose target compiles the same kernel for a device
-//! and runs it once per lane (SPEC_0044 ME-PROJ-001).
+//! complete lowered model admitted to the kernel, whose target compiles the
+//! same kernel for a device and runs it once per lane (SPEC_0044 ME-PROJ-001).
 
 use rumoca_ir_solve as solve;
 
@@ -21,7 +21,7 @@ pub(crate) trait RefreshSource {
     /// linked kernel resolves each reduced chart's state-binding rows.
     fn instantiation_point(&self) -> (&[f64], &[f64]);
     /// The dependency levels of the parameter bindings the kernel settles.
-    fn parameter_binding_levels(&self) -> Result<usize, CodegenError>;
+    fn parameter_binding_levels(&self) -> usize;
     /// Whether the target of this source projects its accepted states onto
     /// the retained state manifold (`manifold_kernel`), so the refresh admits
     /// a model that retains one and its arena also holds that projection.
@@ -44,8 +44,8 @@ impl RefreshSource for solve::fmi::FmiCCodegenView {
     fn instantiation_point(&self) -> (&[f64], &[f64]) {
         Self::instantiation_point(self)
     }
-    fn parameter_binding_levels(&self) -> Result<usize, CodegenError> {
-        Ok(Self::parameter_binding_levels(self))
+    fn parameter_binding_levels(&self) -> usize {
+        Self::parameter_binding_levels(self)
     }
     /// FMI 3 Model Exchange has no call that moves the continuous states at
     /// an accepted point, so the C component never projects them.
@@ -54,35 +54,55 @@ impl RefreshSource for solve::fmi::FmiCCodegenView {
     }
 }
 
-/// A complete lowered model, without an FMI component. Its binding levels
-/// are those the C component computes, from the same parameter bindings. Its
-/// target runs its own steps, so it projects each accepted state onto the
-/// retained manifold (`manifold_kernel` over `solve_blocks.state_manifold`).
-impl RefreshSource for solve::SolveModel {
+/// A complete lowered model, without an FMI component, admitted to the C
+/// kernel: it passed the kernel checks the C component runs before its C is
+/// generated (`rumoca_ir_solve::fmi::SolveBindingExecution::checked`: initial
+/// mode, finite initial values sized to the layout, no recursive function
+/// group, typed functions within the C profile, parameter bindings in
+/// dependency order). Only an admitted model is a refresh source, so no view
+/// is built from a model the kernel refuses. Its target runs its own steps,
+/// so it projects each accepted state onto the retained manifold
+/// (`manifold_kernel` over `solve_blocks.state_manifold`).
+pub(crate) struct AdmittedSolveModel<'a> {
+    model: &'a solve::SolveModel,
+    bindings: solve::fmi::SolveBindingExecution,
+}
+
+impl<'a> AdmittedSolveModel<'a> {
+    pub(crate) fn new(model: &'a solve::SolveModel) -> Result<Self, CodegenError> {
+        let bindings = solve::fmi::SolveBindingExecution::checked(model).map_err(|reason| {
+            CodegenError::dae_preparation_failed(
+                format!("unsupported-feature:projection-kernel: {reason}"),
+                None,
+            )
+        })?;
+        Ok(Self { model, bindings })
+    }
+
+    /// The parameter bindings the kernel's `binding_updates` runs.
+    pub(crate) fn bindings(&self) -> &solve::fmi::SolveBindingExecution {
+        &self.bindings
+    }
+}
+
+impl RefreshSource for AdmittedSolveModel<'_> {
     fn problem(&self) -> &solve::SolveProblem {
-        &self.problem
+        &self.model.problem
     }
     fn artifacts(&self) -> &solve::SolveArtifacts {
-        &self.artifacts
+        &self.model.artifacts
     }
     fn pure_calls(&self) -> &solve::SolvePureCallTable {
-        &self.pure_calls
+        &self.model.pure_calls
     }
     fn solver_variable_scale(&self, index: usize) -> f64 {
-        Self::solver_variable_scale(self, index)
+        self.model.solver_variable_scale(index)
     }
     fn instantiation_point(&self) -> (&[f64], &[f64]) {
-        (&self.initial_y, &self.parameters)
+        (&self.model.initial_y, &self.model.parameters)
     }
-    fn parameter_binding_levels(&self) -> Result<usize, CodegenError> {
-        solve::fmi::SolveBindingExecution::checked(self)
-            .map(|execution| execution.levels())
-            .map_err(|reason| {
-                CodegenError::dae_preparation_failed(
-                    format!("unsupported-feature:initialization: {reason}"),
-                    None,
-                )
-            })
+    fn parameter_binding_levels(&self) -> usize {
+        self.bindings.levels()
     }
     fn projects_state_manifold(&self) -> bool {
         true

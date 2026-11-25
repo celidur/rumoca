@@ -21,9 +21,9 @@ const DEVICE_UNIT: &str = r#"{%- from "fmi-me-projection.jinja" import device_in
 #include <stdint.h>
 #include <string.h>
 {{ device_instance(solve, me_refresh, "rmc") }}
-static __device__ rmcStatus update_discrete_equations(ModelInstance* m) { (void)m; return rmcOK; }
+RMC_UNUSED static __device__ rmcStatus update_discrete_equations(ModelInstance* m) { (void)m; return rmcOK; }
 {{ binding_updates(solve, me_bindings, "rmc", device=true) }}
-{{ real_extremum_prelude("cuda", true) }}
+{{ real_extremum_prelude("cuda") }}
 {{ device_kernel(solve, me_refresh, "rmc") }}
 "#;
 
@@ -44,7 +44,9 @@ pub(crate) fn device_unit(compiled: &rumoca::CompilationResult) -> String {
 
 /// The test models: an affine block with its reduced elimination, a torn loop
 /// with causal runs, an array equation whose rows are sliced singletons, a
-/// loop through a pure function with a loop, and a switching chart set.
+/// loop through a pure function with a loop, a loop through a function whose
+/// assertion fails at some points, an initialization residual that
+/// calls a function, and a switching chart set.
 pub(crate) fn models() -> Vec<(rumoca::CompilationResult, &'static str)> {
     let compile = |source: &str, model: &str| {
         rumoca::Compiler::new()
@@ -62,6 +64,14 @@ pub(crate) fn models() -> Vec<(rumoca::CompilationResult, &'static str)> {
         (
             compile(AFFINE_SPLIT, "DeviceAffineSplit"),
             "DeviceAffineSplit",
+        ),
+        (
+            compile(ASSERTING_FUNCTION, "DeviceAssertingFunction"),
+            "DeviceAssertingFunction",
+        ),
+        (
+            compile(INITIAL_FUNCTION, "DeviceInitialFunction"),
+            "DeviceInitialFunction",
         ),
         (
             compile(
@@ -121,6 +131,41 @@ equation
   u[2] + u[3] = x[1]*x[2];
 end DeviceAffineSplit;";
 
+/// A loop through a function whose error-level assertion holds at the first
+/// points and fails at the last ones.
+const ASSERTING_FUNCTION: &str = "model DeviceAssertingFunction
+  function bounded
+    input Real v;
+    output Real s;
+  algorithm
+    assert(v < 1.1, \"bounded: v out of range\");
+    s := v + 0.1*sin(v);
+  end bounded;
+  Real x(start=1, fixed=true);
+  Real z(start=0.5);
+equation
+  der(x) = -z;
+  z + 0.1*bounded(z) = x;
+end DeviceAssertingFunction;";
+
+/// No projection block, and an initialization residual that calls a function:
+/// its tangent programs are the kernel's only callers of the directional
+/// typed functions.
+const INITIAL_FUNCTION: &str = "model DeviceInitialFunction
+  function shifted
+    input Real v;
+    output Real s;
+  algorithm
+    s := v + 0.5*sin(v);
+  end shifted;
+  parameter Real p(fixed=false, start=1);
+  Real x(start=1, fixed=true);
+initial equation
+  shifted(p) = 2;
+equation
+  der(x) = -p*x;
+end DeviceInitialFunction;";
+
 /// The perturbed state points every comparison refreshes.
 pub(crate) const POINTS: usize = 5;
 
@@ -149,7 +194,8 @@ fn start_values(start: &str, tag: &str) -> String {
 /// (the `Y` and `P` lines a driver prints), perturbs its `states` leading
 /// coordinates as the FMI driver does and refreshes. The host build runs the
 /// lanes in turn; a CUDA build launches them on the device. Both print each
-/// lane's status and coordinate in the FMI driver's format.
+/// lane's status, failed-assertion flag and coordinate in the FMI driver's
+/// format.
 pub(crate) fn lane_harness(unit: &str, start: &str, states: usize) -> String {
     let y0 = start_values(start, "Y");
     let p0 = start_values(start, "P");
@@ -160,14 +206,14 @@ pub(crate) fn lane_harness(unit: &str, start: &str, states: usize) -> String {
 static __device__ const double rmc_y0[Y_LEN] = {{ {y0} }};
 static __device__ const double rmc_p0[P_LEN] = {{ {p0} }};
 static __device__ int rmc_point(ModelInstance* m, int k) {{
-    rmc_lane_reset(m); m->time = 0.0; m->parameters_dirty = false; m->rmc_nonfinite = false; m->assertion_failed = false;
+    rmc_lane_reset(m); m->time = 0.0; m->parameters_dirty = false;
     for (size_t i = 0; i < Y_LEN; ++i) m->y[i] = rmc_y0[i];
     for (size_t i = 0; i < P_LEN; ++i) m->p[i] = rmc_p0[i];
     for (size_t i = 0; i < {states}; ++i) m->y[i] = rmc_y0[i] * (1.0 + 0.05 * k) + 0.01 * (double)(i + 1);
     return refresh_algebraics(m) == rmcOK;
 }}
 static void rmc_print(const ModelInstance* m, int ok) {{
-    printf("%d", ok); for (size_t i = 0; i < Y_LEN; ++i) printf(" %a", m->y[i]); printf("\n");
+    printf("%d %d", ok, (int)m->assertion_failed); for (size_t i = 0; i < Y_LEN; ++i) printf(" %a", m->y[i]); printf("\n");
 }}
 #if defined(__CUDACC__)
 __global__ void rmc_points(ModelInstance* lanes, int* ok) {{
@@ -191,9 +237,10 @@ int main(void) {{
 }}
 #else
 int main(void) {{
-    ModelInstance* m = (ModelInstance*)calloc(1, sizeof *m);
+    ModelInstance* m = (ModelInstance*)malloc(sizeof *m);
     if (!m) return 2;
-    for (int k = 1; k <= {POINTS}; ++k) {{ int ok = rmc_point(m, k); rmc_print(m, ok); }}
+    /* Device memory is not zeroed: every lane starts from garbage. */
+    for (int k = 1; k <= {POINTS}; ++k) {{ memset((void*)m, 0xA5, sizeof *m); int ok = rmc_point(m, k); rmc_print(m, ok); }}
     free(m);
     return 0;
 }}

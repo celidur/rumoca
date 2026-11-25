@@ -34,7 +34,7 @@ use crate::errors::CodegenError;
 use assign::AssignmentCatalog;
 use block::{BlockRecord, BlockSources, block_record};
 pub(super) use manifold::StateManifoldBlocks;
-pub(crate) use source::RefreshSource;
+pub(crate) use source::{AdmittedSolveModel, RefreshSource};
 use table::ProgramTable;
 
 /// The largest projection program, in operations, that the C kernel leaves
@@ -373,7 +373,7 @@ fn float_literal(value: f64) -> String {
 /// and fails beyond it (`eval_and_apply_update_rows`); a component that would
 /// succeed where the linked kernel fails is refused instead.
 fn require_settleable_bindings(component: &impl RefreshSource) -> Result<(), CodegenError> {
-    let levels = component.parameter_binding_levels()?;
+    let levels = component.parameter_binding_levels();
     if levels < policy::ALGEBRAIC_REFRESH_MAX_ITERS {
         return Ok(());
     }
