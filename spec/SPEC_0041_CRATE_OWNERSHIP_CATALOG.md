@@ -317,8 +317,14 @@ schedule as a WGSL value function (#734); they resolve no group, and R003
 re-pins the six macro regions #733 moved or changed. R005 (decision
 `d-pending-owner-741-unused-helper-attribute-20261124`): the projection
 kernel's `rmc_dalloc_raw` carries an unused attribute, so Clang accepts a
-model that emits no caller; it resolves no group. Every other
-group, including D085, remains open.
+model that emits no caller; it resolves no group.
+R006 (decision `d-pending-owner-me-projection-c-emission-20261124`): the FMI
+projection kernel and its plan views render failed trials that restore their
+coordinate, offset descriptors, switch dispatch, model-prefixed shared
+symbols, per-chart fold messages, sliced and packed programs, shared row
+functions, arena coordinate copies and a declined singleton's residual
+reused by the dense Newton; it resolves no group. Every other group,
+including D085, remains open.
 
 The non-active successor design is DRAFT
 [SPEC_0037 §2a](SPEC_0037_FORMALLY_VERIFIED_COMPILER.md#2a-source-bound-backend-retirement),
