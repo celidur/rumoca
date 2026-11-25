@@ -324,11 +324,15 @@ coordinate, offset descriptors, switch dispatch, model-prefixed shared
 symbols, per-chart fold messages, sliced and packed programs, shared row
 functions, arena coordinate copies and a declined singleton's residual
 reused by the dense Newton; it resolves no group.
-R007 (decision `d-pending-owner-cuda-ode-shared-projection-20261125`): the
-projection kernel renders a device build, its binding runs,
-initialization on the instance coordinates, delays held at initialization
-and the retained state manifold, and the cuda-ode target renders one model
-instance per lane through it; it resolves no group. Every other group,
+R007 (decision `d-pending-owner-me-projection-device-build-20261125`): the FMI
+projection kernel, its typed pure functions and the scalar kernel render a
+device build of the kernel, and the refresh view reads a lowered SolveModel; it
+resolves no group.
+R008 (decision `d-pending-owner-cuda-ode-shared-projection-20261125`): the
+projection kernel renders its binding runs, initialization on the instance
+coordinates, delays held at initialization, the retained state manifold and
+bounded device functions, and the cuda-ode target renders one model instance
+per lane through it; it resolves no group. Every other group,
 including D085, remains open.
 
 The non-active successor design is DRAFT
