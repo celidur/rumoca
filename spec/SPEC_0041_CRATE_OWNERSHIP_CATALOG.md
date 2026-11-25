@@ -323,7 +323,12 @@ projection kernel and its plan views render failed trials that restore their
 coordinate, offset descriptors, switch dispatch, model-prefixed shared
 symbols, per-chart fold messages, sliced and packed programs, shared row
 functions, arena coordinate copies and a declined singleton's residual
-reused by the dense Newton; it resolves no group. Every other group,
+reused by the dense Newton; it resolves no group.
+R007 (decision `d-pending-owner-cuda-ode-shared-projection-20261125`): the
+projection kernel renders a device build, its binding runs,
+initialization on the instance coordinates, delays held at initialization
+and the retained state manifold, and the cuda-ode target renders one model
+instance per lane through it; it resolves no group. Every other group,
 including D085, remains open.
 
 The non-active successor design is DRAFT
