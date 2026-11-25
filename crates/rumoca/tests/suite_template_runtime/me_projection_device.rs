@@ -279,8 +279,8 @@ int main(void) {{
     if (cudaDeviceSynchronize() != cudaSuccess) return 3;
     ModelInstance* host = (ModelInstance*)malloc({POINTS} * sizeof(ModelInstance)); int status[{POINTS}];
     if (!host) return 2;
-    cudaMemcpy(host, lanes, {POINTS} * sizeof(ModelInstance), cudaMemcpyDeviceToHost);
-    cudaMemcpy(status, ok, sizeof status, cudaMemcpyDeviceToHost);
+    if (cudaMemcpy(host, lanes, {POINTS} * sizeof(ModelInstance), cudaMemcpyDeviceToHost) != cudaSuccess) return 3;
+    if (cudaMemcpy(status, ok, sizeof status, cudaMemcpyDeviceToHost) != cudaSuccess) return 3;
     for (int k = 0; k < {POINTS}; ++k) rmc_print(&host[k], status[k]);
     free(host); cudaFree(lanes); cudaFree(ok);
     return 0;
