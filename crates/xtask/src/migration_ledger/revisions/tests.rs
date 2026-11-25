@@ -169,8 +169,9 @@ fn shipped_record_is_pinned_and_resolves_only_d007() {
     // and R006 revise paths R003 revised, R007 two more and R010 eleven.
     // One path is revised twice before R005, and six are new. R011 revises
     // fourteen paths, eight of them for the first time.
-    assert_eq!(moved.len(), 46, "{moved:?}");
-    assert_eq!(expected.len(), ledger.files.len() + 6);
+    // R012 revises six paths, one of them for the first time, one new.
+    assert_eq!(moved.len(), 47, "{moved:?}");
+    assert_eq!(expected.len(), ledger.files.len() + 7);
 }
 
 /// The ledger's first pinned region, re-pinned by a revision of its file.

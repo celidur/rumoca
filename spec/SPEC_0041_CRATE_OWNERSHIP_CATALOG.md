@@ -334,8 +334,12 @@ projection kernel and its plan views render failed trials that restore their
 coordinate, offset descriptors, switch dispatch, model-prefixed shared
 symbols, per-chart fold messages, sliced and packed programs, shared row
 functions, arena coordinate copies and a declined singleton's residual
-reused by the dense Newton; it resolves no group. Every other group,
-including D085, remains open.
+reused by the dense Newton; it resolves no group.
+R012 (decision `d-pending-owner-me-projection-device-build-20261125`): the FMI
+projection kernel, its typed pure functions and the scalar kernel render a
+device build of the kernel, and the refresh view reads a lowered SolveModel; it
+resolves no group.
+Every other group, including D085, remains open.
 
 The non-active successor design is DRAFT
 [SPEC_0037 §2a](SPEC_0037_FORMALLY_VERIFIED_COMPILER.md#2a-source-bound-backend-retirement),

@@ -520,6 +520,101 @@
           "after": "871ef8598b2818f22f97844c9c655d928e8b4a79cd6564aa2b11cb3a60395d6b"
         }
       ]
+    },
+    {
+      "id": "R012",
+      "decision": "d-pending-owner-me-projection-device-build-20261125",
+      "change": "The FMI3 projection kernel, its typed pure functions and the scalar kernel take a device flag. In a device build every kernel function and table is static __device__, the exported RMC_API declarations are left out, compound literals become named argument arrays, the two chart functions whose goto fail crosses an initialization open a block that closes before the label, and nextafter steps towards HUGE_VAL. The refresh view reads either the checked FMI C component or a complete lowered SolveModel (RefreshSource), and SolveTemplateRenderer supplies that view and the pure-call families to a target template. With the flag false the emitted C is unchanged.",
+      "resolves": [],
+      "files": [
+        {
+          "path": "crates/rumoca-phase-codegen/src/codegen/me_projection.rs",
+          "before": "4cbd8570785f849038a248b4aed35465f0737c56a7603724d5dd5d3187f74163",
+          "after": "026be005a4af6dbfef156b29c1f002816bc899a1c198df9360ff120e1b73274c"
+        },
+        {
+          "path": "crates/rumoca-phase-codegen/src/codegen/me_projection/source.rs",
+          "after": "ed4ff97f0a2e1ce1cd8ca350b0799cbea7b9ea57f65199559dd440d0456c4d00"
+        },
+        {
+          "path": "crates/rumoca-phase-codegen/src/codegen/solve_renderer.rs",
+          "before": "2b2269072f550f2d999eb542ea27fc0748548cdd4675f8e632285a5e9fd6915a",
+          "after": "9399aa8dc0e1c28f97cef238185d6a9a1ffeba2c5ef2e9890b563072150e9b97"
+        },
+        {
+          "path": "crates/rumoca-phase-codegen/src/templates/fmi3/me_projection.jinja",
+          "before": "3ad1e96b98c7ba6e2686c3b8923ff8515cd47a9143d143386de8793f3e97671a",
+          "after": "629a4ebbd9d6f86300cf8494067f06810788353bd048792758f878d7ef2d2bb3"
+        },
+        {
+          "path": "crates/rumoca-phase-codegen/src/templates/fmi3/scalar_kernel.jinja",
+          "before": "a54e5d3a5e266804333656108ae98df11ab94bb72aa08411cabc520c7cc1d098",
+          "after": "5334c900c88cbd668dfda44c447878210d6d7acb2ad7b6dcd946444117423ba4"
+        },
+        {
+          "path": "crates/rumoca-phase-codegen/src/templates/fmi3/typed_functions.jinja",
+          "before": "89eb15506a3bf0f2d38f667420dd6b40cfce897e8a859a86a2c7fe1c5e369f58",
+          "after": "d8eb7c4265db51c5bee2002fc7a78995d6ab49d1bab9c706d1f34246ba00a9cf"
+        }
+      ],
+      "regions": [
+        {
+          "path": "crates/rumoca-phase-codegen/src/templates/fmi3/typed_functions.jinja",
+          "name": "call",
+          "before": "4830d81614f2fc1f8ef0ba4cf22f5a36dac342d6ab477a17695b240f3e004fd0",
+          "start_byte": 1289,
+          "end_byte": 1897,
+          "after": "d54e52d68decdf4689740a0e1b02e603b8a3f7196b46e6be4aa8a94e82001068"
+        },
+        {
+          "path": "crates/rumoca-phase-codegen/src/templates/fmi3/typed_functions.jinja",
+          "name": "definition",
+          "before": "39ab81c8e4f6d295730509194d48bcc3239b0171fbef34cba8d68034d84a194c",
+          "start_byte": 12001,
+          "end_byte": 16532,
+          "after": "5d9bb27bf9ca3522615522e720d767c432ba9c570f464cdfb247014ca22e977e"
+        },
+        {
+          "path": "crates/rumoca-phase-codegen/src/templates/fmi3/typed_functions.jinja",
+          "name": "function_prototypes",
+          "before": "b970d7b6fb8fa4425ec9ee595bbdd9bc313d0958111274a2f50d7566fdc4062f",
+          "start_byte": 20149,
+          "end_byte": 22768,
+          "after": "2ddb6db08ecce9a1f4c263321e245664664cd160b1f378ce795c82e6451fee13"
+        },
+        {
+          "path": "crates/rumoca-phase-codegen/src/templates/fmi3/typed_functions.jinja",
+          "name": "functions",
+          "before": "c825c1a41be278a54ca03a2f6192739c297d1efb7dfdc4cb1f102c21757338b8",
+          "start_byte": 18627,
+          "end_byte": 20073,
+          "after": "6c0529365179517b83789dd268cedfc73600af178504d924e5ea8e92549e1c17"
+        },
+        {
+          "path": "crates/rumoca-phase-codegen/src/templates/fmi3/typed_functions.jinja",
+          "name": "observation_wrapper",
+          "before": "02f81e72ea261e16b4b5cb68dc2cef614c09863578355d14c56bdcc64614794e",
+          "start_byte": 1899,
+          "end_byte": 3612,
+          "after": "ac45334e1a97b493afe07f0ac447497592df999ed204a244d7c53fbe3047aca5"
+        },
+        {
+          "path": "crates/rumoca-phase-codegen/src/templates/fmi3/typed_functions.jinja",
+          "name": "operation",
+          "before": "dc4844fde52e32579fc22cb235d180afdd39576f05b7db9efd1098fc74e6bfc4",
+          "start_byte": 4204,
+          "end_byte": 11999,
+          "after": "9221e60872bf56947a9b2821179a14891f9af8ed80e6c7b1006d7704bdd9b527"
+        },
+        {
+          "path": "crates/rumoca-phase-codegen/src/templates/fmi3/typed_functions.jinja",
+          "name": "wrapper",
+          "before": "871ef8598b2818f22f97844c9c655d928e8b4a79cd6564aa2b11cb3a60395d6b",
+          "start_byte": 16659,
+          "end_byte": 18452,
+          "after": "8bdc156ad5a0305863a88eac0893a991099afede42babc57bcdac5515725adf3"
+        }
+      ]
     }
   ]
 }
