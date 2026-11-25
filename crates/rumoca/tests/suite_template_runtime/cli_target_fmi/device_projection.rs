@@ -206,5 +206,7 @@ fn the_device_unit_includes_no_header_after_its_shims() {
         let unit = device_unit(&compiled);
         let shims = unit.find("#define snprintf").expect("the device shims");
         assert!(!unit[shims..].contains("#include"), "{model}");
+        // Nor a compound literal, which C++ does not have.
+        assert!(!unit.contains("[]){"), "{model}");
     }
 }

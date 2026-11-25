@@ -295,14 +295,14 @@
             {
                 double r[{{ arm.condition.register_count if arm.condition.register_count > 0 else 1 }}];
 {%- for region_op in arm.condition.ops %}
-{{ scalar_op(region_op, "fc_cond", error_status, observation_mode=observation_mode) }}
+{{ scalar_op(region_op, "fc_cond", error_status, observation_mode=observation_mode, device=device) }}
 {%- endfor %}
             }
             if (fc_cond[0] != 0.0) {
                 double r[{{ arm.result.register_count if arm.result.register_count > 0 else 1 }}];
                 fc_taken = 1;
 {%- for region_op in arm.result.ops %}
-{{ scalar_op(region_op, "fc_out", error_status, observation_mode=observation_mode) }}
+{{ scalar_op(region_op, "fc_out", error_status, observation_mode=observation_mode, device=device) }}
 {%- endfor %}
             }
         }
@@ -310,7 +310,7 @@
         if (!fc_taken) {
             double r[{{ op.fallback.register_count if op.fallback.register_count > 0 else 1 }}];
 {%- for region_op in op.fallback.ops %}
-{{ scalar_op(region_op, "fc_out", error_status, observation_mode=observation_mode) }}
+{{ scalar_op(region_op, "fc_out", error_status, observation_mode=observation_mode, device=device) }}
 {%- endfor %}
         }
         for (size_t k=0; k<{{ op.result_count }}; ++k) fc_outer[{{ op.dst }}+k] = fc_out[k];
@@ -380,7 +380,7 @@
                 double fold_predicate[1];
                 double r[{{ [op.continuation.register_count, 1]|max }}]; (void)r;
 {%- for continuation_op in op.continuation.ops %}
-{{ scalar_op(continuation_op, "fold_predicate", error_status, observation_mode=observation_mode) }}
+{{ scalar_op(continuation_op, "fold_predicate", error_status, observation_mode=observation_mode, device=device) }}
 {%- endfor %}
                 fold_done = fold_predicate[0] == 0.0;
             }
@@ -390,7 +390,7 @@
             {
                 double r[{{ [op.update.register_count, 1]|max }}]; (void)r;
 {%- for update_op in op.update.ops %}
-{{ scalar_op(update_op, "fold_next", error_status, observation_mode=observation_mode) }}
+{{ scalar_op(update_op, "fold_next", error_status, observation_mode=observation_mode, device=device) }}
 {%- endfor %}
             }
             {%- if op.carried_count > 0 %}

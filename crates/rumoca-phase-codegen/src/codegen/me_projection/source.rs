@@ -55,15 +55,10 @@ impl RefreshSource for solve::fmi::FmiCCodegenView {
 }
 
 /// A complete lowered model, without an FMI component, admitted to the C
-/// kernel: it passed the kernel checks the C component runs before its C is
-/// generated (`rumoca_ir_solve::fmi::SolveBindingExecution::checked`: initial
-/// mode, finite initial values sized to the layout, no recursive function
-/// group, typed functions within the C profile, parameter bindings in
-/// dependency order) and the template domain of the kernel
-/// (`require_builtin_fmi_template_domain`). Only an admitted model is a
-/// refresh source, so no view is built from a model the kernel refuses. Its
-/// target runs its own steps, so it projects each accepted state onto the
-/// retained manifold (`manifold_kernel` over `solve_blocks.state_manifold`).
+/// kernel (SPEC_0044 ME-PROJ-001). Only an admitted model is a refresh source,
+/// so no view is built from a model the kernel refuses. Its target runs its
+/// own steps, so it projects each accepted state onto the retained manifold
+/// (`manifold_kernel` over `solve_blocks.state_manifold`).
 pub(crate) struct AdmittedSolveModel<'a> {
     model: &'a solve::SolveModel,
     bindings: solve::fmi::SolveBindingExecution,

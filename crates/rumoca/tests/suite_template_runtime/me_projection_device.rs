@@ -70,6 +70,10 @@ pub(crate) fn models() -> Vec<(rumoca::CompilationResult, &'static str)> {
             "DeviceAssertingFunction",
         ),
         (
+            compile(BRANCHING_FUNCTION, "DeviceBranchingFunction"),
+            "DeviceBranchingFunction",
+        ),
+        (
             compile(INITIAL_FUNCTION, "DeviceInitialFunction"),
             "DeviceInitialFunction",
         ),
@@ -147,6 +151,37 @@ equation
   der(x) = -z;
   z + 0.1*bounded(z) = x;
 end DeviceAssertingFunction;";
+
+/// A loop through a function whose branches and loop body call another
+/// function, and through a conditional a tunable parameter selects, whose
+/// arms call it: pure calls inside the regions of a function conditional.
+const BRANCHING_FUNCTION: &str = "model DeviceBranchingFunction
+  function leaf
+    input Real v;
+    output Real s;
+  algorithm
+    s := v + 0.1*sin(v);
+  end leaf;
+  function branched
+    input Real v;
+    output Real s;
+  algorithm
+    if v > 0.9 then
+      s := leaf(v);
+    else
+      s := 2*leaf(0.5*v);
+    end if;
+    for i in 1:2 loop
+      s := s + 0.01*leaf(s/i);
+    end for;
+  end branched;
+  parameter Integer mode = 2;
+  Real x(start=1, fixed=true);
+  Real z(start=0.5);
+equation
+  der(x) = -z;
+  z + 0.1*branched(z) + (if mode == 1 then leaf(z) else leaf(0.5*z)) = x;
+end DeviceBranchingFunction;";
 
 /// No projection block, and an initialization residual that calls a function:
 /// its tangent programs are the kernel's only callers of the directional
