@@ -423,7 +423,8 @@ RMC_COLD {{ q }} void rmc_fb_note(ModelInstance* m, size_t site) {
 /* ImplicitProjectionModel::eval_implicit_residual_row */
 {{ q }} RMC_ALWAYS_INLINE int rmc_row(ModelInstance* m, const RmcBlock* b, size_t row, double* value) {
     double out[{{ me.table.row_max_outputs }}];
-    if (rmc_row_call(RMC_BP(b, row_program)[row], m, out) != 0) return -1;
+    int status = rmc_row_call(RMC_BP(b, row_program)[row], m, out);
+    if (status != 0) return RMC_FAILURE(status);
     *value = out[RMC_BP(b, row_offset)[row]];
     return 0;
 }
@@ -439,7 +440,8 @@ RMC_COLD {{ q }} void rmc_fb_note(ModelInstance* m, size_t site) {
         size_t dependent = inv ? RMC_BP(b, row_split)[0] : 0;
         int split = dependent ? rmc_dep_call(dependent - 1, m, inv, out) : -1;
         if (split == RMC_FATAL) return RMC_FATAL;
-        if (split != 0 && rmc_row_call(RMC_BP(b, row_program)[0], m, out) != 0) return -1;
+        int status = split != 0 ? rmc_row_call(RMC_BP(b, row_program)[0], m, out) : 0;
+        if (status != 0) return RMC_FAILURE(status);
         residual[0] = out[RMC_BP(b, row_offset)[0]];
         return 0;
     }
@@ -452,7 +454,8 @@ RMC_COLD {{ q }} void rmc_fb_note(ModelInstance* m, size_t site) {
             size_t dependent = inv ? b_row_split_pool[row] : 0;
             int split = dependent ? rmc_dep_call(dependent - 1, m, inv, out) : -1;
             if (split == RMC_FATAL) return RMC_FATAL;
-            if (split != 0 && rmc_row_call(program, m, out) != 0) return -1;
+            int status = split != 0 ? rmc_row_call(program, m, out) : 0;
+            if (status != 0) return RMC_FAILURE(status);
         }
         last = program; residual[row] = out[b_row_offset_pool[row]];
     }
@@ -561,14 +564,15 @@ done:
 {{ q }} int rmc_isolate(ModelInstance* m, size_t id, double* value) {
 {%- if me.table.isolators.programs|length > 0 %}
     double out[{{ me.table.iso_max_outputs }}];
-    if (rmc_iso_call(rmc_iso_group[id], m, out) != 0) return -1;
+    int status = rmc_iso_call(rmc_iso_group[id], m, out);
+    if (status != 0) return RMC_FAILURE(status);
     *value = out[rmc_iso_slot[id]];
     return 0;
 {%- else %}
     /* A component without isolator programs has no isolator tables: an
        isolation its descriptors name is a fault of those tables. */
     (void)value;
-    return rmc_bad_program(m, id) != 0 ? -1 : 0;
+    return rmc_bad_program(m, id);
 {%- endif %}
 }
 /* projection.rs: assignment_tolerances */
@@ -585,8 +589,8 @@ done:
     for (size_t e = b_iso_start_pool[row]; e < b_iso_start_pool[row + 1]; ++e)
         if (b_iso_entries_pool[3 * e] == col) { kind = b_iso_entries_pool[3 * e + 1]; function = b_iso_entries_pool[3 * e + 2]; break; }
     if (kind == RMC_ISOLATION_UNAVAILABLE) return 0;
-    if (kind == RMC_ISOLATION_OUTPUT_VALUE) { if (rmc_row(m, b, row, &result) != 0) return -1; }
-    else if (rmc_isolate(m, function, &result) != 0) return -1;
+    int status = kind == RMC_ISOLATION_OUTPUT_VALUE ? rmc_row(m, b, row, &result) : rmc_isolate(m, function, &result);
+    if (status != 0) return status;
     if (!isfinite(result)) return 0;
     *value = result;
     return 1;
@@ -614,7 +618,8 @@ typedef struct { bool known; double value; } RmcKnownRow;
     if (found < 0) return -1;
     if (found == 0) { declined->known = true; declined->value = before; return 0; }
     double previous = m->y[index]; m->y[index] = value;
-    if (rmc_row(m, b, 0, &after) != 0) return -1;
+    /* A failed evaluation of the trial leaves y as the assignment found it. */
+    if (rmc_row(m, b, 0, &after) != 0) { m->y[index] = previous; return -1; }
     if (isfinite(after)) {
         rmc_assignment_tolerances(m->rmc_tol, index, before, after, previous, value, &row_tol, &variable_tol);
         /* singleton.rs: singleton_assignment_improves */
@@ -632,17 +637,19 @@ typedef struct { bool known; double value; } RmcKnownRow;
     const size_t* entry = RMC_BP(b, cruns) + 4 * run;
     if (entry[0] == RMC_RUN_ISOLATOR) {
         double value = 0.0;
-        if (rmc_isolate(m, entry[1], &value) != 0) return -1;
+        int status = rmc_isolate(m, entry[1], &value);
+        if (status != 0) return status;
         if (!isfinite(value)) return 0;
         m->y[RMC_BP(b, causal_target)[entry[2]]] = value;
         return 1;
     }
     int result = rmc_causal_call(entry[1], m, RMC_BP(b, causal_target) + entry[2]);
-    return result < 0 ? -1 : (result > 0 ? 0 : 1);
+    return result < 0 ? RMC_FAILURE(result) : (result > 0 ? 0 : 1);
 }
 {{ q }} inline int rmc_torn_residual(ModelInstance* m, const RmcBlock* b, size_t i, double* residual) {
     double value = 0.0;
-    if (rmc_row(m, b, RMC_BP(b, residual_row)[i], &value) != 0) return -1;
+    int status = rmc_row(m, b, RMC_BP(b, residual_row)[i], &value);
+    if (status != 0) return status;
     residual[i] = isfinite(value) ? value : NAN;
     return 0;
 }
@@ -858,7 +865,8 @@ typedef struct { bool known; double value; } RmcKnownRow;
     bool stepped = false;
     rmc_save(m, b, snapshot);
     int swept = rmc_torn_sweep(m, b, residual);
-    if (swept < 0) { RMC_RELEASE; return -1; }
+    /* A failed sweep or Newton step leaves y as the torn attempt found it. */
+    if (swept < 0) { rmc_restore(m, b, snapshot); RMC_RELEASE; return -1; }
     if (swept == 1) {
         for (size_t c = 0; c < k; ++c) vscale[c] = rmc_model_scale(b_y_pool[b_tear_col_pool[c]], m->y[b_y_pool[b_tear_col_pool[c]]]);
         if (rmc_all_finite(residual, k)) {
@@ -868,7 +876,7 @@ typedef struct { bool known; double value; } RmcKnownRow;
                    forming the Jacobian again. */
                 int step = !m->rmc_certify && stepped && rmc_scaled_converged(m->rmc_tol, residual, step_scales, k) ? 1 : rmc_torn_newton(m, b, residual, vscale, step_scales);
                 if (step == 2) stepped = true;
-                if (step < 0) { RMC_RELEASE; return -1; }
+                if (step < 0) { rmc_restore(m, b, snapshot); RMC_RELEASE; return -1; }
                 if (step == 1) {
                     update->changed = false;
                     for (size_t i = 0; i < b_n; ++i) if (m->y[b_y_pool[i]] != snapshot[i]) update->changed = true;
@@ -1156,6 +1164,8 @@ typedef struct {
         }
         result = 0;
     }
+    /* A failed solve leaves the block as it was, as affine.rs restores it. */
+    else rmc_restore(m, b, original);
     RMC_RELEASE; return result;
 }
 
@@ -1177,7 +1187,7 @@ RMC_COLD {{ q }} int rmc_seed_assignments(ModelInstance* m, const RmcBlock* b) {
                 if (found < 0) { RMC_RELEASE; return -1; }
                 if (found == 0) continue;
                 double previous = m->y[index]; m->y[index] = value;
-                if (rmc_row(m, b, row, &after) != 0) { RMC_RELEASE; return -1; }
+                if (rmc_row(m, b, row, &after) != 0) { m->y[index] = previous; RMC_RELEASE; return -1; }
                 rmc_assignment_tolerances(m->rmc_tol, index, before, after, previous, value, &row_tol, &variable_tol);
                 if (isfinite(after) && fabs(after) <= row_tol) {
                     if (previous != value) changed = 1;
@@ -1249,7 +1259,8 @@ RMC_COLD {{ q }} int rmc_nudge(ModelInstance* m, const RmcBlock* b, const double
         if (!significant) break;
         alpha = next;
     }
-    if (result == 0) rmc_restore(m, b, snapshot);
+    /* A declined or failed step leaves the block as it was. */
+    rmc_restore(m, b, snapshot);
     RMC_RELEASE; return result;
 }
 /* projection.rs: project_algebraic_residual_block; an uncertified refresh
@@ -1298,18 +1309,16 @@ RMC_COLD {{ q }} int rmc_nudge(ModelInstance* m, const RmcBlock* b, const double
 {{ q }} int rmc_project_block_paths(ModelInstance* m, const RmcBlock* b, RmcUpdate* update) {
     bool singleton_tried = !RMC_BS(b, has_tearing); int handled;
     RmcKnownRow declined = { false, 0.0 };
-    if (singleton_tried && (handled = rmc_project_singleton(m, b, update, &declined)) != 0) return handled < 0 ? -1 : 0;
+    if (singleton_tried && (handled = rmc_project_singleton(m, b, update, &declined)) != 0) return handled < 0 ? handled : 0;
     if (RMC_BS(b, affine)) {
-        if (!singleton_tried && (handled = rmc_project_singleton(m, b, update, &declined)) != 0) return handled < 0 ? -1 : 0;
+        if (!singleton_tried && (handled = rmc_project_singleton(m, b, update, &declined)) != 0) return handled < 0 ? handled : 0;
         return rmc_project_affine(m, b, update);
     }
     if (RMC_BS(b, torn)) {
-        /* The torn solve may move the coordinates the singleton saw. */
-        declined.known = false;
-        if ((handled = rmc_project_torn(m, b, update)) != 0) return handled < 0 ? -1 : 0;
+        if ((handled = rmc_project_torn(m, b, update)) != 0) return handled < 0 ? handled : 0;
         rmc_fb_note(m, b->id);
     }
-    if (!singleton_tried && (handled = rmc_project_singleton(m, b, update, &declined)) != 0) return handled < 0 ? -1 : 0;
+    if (!singleton_tried && (handled = rmc_project_singleton(m, b, update, &declined)) != 0) return handled < 0 ? handled : 0;
     return rmc_project_dense(m, b, &declined, update);
 }
 /* projection_fallbacks.rs: begin_call around the block projection */
@@ -2401,7 +2410,7 @@ RMC_COLD {{ q }} int rmc_tan_rows(ModelInstance* m, const size_t* entries, size_
     size_t last = (size_t)-1;
     for (size_t i = 0; i < count; ++i) {
         const size_t* e = entries + stride * i;
-        if (e[0] != last) { if (rmc_jvp_call(e[0], m, seed, out) != 0) return -1; last = e[0]; }
+        if (e[0] != last) { int status = rmc_jvp_call(e[0], m, seed, out); if (status != 0) return RMC_FAILURE(status); last = e[0]; }
         values[i] = out[e[1]];
     }
     return 0;
@@ -2961,6 +2970,9 @@ RMC_COLD {{ q }} {{ prefix }}Status rmc_initialize(ModelInstance* m, double tole
    apart from a failed program (-1); see rmc_bad_program. RMC_FAULTED reads
    the fault an earlier call left on the instance. */
 #define RMC_FATAL (-2)
+/* A failed call's answer to its caller: a fault stays RMC_FATAL, any other
+   failure is -1. */
+#define RMC_FAILURE(status) ((status) == RMC_FATAL ? RMC_FATAL : -1)
 #define RMC_FAULTED(m) ((m)->rmc_fatal)
 {{ api }} int rmc_bad_program(ModelInstance* m, size_t program);
 {%- else %}

@@ -6,6 +6,7 @@ mod colored_rows;
 mod column_gradient;
 mod combined_names;
 mod declined_singleton;
+mod failed_trials;
 mod manifold;
 mod order_robustness;
 mod row_scoped_initial_residual;

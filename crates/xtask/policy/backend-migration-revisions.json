@@ -229,7 +229,7 @@
     {
       "id": "R006",
       "decision": "d-pending-owner-me-projection-c-emission-20261124",
-      "change": "The FMI3 projection kernel, the FMI2 and FMI3 model headers and their plan views render projection block and chart descriptors as offsets into the index pool instead of pointers, reach each program family through one switch dispatcher instead of function-pointer tables, and carry the model identifier on the shared kernel and typed-function symbols. An out-of-range program index answers a logged fatal status that later kernel entries refuse until reset. A block's ES016 fold message is read from the block's own chart. Row, isolator and assignment functions render the output slices and packed registers issued by rumoca-ir-solve (slice_to_outputs, pack_registers), and rows equal up to their load indices (load_index_classes) share one row function. With a projection arena, the coordinate copies of the refresh and of the chart functions are arena frames. A one-row block whose singleton assignment declines passes its residual to the dense Newton. No in-range value or decision changes.",
+      "change": "The FMI3 projection kernel, the FMI2 and FMI3 model headers and their plan views render projection block and chart descriptors as offsets into the index pool instead of pointers, reach each program family through one switch dispatcher instead of function-pointer tables, and carry the model identifier on the shared kernel and typed-function symbols. An out-of-range program index answers a logged fatal status that later kernel entries refuse until reset. A block's ES016 fold message is read from the block's own chart, and a block projection whose trial evaluation fails restores the coordinate it saved before it returns the error. Row, isolator and assignment functions render the output slices and packed registers issued by rumoca-ir-solve (slice_to_outputs, pack_registers), and rows equal up to their load indices (load_index_classes) share one row function. With a projection arena, the coordinate copies of the refresh and of the chart functions are arena frames. A one-row block whose singleton assignment declines passes its residual to the dense Newton. No in-range value or decision changes.",
       "resolves": [],
       "files": [
         {
@@ -285,7 +285,7 @@
         {
           "path": "crates/rumoca-phase-codegen/src/templates/fmi3/me_projection.jinja",
           "before": "73af5da1993be9eec46d8abb9ef17e0cbbf2a4d125f0b7b34fa084a68c6d92ea",
-          "after": "5e0dd95f99d7a21bda5521ab4646c11118708e94af9549e61dedc41fe8ed6995"
+          "after": "5f75b853530c02b9c008d941c5ca93be8315448edbdbafd9769ea0220449b048"
         },
         {
           "path": "crates/rumoca-phase-codegen/src/templates/fmi3/model.h.jinja",
@@ -389,7 +389,7 @@
     {
       "id": "R007",
       "decision": "d-pending-owner-cuda-ode-shared-projection-20261125",
-      "change": "The FMI3 projection kernel and its typed-function and scalar-kernel templates render, behind a device flag, a build in which every function is a static device function, the instance and its arena live in caller storage, and typed calls pass named arrays instead of compound literals; the host components render as before. The kernel also renders the lane status, the parameter-binding runs, the initialization on the instance coordinates with its row isolators and partial forward Jacobian, the delays held at their source during initialization and the projection onto the retained state manifold, each from the plans issued by rumoca-ir-solve. On a device, runs of whole programs and switch dispatchers are split into out-of-line groups of bounded size. The cuda-ode target renders one model instance per lane through that kernel (refresh, initialization, state manifold, step-only builds) from a per-lane execution view of the Solve model. No renderer derives a plan.",
+      "change": "The FMI3 projection kernel and its typed-function and scalar-kernel templates render, behind a device flag, a build in which every function is a static device function, the instance and its arena live in caller storage, and typed calls pass named arrays instead of compound literals; the host components render as before. The kernel also renders the parameter-binding runs, the initialization on the instance coordinates with its row isolators and partial forward Jacobian, the delays held at their source during initialization and the projection onto the retained state manifold, each from the plans issued by rumoca-ir-solve. On a device, runs of whole programs and switch dispatchers are split into out-of-line groups of bounded size. The cuda-ode target renders one model instance per lane through that kernel (refresh, initialization, state manifold, step-only builds) from a per-lane execution view of the Solve model. No renderer derives a plan.",
       "resolves": [],
       "files": [
         {
@@ -483,8 +483,8 @@
         },
         {
           "path": "crates/rumoca-phase-codegen/src/templates/fmi3/me_projection.jinja",
-          "before": "5e0dd95f99d7a21bda5521ab4646c11118708e94af9549e61dedc41fe8ed6995",
-          "after": "cc91e360ed62bc288d9e9009f3967df23470d057e4fb82eaf636c9c779ca53aa"
+          "before": "5f75b853530c02b9c008d941c5ca93be8315448edbdbafd9769ea0220449b048",
+          "after": "1e2f56a10124d0aea220f2c03a567a84a20479d49365681a190499a4c4bc2e27"
         },
         {
           "path": "crates/rumoca-phase-codegen/src/templates/fmi3/scalar_kernel.jinja",

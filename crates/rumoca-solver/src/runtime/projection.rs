@@ -1019,10 +1019,6 @@ fn project_algebraic_block<M: ImplicitProjectionModel>(
     // and corpus-pin gates rather than by any runtime cross-check (there is no
     // second ground truth to compare against, and re-solving densely would give
     // back the cost the tearing removes).
-    if block.tearing.is_some() {
-        // The torn solve may move the coordinates the assignment saw.
-        declined_residual = None;
-    }
     if let Some(update) = try_torn_algebraic_block(
         model,
         y,
@@ -1321,21 +1317,30 @@ fn try_seed_algebraic_target<M: ImplicitProjectionModel>(
     };
     let previous = y[y_index];
     y[y_index] = value;
-    let accepted = context
-        .model
-        .eval_implicit_residual_row(row, y, context.parameters, context.time)?
-        .is_some_and(|after| {
-            let (row_tol, _) = assignment_tolerances(
-                context.model,
-                y_index,
-                before,
-                after,
-                previous,
-                value,
-                context.tolerance,
-            );
-            after.is_finite() && after.abs() <= row_tol
-        });
+    // A failed evaluation of the trial leaves `y` as the seed found it.
+    let after =
+        match context
+            .model
+            .eval_implicit_residual_row(row, y, context.parameters, context.time)
+        {
+            Ok(after) => after,
+            Err(error) => {
+                y[y_index] = previous;
+                return Err(error);
+            }
+        };
+    let accepted = after.is_some_and(|after| {
+        let (row_tol, _) = assignment_tolerances(
+            context.model,
+            y_index,
+            before,
+            after,
+            previous,
+            value,
+            context.tolerance,
+        );
+        after.is_finite() && after.abs() <= row_tol
+    });
     if accepted {
         return Ok(Some(previous != value));
     }
@@ -1387,7 +1392,14 @@ fn project_algebraic_singleton_assignment<M: ImplicitProjectionModel>(
     };
     let previous = y[*y_index];
     y[*y_index] = value;
-    let after = model.eval_implicit_residual_row(*row, y, p, t)?;
+    // A failed evaluation of the trial leaves `y` as the assignment found it.
+    let after = match model.eval_implicit_residual_row(*row, y, p, t) {
+        Ok(after) => after,
+        Err(error) => {
+            y[*y_index] = previous;
+            return Err(error);
+        }
+    };
     if let Some(after) = after.filter(|after| after.is_finite()) {
         let (row_tol, variable_tol) =
             assignment_tolerances(model, *y_index, before, after, previous, value, tol);
@@ -1551,8 +1563,21 @@ fn accept_algebraic_block_delta<M: ImplicitProjectionModel>(
                 settled: false,
             });
         }
-        let after =
-            algebraic_selected_residual_norm(model, y, parameters, time, &block.rows, row_scales)?;
+        // A failed evaluation of the trial leaves the block as it was.
+        let after = match algebraic_selected_residual_norm(
+            model,
+            y,
+            parameters,
+            time,
+            &block.rows,
+            row_scales,
+        ) {
+            Ok(after) => after,
+            Err(error) => {
+                restore_block_values(y, &block.y_indices, &snapshot);
+                return Err(error);
+            }
+        };
         if after.is_finite() && (after <= tolerance || (!step_at_resolution && after < before)) {
             return Ok(ProjectionBlockUpdate {
                 changed: true,

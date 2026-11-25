@@ -165,9 +165,11 @@ fn shipped_record_is_pinned_and_resolves_only_d007() {
         .filter(|(path, hash)| ledger.files.get(*path) != Some(*hash))
         .map(|(path, _)| path.as_str())
         .collect();
-    // R001 revises five paths, R002 six, R003 eleven, R004 four, R005 one,
-    // R006 fourteen and R007 twenty-two. Fifteen of these revisions revise
-    // a path an earlier one revised, and nine paths are new.
+    // R001 revises five paths, R002 six, R003 eleven and R004 four. One path
+    // is revised twice, and three are new.
+    // R006 revises fourteen paths, eight of them for the first time.
+    // R007 revises twenty-two paths, fifteen of them for the first time;
+    // six of those are new.
     assert_eq!(moved.len(), 48, "{moved:?}");
     assert_eq!(expected.len(), ledger.files.len() + 9);
 }

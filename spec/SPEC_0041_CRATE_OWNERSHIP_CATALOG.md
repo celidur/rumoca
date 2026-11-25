@@ -319,13 +319,13 @@ re-pins the six macro regions #733 moved or changed. R005 (decision
 kernel's `rmc_dalloc_raw` carries an unused attribute, so Clang accepts a
 model that emits no caller; it resolves no group.
 R006 (decision `d-pending-owner-me-projection-c-emission-20261124`): the FMI
-projection kernel and its plan views render offset descriptors, switch
-dispatch, model-prefixed shared symbols, per-chart fold messages, sliced and
-packed programs, shared row functions, arena coordinate copies and a
-declined singleton's residual reused by the dense Newton; it resolves no
-group.
+projection kernel and its plan views render failed trials that restore their
+coordinate, offset descriptors, switch dispatch, model-prefixed shared
+symbols, per-chart fold messages, sliced and packed programs, shared row
+functions, arena coordinate copies and a declined singleton's residual
+reused by the dense Newton; it resolves no group.
 R007 (decision `d-pending-owner-cuda-ode-shared-projection-20261125`): the
-projection kernel renders a device build, its lane status, binding runs,
+projection kernel renders a device build, its binding runs,
 initialization on the instance coordinates, delays held at initialization
 and the retained state manifold, and the cuda-ode target renders one model
 instance per lane through it; it resolves no group. Every other group,

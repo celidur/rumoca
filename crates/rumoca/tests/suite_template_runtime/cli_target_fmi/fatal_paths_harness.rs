@@ -107,6 +107,16 @@ int main(void) {
         faulted_family = -1;
     }
     CHECK(reached > 0, "some family is reached");
+    /* The row wrappers answer a fault with the dispatcher's RMC_FATAL, not
+       an ordinary failure. */
+    {
+        static double rows[Y_LEN + 1]; double value = 0.0;
+        reset(m, y); faulted_family = F_ROW;
+        CHECK(rmc_row(m, rmc_block(0), 0, &value) == RMC_FATAL, "rmc_row answers a fault with RMC_FATAL");
+        reset(m, y); faulted_family = F_ROW;
+        CHECK(rmc_rows(m, rmc_block(0), rows) == RMC_FATAL, "rmc_rows answers a fault with RMC_FATAL");
+        faulted_family = -1;
+    }
     /* A fault left on the instance refuses the refresh at entry: no step
        runs, no program or assignment is called, nothing more is logged, and
        no arena frame is opened. */
