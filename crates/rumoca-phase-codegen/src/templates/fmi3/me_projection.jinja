@@ -171,6 +171,8 @@ static __device__ RMC_NOINLINE int {{ name }}_g{{ g.open }}({{ params }}) {
 #define P_LEN {{ solve.layout.p_scalars if solve.layout.p_scalars > 0 else 1 }}
 #define STATE_LEN {{ solve.solve_layout.state_scalar_count if solve.solve_layout.state_scalar_count > 0 else 1 }}
 {%- endmacro %}
+{#- The arena (`rmc_d`, `rmc_s`) stays first: `rmc_lane_reset` zeroes the
+    fields after it. -#}
 {%- macro workspace_fields(me) -%}
 {%- if me.kernel %} double rmc_d[{{ me.work.doubles }}]; size_t rmc_s[{{ me.work.sizes }}]; size_t rmc_dtop; size_t rmc_stop; double rmc_tol; bool rmc_certify;{% endif -%}
 {%- if me.kernel or me.assign.plan.programs|length > 0 %} bool rmc_fatal;{% endif -%}
@@ -3238,7 +3240,8 @@ RMC_API extern const size_t rmc_iso_slot[{{ me.table.isolator_slot|length }}];
     <float.h>, <math.h>, <stdbool.h>, <stddef.h>, <stdint.h> and <string.h>,
     <assert.h> when it defines RMC_DEBUG, and any other standard header it
     uses, before `device_instance`, which redefines `snprintf` and `memcmp`
-    until the end of `device_kernel`; the two macros include none. It emits
+    until the end of `device_kernel`, where the includer's own definitions
+    come back (push_macro, pop_macro); the two macros include none. It emits
     the min/max helpers its programs and typed functions call
     (`real_extremum_prelude("cuda")`) before `device_kernel`. -#}
 {%- macro device_instance(solve, me, prefix) %}
@@ -3264,6 +3267,7 @@ RMC_UNUSED static __device__ inline double rmc_now(const ModelInstance* m) { ret
    formats for its log is left empty; and no `memcmp`, which the kernel uses
    to compare values bit for bit. */
 RMC_UNUSED static __device__ inline int rmc_device_format(char* text, size_t size) { if (size > 0) text[0] = '\0'; return 0; }
+#pragma push_macro("snprintf")
 #undef snprintf
 #define snprintf(text, size, ...) rmc_device_format((text), (size))
 RMC_UNUSED static __device__ inline int rmc_device_memcmp(const void* a, const void* b, size_t n) {
@@ -3271,6 +3275,7 @@ RMC_UNUSED static __device__ inline int rmc_device_memcmp(const void* a, const v
     for (size_t i = 0; i < n; ++i) if (x[i] != y[i]) return x[i] < y[i] ? -1 : 1;
     return 0;
 }
+#pragma push_macro("memcmp")
 #undef memcmp
 #define memcmp rmc_device_memcmp
 {{ kernel_declarations(me, device=true) }}{{ linear_solve_kernel(device=true) }}
@@ -3300,12 +3305,14 @@ RMC_UNUSED static __device__ int rmc_model_assertion(void* context, size_t predi
 RMC_UNUSED static __device__ void rmc_finish_assertion_observation(RmcModelAssertionContext* context, int status) { (void)context; (void)status; }
 /* A lane as a new instance starts it, but for its time, coordinate,
    parameters and `parameters_dirty`, which the caller sets: no fault or
-   failed assertion, and the projection workspace (the fields after `p`)
-   zeroed as the host component's allocation zeroes it (device memory comes
-   unzeroed), then the reset the component runs. */
+   failed assertion, and the projection workspace zeroed as the host
+   component's allocation zeroes it (device memory comes unzeroed), then the
+   reset the component runs. The arena, the workspace's first two fields, is
+   left as it is: `rmc_dalloc` and `rmc_salloc` zero what they hand out and a
+   raw buffer is written before it is read. */
 RMC_UNUSED static __device__ void rmc_lane_reset(ModelInstance* m) {
     m->rmc_nonfinite = false; m->assertion_failed = false;
-    unsigned char* workspace = (unsigned char*)(m->p + P_LEN);
+    unsigned char* workspace = (unsigned char*){{ "&m->rmc_dtop" if me.kernel else "(m->p + P_LEN)" }};
     memset(workspace, 0, (size_t)((unsigned char*)(m + 1) - workspace));{{ workspace_reset(me) }}
 }
 {{ typed_functions(typed_pure_calls, typed_directional_calls if me.blocks|length > 0 or me.table.jvp.programs|length > 0 else [], device=true) }}
@@ -3314,6 +3321,6 @@ RMC_UNUSED static __device__ void rmc_lane_reset(ModelInstance* m) {
 {{ jacobian_unit(me, device=true) }}
 {{ assignment_functions(me, device=true) }}
 {{ refresh_entries(solve, me, prefix, device=true) }}
-#undef snprintf
-#undef memcmp
+#pragma pop_macro("memcmp")
+#pragma pop_macro("snprintf")
 {%- endmacro %}

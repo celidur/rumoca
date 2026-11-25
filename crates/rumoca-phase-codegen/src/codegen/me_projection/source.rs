@@ -59,10 +59,11 @@ impl RefreshSource for solve::fmi::FmiCCodegenView {
 /// generated (`rumoca_ir_solve::fmi::SolveBindingExecution::checked`: initial
 /// mode, finite initial values sized to the layout, no recursive function
 /// group, typed functions within the C profile, parameter bindings in
-/// dependency order). Only an admitted model is a refresh source, so no view
-/// is built from a model the kernel refuses. Its target runs its own steps,
-/// so it projects each accepted state onto the retained manifold
-/// (`manifold_kernel` over `solve_blocks.state_manifold`).
+/// dependency order) and the template domain of the kernel
+/// (`require_builtin_fmi_template_domain`). Only an admitted model is a
+/// refresh source, so no view is built from a model the kernel refuses. Its
+/// target runs its own steps, so it projects each accepted state onto the
+/// retained manifold (`manifold_kernel` over `solve_blocks.state_manifold`).
 pub(crate) struct AdmittedSolveModel<'a> {
     model: &'a solve::SolveModel,
     bindings: solve::fmi::SolveBindingExecution,
@@ -70,6 +71,7 @@ pub(crate) struct AdmittedSolveModel<'a> {
 
 impl<'a> AdmittedSolveModel<'a> {
     pub(crate) fn new(model: &'a solve::SolveModel) -> Result<Self, CodegenError> {
+        crate::codegen::solve_renderer::require_builtin_fmi_template_domain(&model.problem)?;
         let bindings = solve::fmi::SolveBindingExecution::checked(model).map_err(|reason| {
             CodegenError::dae_preparation_failed(
                 format!("unsupported-feature:projection-kernel: {reason}"),

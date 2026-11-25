@@ -1,40 +1,67 @@
 //! The kernel built for a device refreshes as the FMI component does.
 //!
 //! For each test model, the FMI 3 component settles its parameters at the
-//! start point and prints its coordinate and parameters; it then refreshes
-//! the algebraic coordinates at five perturbed state points. The device unit
-//! of the same model (`crate::me_projection_device`), compiled by a host C++
-//! compiler with the CUDA qualifiers defined away, starts one lane per point
-//! from that coordinate and those parameters and refreshes it. Every status
-//! failed-assertion flag and every coordinate must be the same, bit for bit.
+//! start point and prints its coordinate and parameters; at five perturbed
+//! state points, a new instance then refreshes the algebraic coordinates and
+//! the derivative values, and a switching chart set decides its chart and
+//! transfers when the decision asks (its points sweep the first state towards
+//! the edge of the first chart, so the last ones switch). The device unit of the same model
+//! (`crate::me_projection_device`), compiled by a host C++ compiler with the
+//! CUDA qualifiers defined away, starts one lane per point from that
+//! coordinate and those parameters and runs the same entries. Every status,
+//! chart decision, failed-assertion flag and coordinate must be the same, bit
+//! for bit. The initialization entry is compiled and not run: the unit
+//! settles no parameter binding.
 
 use super::*;
 use crate::me_projection_device::{POINTS, device_unit, lane_harness, models};
 
 const FMI_DRIVER: &str = r#"
 #include <stdio.h>
-int main(void) {
+static ModelInstance* fresh(void) {
     ModelInstance* m = calloc(1, sizeof *m);
-    if (!m) return 1;
+    if (!m) exit(1);
     initialize_values(m);
-    if (refresh_parameters(m) != fmi3OK) { printf("parameters failed\n"); return 1; }
+    if (refresh_parameters(m) != fmi3OK) { printf("parameters failed\n"); exit(1); }
+    return m;
+}
+int main(void) {
+    ModelInstance* m = fresh();
     printf("Y"); for (size_t i = 0; i < Y_LEN; ++i) printf(" %a", m->y[i]); printf("\n");
     printf("P"); for (size_t i = 0; i < P_LEN; ++i) printf(" %a", m->p[i]); printf("\n");
     double start[Y_LEN]; memcpy(start, m->y, sizeof start);
-    for (int k = 1; k <= RMC_POINTS; ++k) {
-        memcpy(m->y, start, sizeof start);
-        for (size_t i = 0; i < RMC_STATES; ++i) m->y[i] = start[i] * (1.0 + 0.05 * k) + 0.01 * (double)(i + 1);
-        int ok = refresh_algebraics(m) == fmi3OK;
-        printf("%d %d", ok, (int)m->assertion_failed); for (size_t i = 0; i < Y_LEN; ++i) printf(" %a", m->y[i]); printf("\n");
-        m->assertion_failed = false;
-    }
     free(m);
+    for (int k = 1; k <= RMC_POINTS; ++k) {
+        m = fresh();
+        for (size_t i = 0; i < RMC_STATES; ++i) m->y[i] = start[i] * (1.0 + 0.05 * k) + 0.01 * (double)(i + 1) + (RMC_CHARTS && i == 0 ? 0.196 * k : 0.0);
+        int code = refresh_algebraics(m) == fmi3OK;
+        code |= (refresh_derivative_values(m) == fmi3OK) << 1;
+#if RMC_CHARTS
+        bool request = false, values = false, nominals = false;
+        code |= (rmc_chart_completed(m, &request) == fmi3OK) << 2;
+        code |= (int)request << 3;
+        if (request) code |= (rmc_chart_transfer(m, &values, &nominals) == fmi3OK) << 4;
+        code |= (int)values << 5;
+        printf("%zu ", m->rmc_chart);
+#endif
+        code |= (int)m->assertion_failed << 6;
+        printf("%d", code); for (size_t i = 0; i < Y_LEN; ++i) printf(" %a", m->y[i]); printf("\n");
+        free(m);
+    }
     return 0;
 }
 "#;
 
+/// The prerequisites of the comparison: the FMI conformance set, for the
+/// component and its headers, and a host C++ compiler, for the device unit.
 fn headers() -> Option<PathBuf> {
-    if !conformance_prerequisites_are_available() {
+    let cxx = Command::new("c++").arg("--version").output().is_ok();
+    if !conformance_prerequisites_are_available()
+        || !crate::template_runtime_policy::prerequisites_are_available(
+            "host C++ build of the device projection kernel",
+            &[("c++", cxx)],
+        )
+    {
         return None;
     }
     let headers = standard_roots().1.root.join("headers");
@@ -47,6 +74,7 @@ fn fmi_points(
     compiled: &rumoca::CompilationResult,
     model: &str,
     states: usize,
+    charts: bool,
 ) -> String {
     let headers = headers().expect("checked by the caller");
     let fmu = build_named_fmu(work, compiled, "fmi3", model);
@@ -54,7 +82,10 @@ fn fmi_points(
     let driver = work.join("fmi_points.c");
     fs::write(
         &driver,
-        format!("#include \"model.c\"\n#define RMC_POINTS {POINTS}\n#define RMC_STATES {states}\n{FMI_DRIVER}"),
+        format!(
+            "#include \"model.c\"\n#define RMC_POINTS {POINTS}\n#define RMC_STATES {states}\n#define RMC_CHARTS {}\n{FMI_DRIVER}",
+            u8::from(charts)
+        ),
     )
     .expect("write the FMI driver");
     let binary = work.join("fmi_points");
@@ -88,18 +119,9 @@ fn fmi_points(
 
 /// The device unit's lanes, compiled by the host C++ compiler, from the
 /// FMI component's start point.
-fn device_points(
-    work: &Path,
-    compiled: &rumoca::CompilationResult,
-    start: &str,
-    states: usize,
-) -> String {
+fn device_points(work: &Path, unit: &str, start: &str, states: usize) -> String {
     let harness = work.join("device_points.cpp");
-    fs::write(
-        &harness,
-        lane_harness(&device_unit(compiled), start, states),
-    )
-    .expect("write the device harness");
+    fs::write(&harness, lane_harness(unit, start, states)).expect("write the device harness");
     let binary = work.join("device_points");
     let mut command = Command::new("c++");
     command
@@ -128,7 +150,9 @@ fn a_device_build_refreshes_every_lane_as_the_fmi_component() {
     for (compiled, model) in models() {
         let work = tempdir().expect("device projection work directory");
         let states = crate::me_projection_device::state_count(&compiled);
-        let fmi = fmi_points(work.path(), &compiled, model, states);
+        let unit = device_unit(&compiled);
+        let charts = unit.contains(" rmc_chart_completed(");
+        let fmi = fmi_points(work.path(), &compiled, model, states, charts);
         // The driver prints the start point on two lines (`Y`, `P`), then one
         // line per point, whatever its status.
         let (start, points) = fmi.split_at(
@@ -139,7 +163,7 @@ fn a_device_build_refreshes_every_lane_as_the_fmi_component() {
                 + 1,
         );
         assert_eq!(points.lines().count(), POINTS, "{model}: {fmi}");
-        let device = device_points(work.path(), &compiled, start, states);
+        let device = device_points(work.path(), &unit, start, states);
         assert_eq!(
             device, points,
             "{model}: the device lanes differ from the FMI component"

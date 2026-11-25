@@ -192,13 +192,16 @@ fn start_values(start: &str, tag: &str) -> String {
 
 /// The device unit with one lane per point: each lane starts from `start`
 /// (the `Y` and `P` lines a driver prints), perturbs its `states` leading
-/// coordinates as the FMI driver does and refreshes. The host build runs the
-/// lanes in turn; a CUDA build launches them on the device. Both print each
-/// lane's status, failed-assertion flag and coordinate in the FMI driver's
+/// coordinates as the FMI driver does, refreshes its algebraic coordinates
+/// and derivative values and, for a switching chart set, decides its chart
+/// and transfers when asked. The host build runs the lanes in turn; a CUDA
+/// build launches them on the device. Both print each lane's chart, its
+/// statuses and flags as one code, and its coordinate, in the FMI driver's
 /// format.
 pub(crate) fn lane_harness(unit: &str, start: &str, states: usize) -> String {
     let y0 = start_values(start, "Y");
     let p0 = start_values(start, "P");
+    let charts = u8::from(unit.contains(" rmc_chart_completed("));
     format!(
         r#"#include <stdio.h>
 #include <stdlib.h>
@@ -209,11 +212,23 @@ static __device__ int rmc_point(ModelInstance* m, int k) {{
     rmc_lane_reset(m); m->time = 0.0; m->parameters_dirty = false;
     for (size_t i = 0; i < Y_LEN; ++i) m->y[i] = rmc_y0[i];
     for (size_t i = 0; i < P_LEN; ++i) m->p[i] = rmc_p0[i];
-    for (size_t i = 0; i < {states}; ++i) m->y[i] = rmc_y0[i] * (1.0 + 0.05 * k) + 0.01 * (double)(i + 1);
-    return refresh_algebraics(m) == rmcOK;
+    for (size_t i = 0; i < {states}; ++i) m->y[i] = rmc_y0[i] * (1.0 + 0.05 * k) + 0.01 * (double)(i + 1) + ({charts} && i == 0 ? 0.196 * k : 0.0);
+    int code = refresh_algebraics(m) == rmcOK;
+    code |= (refresh_derivative_values(m) == rmcOK) << 1;
+#if {charts}
+    bool request = false, values = false, nominals = false;
+    code |= (rmc_chart_completed(m, &request) == rmcOK) << 2;
+    code |= (int)request << 3;
+    if (request) code |= (rmc_chart_transfer(m, &values, &nominals) == rmcOK) << 4;
+    code |= (int)values << 5;
+#endif
+    return code | (int)m->assertion_failed << 6;
 }}
-static void rmc_print(const ModelInstance* m, int ok) {{
-    printf("%d %d", ok, (int)m->assertion_failed); for (size_t i = 0; i < Y_LEN; ++i) printf(" %a", m->y[i]); printf("\n");
+static void rmc_print(const ModelInstance* m, int code) {{
+#if {charts}
+    printf("%zu ", m->rmc_chart);
+#endif
+    printf("%d", code); for (size_t i = 0; i < Y_LEN; ++i) printf(" %a", m->y[i]); printf("\n");
 }}
 #if defined(__CUDACC__)
 __global__ void rmc_points(ModelInstance* lanes, int* ok) {{
