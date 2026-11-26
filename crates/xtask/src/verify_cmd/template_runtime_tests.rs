@@ -322,8 +322,12 @@ fn cuda_group_builds_the_device_projection_test() {
     let source = workspace_root_from_manifest_dir(env!("CARGO_MANIFEST_DIR"))
         .join("crates/rumoca/tests/suite_template_runtime/backend_template_runtime_regression.rs");
     let text = fs::read_to_string(&source).expect("read the regression module list");
+    let lines: Vec<&str> = text.lines().map(str::trim).collect();
     assert!(
-        text.contains("#[cfg(feature = \"fmu-packaging\")]\nmod cuda_device_projection;"),
+        lines.windows(2).any(|pair| {
+            pair[0] == "#[cfg(feature = \"fmu-packaging\")]"
+                && pair[1] == "mod cuda_device_projection;"
+        }),
         "the gate of cuda_device_projection moved: update this guard"
     );
 }

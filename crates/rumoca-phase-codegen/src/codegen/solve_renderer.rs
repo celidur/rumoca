@@ -59,9 +59,18 @@ impl SolveTemplateRenderer {
         let pure_calls = super::pure_call_families::PureCallFamilies::new(&model.pure_calls)?;
         let assertion_observations =
             super::fmi_c_assertions::observations(&model.problem, &model.pure_calls)?;
+        // The unit renders every owner as a typed body, nested regions and
+        // assertion messages included, beside the programs that inline it.
+        let uses_real_extremum = super::real_extremum::used_by(
+            &model.problem,
+            &model.artifacts,
+            Some(&model.pure_calls),
+            Some(&model.pure_calls),
+        );
         let renderer = Self::new_owned_model_with_dae(model, dae_model)?;
         Ok(Self {
             context: minijinja::context! {
+                uses_real_extremum => uses_real_extremum,
                 me_refresh => me_refresh,
                 me_bindings => me_bindings,
                 typed_pure_calls => pure_calls.owners_value(),

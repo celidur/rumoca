@@ -155,6 +155,8 @@ end DeviceAssertingFunction;";
 /// A loop through a function whose branches and loop body call another
 /// function, and through a conditional a tunable parameter selects, whose
 /// arms call it: pure calls inside the regions of a function conditional.
+/// A third function takes a minimum in one arm only, so the unit's extremum
+/// helper is demanded by a nested region alone.
 const BRANCHING_FUNCTION: &str = "model DeviceBranchingFunction
   function leaf
     input Real v;
@@ -175,12 +177,22 @@ const BRANCHING_FUNCTION: &str = "model DeviceBranchingFunction
       s := s + 0.01*leaf(s/i);
     end for;
   end branched;
+  function clipped
+    input Real v;
+    output Real s;
+  algorithm
+    if v > 0 then
+      s := min(v, 1);
+    else
+      s := 0;
+    end if;
+  end clipped;
   parameter Integer mode = 2;
   Real x(start=1, fixed=true);
   Real z(start=0.5);
 equation
   der(x) = -z;
-  z + 0.1*branched(z) + (if mode == 1 then leaf(z) else leaf(0.5*z)) = x;
+  z + 0.1*branched(z) + 0.01*clipped(z) + (if mode == 1 then leaf(z) else leaf(0.5*z)) = x;
 end DeviceBranchingFunction;";
 
 /// No projection block, and an initialization residual that calls a function:

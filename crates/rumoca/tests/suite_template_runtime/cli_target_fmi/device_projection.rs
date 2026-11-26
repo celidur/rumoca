@@ -52,20 +52,28 @@ int main(void) {
 }
 "#;
 
-/// The prerequisites of the comparison: the FMI conformance set, for the
-/// component and its headers, and a host C++ compiler, for the device unit.
+/// The prerequisites of the comparison: the FMI conformance set with its FMI
+/// 3 headers and a host C compiler, for the component, and a host C++
+/// compiler, for the device unit. A run that requires external tools fails
+/// on a missing one instead of skipping.
 fn headers() -> Option<PathBuf> {
-    let cxx = Command::new("c++").arg("--version").output().is_ok();
-    if !conformance_prerequisites_are_available()
-        || !crate::template_runtime_policy::prerequisites_are_available(
-            "host C++ build of the device projection kernel",
-            &[("c++", cxx)],
-        )
-    {
+    if !conformance_prerequisites_are_available() {
         return None;
     }
+    let runs = |tool: &str| Command::new(tool).arg("--version").output().is_ok();
     let headers = standard_roots().1.root.join("headers");
-    headers.join("fmi3Functions.h").is_file().then_some(headers)
+    crate::template_runtime_policy::prerequisites_are_available(
+        "host build of the device projection kernel and its FMI 3 driver",
+        &[
+            ("cc", runs("cc")),
+            ("c++", runs("c++")),
+            (
+                "headers/fmi3Functions.h",
+                headers.join("fmi3Functions.h").is_file(),
+            ),
+        ],
+    )
+    .then_some(headers)
 }
 
 /// The FMI 3 component's start point and refreshed points.
