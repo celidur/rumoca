@@ -3292,8 +3292,12 @@ typedef struct { bool parameters_dirty; bool rmc_nonfinite; bool assertion_faile
    an error-level action observed for its error marks the lane; a warning
    records no notice. */
 {{ device_qualifier(true) }} int rmc_model_assertion(void* context, size_t predicate, const void* const captures[], size_t count) {
+{%- if fmi_assertion_observations %}
     RmcModelAssertionContext* observed = (RmcModelAssertionContext*)context;
-    (void)observed; (void)predicate; (void)captures; (void)count;
+{%- else %}
+    (void)context;
+{%- endif %}
+    (void)predicate; (void)captures; (void)count;
 {%- for observation in fmi_assertion_observations %}
     if (observed->owner == {{ observation.owner }} && predicate == {{ observation.predicate }}) {
         if (count != {{ observation.capture_count }}) return 1;
