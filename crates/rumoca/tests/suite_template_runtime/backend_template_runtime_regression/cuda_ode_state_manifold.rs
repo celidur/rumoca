@@ -53,10 +53,10 @@ int main() {
 }
 "#;
 
-#[test]
-fn cuda_ode_lane_projects_its_states_onto_the_retained_manifold() {
-    // Index reduction keeps `x^3 = 1` as a constraint over the state `x`;
-    // the initial equation fixes `w`, so `z = 2 - x^2 = 1`.
+/// The kernel cuda-ode renders for a model whose index reduction keeps
+/// `x^3 = 1` as a constraint over the state `x`; the initial equation fixes
+/// `w`, so `z = 2 - x^2 = 1`.
+fn rendered_pinned_start() -> (tempfile::TempDir, std::path::PathBuf) {
     let compiled = Compiler::new()
         .model("PinnedStart")
         .compile_str(
@@ -89,6 +89,13 @@ end PinnedStart;
             .contains("#define PINNEDSTART_MANIFOLD_BLOCKS 1"),
         "the model must retain a state manifold for this test to bite"
     );
+    let path = directory.path().join(&source.path);
+    (directory, path)
+}
+
+#[test]
+fn cuda_ode_lane_projects_its_states_onto_the_retained_manifold() {
+    let (directory, source) = rendered_pinned_start();
     let harness = directory.path().join("manifold.cpp");
     fs::write(
         &harness,
@@ -105,7 +112,7 @@ static Dim3 blockIdx, blockDim, threadIdx;
 #include {:?}
 
 {}"#,
-            source.path, HARNESS,
+            source, HARNESS,
         ),
     )
     .expect("write manifold harness");
@@ -122,5 +129,34 @@ static Dim3 blockIdx, blockDim, threadIdx;
     run_checked(
         &mut Command::new(executable),
         "execute CUDA ODE state-manifold emulation",
+    );
+}
+
+/// NVCC compiles the kernel of a model with a state manifold: the manifold
+/// part of the shared kernel formats its messages and compares bits through
+/// the device shims, as the rest of the kernel does.
+#[test]
+fn cuda_ode_state_manifold_kernel_compiles_with_required_nvcc() {
+    let (directory, source) = rendered_pinned_start();
+    let available = Command::new("nvcc").arg("--version").output().is_ok();
+    if !crate::template_runtime_policy::prerequisites_are_available(
+        "NVCC state-manifold build",
+        &[("NVCC", available)],
+    ) {
+        return;
+    }
+    run_checked(
+        Command::new("nvcc")
+            .args([
+                "-std=c++17",
+                "--fmad=false",
+                "-Werror",
+                "all-warnings",
+                "-c",
+            ])
+            .arg(&source)
+            .arg("-o")
+            .arg(directory.path().join("manifold.o")),
+        "compile the CUDA ODE state-manifold kernel with NVCC",
     );
 }

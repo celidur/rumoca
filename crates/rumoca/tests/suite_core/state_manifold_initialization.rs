@@ -60,7 +60,7 @@ equation
 end PinnedSeed;
 "#;
 
-const DEVICE_UNIT: &str = r#"{%- from "fmi-me-projection.jinja" import device_instance, device_kernel, binding_updates, manifold_kernel -%}
+const DEVICE_UNIT: &str = r#"{%- from "fmi-me-projection.jinja" import device_instance, device_kernel, binding_updates -%}
 #include <float.h>
 #include <math.h>
 #include <stdbool.h>
@@ -73,8 +73,7 @@ const DEVICE_UNIT: &str = r#"{%- from "fmi-me-projection.jinja" import device_in
 static __device__ rmcStatus update_discrete_equations(ModelInstance* m) { (void)m; return rmcOK; }
 {{ binding_updates(solve, me_bindings, "rmc", device=true) }}
 {{ real_extremum_prelude("cuda", true) }}
-{{ device_kernel(solve, me_refresh, "rmc") }}
-{{ manifold_kernel(solve_blocks.state_manifold, device=true) }}
+{{ device_kernel(solve, me_refresh, "rmc", solve_blocks.state_manifold) }}
 "#;
 
 /// Start guesses: the model's own, a scaled one, and one off the manifold

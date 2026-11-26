@@ -1423,9 +1423,10 @@ RMC_COLD {{ q }} int rmc_plan_converged(ModelInstance* m, const size_t* entries,
     target calls `rmc_project_state_manifold` after each accepted step and
     `rmc_certify_state_manifold` on a settled initialization point. With
     `device=true` every function and table is `static __device__`: a lane
-    target emits it after `device_kernel`, whose numerics already size the
-    arena for it (the refresh view of a lowered model holds `mf.work`); a
-    smaller arena fails the build. -#}
+    target passes the manifold to `device_kernel`, which emits it after the
+    refresh entries and before the device shims of `device_instance` end; its
+    numerics already size the arena for it (the refresh view of a lowered
+    model holds `mf.work`), and a smaller arena fails the build. -#}
 {%- macro manifold_kernel(mf, device=false) %}{%- set q = device_qualifier(device) %}{%- set api = device_qualifier(device, true) %}
 {%- if mf.blocks|length > 0 %}
 #define RMC_MF_ROWS {{ mf.rows }}
@@ -3234,7 +3235,8 @@ RMC_API extern const size_t rmc_iso_slot[{{ me.table.isolator_slot|length }}];
 
     `device_instance` declares the instance and what the kernel reads around
     it; `device_kernel` defines the kernel and `rmc_lane_reset`, which resets
-    a lane's workspace. Between the two, the including unit defines the
+    a lane's workspace, and given a retained state manifold
+    (`solve_blocks.state_manifold`) its projection (`manifold_kernel`). Between the two, the including unit defines the
     parameter refresh every refresh entry runs first,
     `static __device__ <prefix>Status refresh_parameters(ModelInstance* m)`,
     and, for a kernel with an initialization (`me.init.rows > 0`), the
@@ -3285,7 +3287,7 @@ typedef struct { bool parameters_dirty; bool rmc_nonfinite; bool assertion_faile
 {{ kernel_declarations(me, device=true) }}{{ linear_solve_kernel(device=true) }}
 {{ typed_function_prototypes(typed_pure_calls, typed_directional_calls if me.blocks|length > 0 or me.table.jvp.programs|length > 0 else [], device=true) }}
 {%- endmacro %}
-{%- macro device_kernel(solve, me, prefix) %}
+{%- macro device_kernel(solve, me, prefix, manifold=none) %}
 /* A pure call's assertion, as the component's observer answers it
    (scalar_kernel.jinja: observers) without its messages: an observation the
    model does not issue, or one with another capture count, fails the call;
@@ -3329,6 +3331,9 @@ typedef struct { bool parameters_dirty; bool rmc_nonfinite; bool assertion_faile
 {{ jacobian_unit(me, device=true) }}
 {{ assignment_functions(me, device=true) }}
 {{ refresh_entries(solve, me, prefix, device=true) }}
+{%- if manifold %}
+{{ manifold_kernel(manifold, device=true) }}
+{%- endif %}
 #pragma pop_macro("memcmp")
 #pragma pop_macro("snprintf")
 {%- endmacro %}

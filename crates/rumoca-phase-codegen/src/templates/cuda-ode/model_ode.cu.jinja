@@ -1,5 +1,5 @@
 {%- from "cuda-typed-functions.jinja" import functions as typed_functions %}
-{%- from "fmi-me-projection.jinja" import manifold_kernel, device_instance, device_kernel, binding_updates %}
+{%- from "fmi-me-projection.jinja" import device_instance, device_kernel, binding_updates %}
 {%- macro scalar_const(op) -%}
 {%- if op.value_class == "finite" -%}{{ op.value }}
 {%- elif op.value_class == "positive_infinity" -%}INFINITY
@@ -338,10 +338,7 @@ const double {{ name }}_time_events[{{ ev.time_events | length }}] = { {% for ti
 // initial event iteration settles the discrete rows after initialization.
 static __device__ rmcStatus update_discrete_equations(ModelInstance* m) { (void)m; return rmcOK; }
 {{ binding_updates(solve, me_bindings, "rmc", device=true) }}
-{{ device_kernel(solve, me_refresh, "rmc") }}
-{%- if manifold %}
-{{ manifold_kernel(manifold, device=true) }}
-{%- endif %}
+{{ device_kernel(solve, me_refresh, "rmc", manifold) }}
 #undef snprintf
 #undef memcmp
 #if defined(__GNUC__) && !defined(__CUDACC__)
