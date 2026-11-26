@@ -349,6 +349,24 @@ static __device__ rmcStatus update_discrete_equations(ModelInstance* m) { (void)
 #pragma GCC diagnostic pop
 #endif
 #define {{ NAME }}_LANE_WORKSPACE_BYTES sizeof(ModelInstance)
+#ifndef __CUDACC_RTC__
+// A lane's projection reports (SPEC_0044 ME-PROJ-003): the kernel keeps its
+// fallbacks and faults in the {{ NAME }}_LANE_STATUS_BYTES bytes at offset
+// {{ NAME }}_LANE_STATUS_OFFSET of the lane's instance. Copy them back (for
+// instance by a pitched copy of the lane instances, pitch
+// {{ NAME }}_LANE_WORKSPACE_BYTES) and pass each copy to
+// `{{ name }}_lane_report`, which gives `sink` each report, its category
+// (`projection` for a fallback rate, `error` for a fault) and its message,
+// and answers their number. `{{ name }}_workspace_init_batch` clears them.
+#define {{ NAME }}_LANE_STATUS_OFFSET offsetof(ModelInstance, rmc_lane_status)
+#define {{ NAME }}_LANE_STATUS_BYTES sizeof(RmcLaneStatus)
+extern "C" size_t {{ name }}_lane_report(const void *status, void (*sink)(void *environment, const char *category, const char *message), void *environment)
+{
+    RmcLaneStatus copy;
+    memcpy(&copy, status, sizeof copy);
+    return rmc_lane_report(&copy, sink, environment);
+}
+#endif
 // The lane of the calling thread. Override with -D for another launch shape.
 #ifndef RUMOCA_LANE_INDEX
 #define RUMOCA_LANE_INDEX (blockIdx.x * blockDim.x + threadIdx.x)
