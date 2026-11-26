@@ -133,8 +133,8 @@ static Dim3 blockIdx, blockDim, threadIdx;
 }
 
 /// NVCC compiles the kernel of a model with a state manifold: the manifold
-/// part of the shared kernel formats its messages and compares bits through
-/// the device shims, as the rest of the kernel does.
+/// part of the shared kernel reports its faults through the lane's status,
+/// as the rest of the kernel does.
 #[test]
 fn cuda_ode_state_manifold_kernel_compiles_with_required_nvcc() {
     let (directory, source) = rendered_pinned_start();
@@ -158,5 +158,83 @@ fn cuda_ode_state_manifold_kernel_compiles_with_required_nvcc() {
             .arg("-o")
             .arg(directory.path().join("manifold.o")),
         "compile the CUDA ODE state-manifold kernel with NVCC",
+    );
+}
+
+/// The host reads a lane's projection reports from its instance: a lane
+/// whose projection fails keeps the fault, which `PinnedStart_lane_report`
+/// gives the host from the lane's status at `PINNEDSTART_LANE_STATUS_OFFSET`,
+/// and the workspace initialization clears it.
+#[test]
+fn cuda_ode_host_reads_each_lane_s_projection_reports() {
+    let (directory, source) = rendered_pinned_start();
+    let harness = directory.path().join("reports.cpp");
+    fs::write(
+        &harness,
+        format!(
+            r#"#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+struct Dim3 {{ int x; }};
+static Dim3 blockIdx, blockDim, threadIdx;
+#define __global__
+#define __host__
+#define __device__
+#include {source:?}
+
+static void sink(void *environment, const char *category, const char *message) {{
+    (void)environment;
+    std::printf("%s | %s\n", category, message);
+}}
+
+int main() {{
+    blockIdx.x = 0;
+    blockDim.x = 1;
+    threadIdx.x = 0;
+    void *lanes = std::malloc(PINNEDSTART_LANE_WORKSPACE_BYTES);
+    const void *status_bytes = (const char *)lanes + PINNEDSTART_LANE_STATUS_OFFSET;
+    double y[PINNEDSTART_Y_LEN];
+    double p[PINNEDSTART_P_LEN + 1];
+    int status = -1;
+    PinnedStart_workspace_init_batch(lanes, 1);
+    PinnedStart_load_starts_batch(y, p, PINNEDSTART_Y_LEN, PINNEDSTART_P_LEN, 1);
+    PinnedStart_initialize_batch(0.0, y, p, &status, PINNEDSTART_Y_LEN, PINNEDSTART_P_LEN, 1);
+    std::printf("initialize %d reports %zu\n", status, PinnedStart_lane_report(status_bytes, sink, nullptr));
+    // x^3 = 1 has a singular Jacobian at x = 0: the projection fails.
+    y[0] = 0.0;
+    PinnedStart_project_states_batch(0.1, y, p, &status, PINNEDSTART_Y_LEN, PINNEDSTART_P_LEN, 1);
+    std::printf("project %d reports %zu\n", status, PinnedStart_lane_report(status_bytes, sink, nullptr));
+    PinnedStart_workspace_init_batch(lanes, 1);
+    std::printf("reset reports %zu\n", PinnedStart_lane_report(status_bytes, sink, nullptr));
+    std::printf("status bytes %d\n", (int)(PINNEDSTART_LANE_STATUS_OFFSET + PINNEDSTART_LANE_STATUS_BYTES <= PINNEDSTART_LANE_WORKSPACE_BYTES));
+    std::free(lanes);
+    return 0;
+}}
+"#
+        ),
+    )
+    .expect("write lane report harness");
+    let executable = directory.path().join("cuda-ode-reports");
+    run_checked(
+        Command::new("c++")
+            .args(["-std=c++17", "-Wall", "-Wextra", "-Werror"])
+            .arg(&harness)
+            .arg("-o")
+            .arg(&executable)
+            .current_dir(directory.path()),
+        "compile CUDA ODE lane report emulation",
+    );
+    let output = Command::new(&executable)
+        .output()
+        .expect("run CUDA ODE lane report emulation");
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "initialize 0 reports 0\n\
+         error | index-reduction manifold projection did not converge\n\
+         project 1 reports 1\n\
+         reset reports 0\n\
+         status bytes 1\n"
     );
 }

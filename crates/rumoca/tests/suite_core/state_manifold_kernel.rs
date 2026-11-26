@@ -51,7 +51,7 @@ end Pinned;
 /// A minimal instance around the shared numerics and the manifold kernel,
 /// `DEVICE` naming the kernel's mode.
 const KERNEL: &str = r#"
-{%- from "fmi-me-projection.jinja" import projection_numerics, manifold_kernel %}
+{%- from "fmi-me-projection.jinja" import fault_declarations, projection_numerics, manifold_kernel %}
 {%- set mf = solve_blocks.state_manifold %}
 #include <float.h>
 #include <math.h>
@@ -72,7 +72,8 @@ typedef struct {
     double rmc_d[{{ mf.work.doubles }}]; size_t rmc_s[{{ mf.work.sizes }}];
     size_t rmc_dtop; size_t rmc_stop; double rmc_tol;
 } ModelInstance;
-#define RMC_LOG(m, message) ((void)(m), fprintf(stderr, "%s\n", (message)))
+{{ fault_declarations(device=DEVICE) }}
+static void rmc_fault(ModelInstance* m, unsigned code, size_t site) { (void)m; fprintf(stderr, "fault %u at %zu\n", code, site); }
 static inline double rmc_now(const ModelInstance* m) { return m->time; }
 {{ projection_numerics(mf.work, device=DEVICE) }}
 {{ manifold_kernel(mf, device=DEVICE) }}

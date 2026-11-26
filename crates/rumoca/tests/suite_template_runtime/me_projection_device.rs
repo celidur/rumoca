@@ -59,7 +59,8 @@ fn render_device_unit(
     .expect("render the device unit")
 }
 
-/// The test models: an affine block with its reduced elimination, a torn loop
+/// The test models: an affine block with its reduced elimination, an affine
+/// chain on its retained dense factorization, a torn loop
 /// with causal runs, an array equation whose rows are sliced singletons, a
 /// loop through a pure function with a loop, a loop through a function whose
 /// assertion fails at some points, an initialization residual that
@@ -93,6 +94,10 @@ pub(crate) fn models() -> Vec<(rumoca::CompilationResult, &'static str)> {
         (
             compile(INITIAL_FUNCTION, "DeviceInitialFunction"),
             "DeviceInitialFunction",
+        ),
+        (
+            compile(AFFINE_CHAIN, "DeviceAffineChain"),
+            "DeviceAffineChain",
         ),
         (
             compile(
@@ -230,6 +235,24 @@ equation
   der(x) = -p*x;
 end DeviceInitialFunction;";
 
+/// A resistive chain: one coupled affine block without an elimination layout,
+/// whose dense factorization the lane keeps from one refresh to the next.
+const AFFINE_CHAIN: &str = "model DeviceAffineChain
+  parameter Integer N = 12;
+  parameter Real R = 1.0;
+  parameter Real Rm = 10;
+  parameter Real C = 1e-3;
+  Real vC[N](start={0.1*i for i in 1:N}, each fixed=true);
+  Real v[N];
+equation
+  (sin(time) - v[1]) / 0.1 + (v[2] - v[1]) / R = (v[1] - vC[1]) / Rm;
+  for i in 2:N - 1 loop
+    (v[i - 1] - v[i]) / R + (v[i + 1] - v[i]) / R = (v[i] - vC[i]) / Rm;
+  end for;
+  (v[N - 1] - v[N]) / R = (v[N] - vC[N]) / Rm;
+  C * der(vC) = (v - vC) / Rm;
+end DeviceAffineChain;";
+
 /// The perturbed state points every comparison refreshes.
 pub(crate) const POINTS: usize = 5;
 
@@ -244,7 +267,7 @@ pub(crate) fn state_count(compiled: &rumoca::CompilationResult) -> usize {
 }
 
 /// The values of one `Y` or `P` line of a start point, as C initializers.
-fn start_values(start: &str, tag: &str) -> String {
+pub(crate) fn start_values(start: &str, tag: &str) -> String {
     start
         .lines()
         .find_map(|line| line.strip_prefix(tag))
@@ -259,9 +282,12 @@ fn start_values(start: &str, tag: &str) -> String {
 /// coordinates as the FMI driver does, refreshes its algebraic coordinates
 /// and derivative values and, for a switching chart set, decides its chart
 /// and transfers when asked. The host build runs the lanes in turn; a CUDA
-/// build launches them on the device. Both print each lane's chart, its
-/// statuses and flags as one code, and its coordinate, in the FMI driver's
-/// format.
+/// build launches them on the device and copies them back, and each lane's
+/// `rmc_lane_status` alone by a pitched copy. Both print each lane's chart,
+/// its statuses and flags as one code, and its coordinate, in the FMI
+/// driver's format, and write the `rmc_lane_report` of its status to the
+/// standard error, which no caller reads: the reports are checked against
+/// the component's log by `lane_status_harness`.
 pub(crate) fn lane_harness(unit: &str, start: &str, states: usize) -> String {
     let y0 = start_values(start, "Y");
     let p0 = start_values(start, "P");
@@ -294,6 +320,9 @@ static void rmc_print(const ModelInstance* m, int code) {{
 #endif
     printf("%d", code); for (size_t i = 0; i < Y_LEN; ++i) printf(" %a", m->y[i]); printf("\n");
 }}
+static void rmc_report(void* environment, const char* category, const char* message) {{
+    fprintf(stderr, "point %d %s | %s\n", *(const int*)environment, category, message);
+}}
 #if defined(__CUDACC__)
 __global__ void rmc_points(ModelInstance* lanes, int* ok) {{
     int lane = blockIdx.x * blockDim.x + threadIdx.x;
@@ -310,7 +339,11 @@ int main(void) {{
     if (!host) return 2;
     if (cudaMemcpy(host, lanes, {POINTS} * sizeof(ModelInstance), cudaMemcpyDeviceToHost) != cudaSuccess) return 3;
     if (cudaMemcpy(status, ok, sizeof status, cudaMemcpyDeviceToHost) != cudaSuccess) return 3;
-    for (int k = 0; k < {POINTS}; ++k) rmc_print(&host[k], status[k]);
+    /* Each lane's status alone, by a pitched copy of that member of the
+       lane array. */
+    RmcLaneStatus reports[{POINTS}];
+    if (cudaMemcpy2D(reports, sizeof(RmcLaneStatus), &lanes[0].rmc_lane_status, sizeof(ModelInstance), sizeof(RmcLaneStatus), {POINTS}, cudaMemcpyDeviceToHost) != cudaSuccess) return 3;
+    for (int k = 0; k < {POINTS}; ++k) {{ int point = k + 1; rmc_print(&host[k], status[k]); (void)rmc_lane_report(&reports[k], rmc_report, &point); }}
     free(host); cudaFree(lanes); cudaFree(ok);
     return 0;
 }}
@@ -319,7 +352,7 @@ int main(void) {{
     ModelInstance* m = (ModelInstance*)malloc(sizeof *m);
     if (!m) return 2;
     /* Device memory is not zeroed: every lane starts from garbage. */
-    for (int k = 1; k <= {POINTS}; ++k) {{ memset((void*)m, 0xA5, sizeof *m); int ok = rmc_point(m, k); rmc_print(m, ok); }}
+    for (int k = 1; k <= {POINTS}; ++k) {{ memset((void*)m, 0xA5, sizeof *m); int ok = rmc_point(m, k); rmc_print(m, ok); (void)rmc_lane_report(&m->rmc_lane_status, rmc_report, &k); }}
     free(m);
     return 0;
 }}

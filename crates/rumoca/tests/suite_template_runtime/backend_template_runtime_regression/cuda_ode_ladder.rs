@@ -42,7 +42,13 @@ static Dim3 blockIdx, blockDim, threadIdx;
 #define __global__
 #define __host__
 #define __device__
+// The includer's own `snprintf` and `memcmp` survive the kernel's shims.
+#define snprintf snprintf
+#define memcmp memcmp
 #include {path:?}
+#if !defined(snprintf) || !defined(memcmp)
+#error "the kernel's shims dropped the includer's snprintf or memcmp"
+#endif
 
 static int slot(const char *name) {{
     for (int i = 0; i < RLCLADDER_LADDER_Y_LEN; ++i) {{

@@ -6,6 +6,7 @@
 
 mod affine_guard_harness;
 mod affine_promotion;
+mod affine_retention;
 mod algebraic;
 mod arena_budget_harness;
 mod array_bounds;
@@ -27,6 +28,7 @@ mod input_defaults;
 mod integer_parameter;
 mod integer_publication;
 mod integer_quotients;
+mod lane_status_harness;
 mod lifecycle;
 mod mass_matrix;
 mod projection;

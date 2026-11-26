@@ -28,10 +28,14 @@
   function it mirrors.
 
   Two kinds of unit include it. A C component target defines `ModelInstance`
-  (with `time`, `y`, `p`), `Y_LEN`, and `RMC_LOG(m, message)` itself and
-  calls the kernel macros with `device` false. A device unit defines none of
-  them: `device_instance` does, and `device_kernel` emits the kernel (see the
-  comment above `device_instance` for what such a unit provides).
+  (with `time`, `y`, `p`), `Y_LEN`, `RMC_LOG(m, message)` and
+  `RMC_LOG_AT(m, category, message)` itself and calls the kernel macros with
+  `device` false. A device unit defines none of them: `device_instance`
+  defines `ModelInstance` and `Y_LEN` and no log, and `device_kernel` emits
+  the kernel (see the comment above `device_instance` for what such a unit
+  provides). A lane build (`RMC_LANE_STATUS`, which every device build is)
+  logs no fallback or fault report: it keeps its reports in the instance's
+  `rmc_lane_status` for `rmc_lane_report` (SPEC_0044 ME-PROJ-003).
 -#}
 {%- from "fmi-c-kernel.jinja" import device_qualifier, scalar_op, store_range, store_target, c_string, projection_lu_kernel, shared_prefix, shared_symbol, linear_solve_kernel %}
 {%- from "fmi-typed-functions.jinja" import functions as typed_functions, function_prototypes as typed_function_prototypes %}
@@ -175,37 +179,221 @@ static __device__ RMC_NOINLINE int {{ name }}_g{{ g.open }}({{ params }}) {
 #define P_LEN {{ solve.layout.p_scalars if solve.layout.p_scalars > 0 else 1 }}
 #define STATE_LEN {{ solve.solve_layout.state_scalar_count if solve.solve_layout.state_scalar_count > 0 else 1 }}
 {%- endmacro %}
-{#- The arena (`rmc_d`, `rmc_s`) stays first: `rmc_lane_reset` zeroes the
-    fields after it. -#}
-{%- macro workspace_fields(me) -%}
-{%- if me.kernel %} double rmc_d[{{ me.work.doubles }}]; size_t rmc_s[{{ me.work.sizes }}]; size_t rmc_dtop; size_t rmc_stop; double rmc_tol; bool rmc_certify;{% endif -%}
+{#- The arena (`rmc_d`, `rmc_s`) stays first, then a lane's retained
+    factors: `rmc_lane_reset` zeroes the fields after them. The host
+    component keeps its retained factors outside the instance
+    (`keep_storage`), so an FMU-state copy and the private point of a
+    directional derivative copy only their address. -#}
+{%- macro workspace_fields(me, device=false) -%}
+{%- if me.kernel %} double rmc_d[{{ me.work.doubles }}]; size_t rmc_s[{{ me.work.sizes }}];
+{%- if me.keep.doubles > 0 %}{% if device %} double rmc_keep_d[{{ me.keep.doubles }}]; size_t rmc_keep_s[{{ me.keep.sizes }}];{% else %} double* rmc_keep_d; size_t* rmc_keep_s;{% endif %}{% endif %} size_t rmc_dtop; size_t rmc_stop; double rmc_tol; bool rmc_certify;{% endif -%}
 {%- if me.kernel or me.assign.plan.programs|length > 0 %} bool rmc_fatal;{% endif -%}
 {%- if me.blocks|length > 0 and me.seed_rule == "CommittedAcceptedPoint" %} double rmc_commit_y[Y_LEN]; double rmc_mark_x[STATE_LEN]; double rmc_mark_t; bool rmc_seeding; bool rmc_mark_pending; bool rmc_mark_resolved;{% endif -%}
 {%- if me.blocks|length > 0 %} double rmc_seed[{{ me.seed_len if me.seed_len > 0 else 1 }}]; size_t rmc_fb_calls[{{ me.blocks|length + 1 }}]; size_t rmc_fb_count[{{ me.blocks|length + 1 }}]; size_t rmc_fb_mark[{{ me.blocks|length + 1 }}]; bool rmc_fb_active[{{ me.blocks|length + 1 }}]; bool rmc_fb_reported[{{ me.blocks|length + 1 }}];{% endif -%}
 {%- if me.lane_max > 0 %} double rmc_lane_seed[{{ (me.seed_len if me.seed_len > 0 else 1) * me.lane_max }}];{% endif -%}
 {%- if me.switching %} size_t rmc_chart; size_t rmc_chart_target; bool rmc_chart_pending; double rmc_chart_reference; double rmc_chart_target_reference; bool rmc_chart_log; double rmc_chart_y[Y_LEN];{% endif -%}
+{%- if me.kernel or me.assign.plan.programs|length > 0 %}
+#if defined(RMC_LANE_STATUS)
+ RmcLaneStatus rmc_lane_status;
+#endif
+{% endif -%}
 {%- endmacro %}
-{%- macro workspace_reset(me) -%}
+{#- SPEC_0044 ME-PROJ-003: the type of a lane build's `rmc_lane_status`,
+    which the including unit emits before its `ModelInstance`. -#}
+{%- macro lane_status_type(me) %}
+{%- if me.kernel or me.assign.plan.programs|length > 0 %}
+#if defined(RMC_LANE_STATUS)
+/* SPEC_0044 ME-PROJ-003: what a lane build keeps of its kernel's reports, in
+   one member of the instance (rmc_lane_status), so that the host reads them
+   back by copying that member alone, not the lane's whole instance with its
+   projection arena: the first fault (an RMC_FAULT_* code), its site and the
+   number of faults, and for each site the fallback count and call count at
+   the call that first crossed the policy rate (zero calls while it has
+   not). */
+typedef struct { unsigned fault; size_t fault_site; size_t faults;{% if me.blocks|length > 0 %} size_t crossed_count[{{ me.blocks|length + 1 }}]; size_t crossed_calls[{{ me.blocks|length + 1 }}];{% endif %} } RmcLaneStatus;
+#endif
+{%- endif %}
+{%- endmacro %}
+{#- A reset unbinds every retained factor: a block whose key flag is clear
+    binds its key and forms its factors again (`rmc_keep_bind`), so only
+    that flag is cleared. -#}
+{%- macro workspace_reset(me, device=false) -%}
 {%- if me.kernel %} m->rmc_dtop = 0; m->rmc_stop = 0; m->rmc_tol = {{ me.policy.tolerance }}; m->rmc_certify = true;{% endif -%}
 {%- if me.kernel or me.assign.plan.programs|length > 0 %} m->rmc_fatal = false;{% endif -%}
 {%- if me.blocks|length > 0 and me.seed_rule == "CommittedAcceptedPoint" %} m->rmc_seeding = false; m->rmc_mark_pending = false; m->rmc_mark_resolved = false;{% endif -%}
 {%- if me.blocks|length > 0 %} memset(m->rmc_seed, 0, sizeof(m->rmc_seed)); memset(m->rmc_fb_calls, 0, sizeof(m->rmc_fb_calls)); memset(m->rmc_fb_count, 0, sizeof(m->rmc_fb_count)); memset(m->rmc_fb_mark, 0, sizeof(m->rmc_fb_mark)); memset(m->rmc_fb_active, 0, sizeof(m->rmc_fb_active)); memset(m->rmc_fb_reported, 0, sizeof(m->rmc_fb_reported));{% endif -%}
 {%- if me.lane_max > 0 %} memset(m->rmc_lane_seed, 0, sizeof(m->rmc_lane_seed));{% endif -%}
+{%- if me.keep.doubles > 0 %}{% if not device %} if (m->rmc_keep_s){% endif %} { {%- for at in me.keep.flags %} m->rmc_keep_s[{{ at }}] = 0;{% endfor %} }{% endif -%}
 {%- if me.switching %} m->rmc_chart = 0; m->rmc_chart_target = 0; m->rmc_chart_pending = false; m->rmc_chart_reference = {{ me.switching[0].trial_rcond }}; m->rmc_chart_target_reference = 0.0;{% endif -%}
+{%- if me.kernel or me.assign.plan.programs|length > 0 %}
+#if defined(RMC_LANE_STATUS)
+ memset(&m->rmc_lane_status, 0, sizeof(m->rmc_lane_status)); m->rmc_lane_status.fault_site = RMC_NO_SITE;
+#endif
+{% endif -%}
+{%- endmacro %}
+
+{#- SPEC_0044 ME-PROJ-003: the faults the projection kernel reports, one row
+    per code: its name (`RMC_FAULT_<name>`) and the message the FMI component
+    logs for it, so the codes and their messages cannot drift apart. With
+    `cases`, each code but RMC_FAULT_NONE becomes the case of a switch that
+    answers its message; otherwise each becomes an enumerator. -#}
+{%- macro fault_rows(cases) %}
+{%- for name, message in [
+    ("NONE", ""),
+    ("WORKSPACE", "algebraic projection workspace exhausted"),
+    ("PROGRAM_TABLE", "projection program index outside its dispatcher: the generated program tables are inconsistent"),
+    ("COMPLETE", "complete algebraic projection did not establish coordinate convergence"),
+    ("STAGE", "algebraic projection did not establish coordinate convergence"),
+    ("INIT_VIEW", "initial residual evaluation view did not converge"),
+    ("SENSITIVITY_REFINEMENT", "algebraic projection sensitivity matrix is singular during refinement"),
+    ("SENSITIVITY_SINGULAR", "algebraic projection sensitivity matrix is singular"),
+    ("SENSITIVITY_NONFINITE", "algebraic projection produced a non-finite sensitivity"),
+    ("SENSITIVITY_RESIDUAL", "algebraic projection sensitivity did not satisfy the selected residual system"),
+    ("INIT_TANGENT", "initial residual tangent did not converge"),
+    ("INIT_VARIABLES", "initial variable projection did not satisfy the complete residual system"),
+    ("INIT_PROJECTION", "initial algebraic/update projection did not converge"),
+    ("CHART_CONDITIONING", "reduced-chart conditioning failed"),
+    ("CHART_FOLD", "the active reduced chart crossed its fold before a basis change could be requested"),
+    ("CHART_TRANSFER", "the reduced-chart basis transfer did not establish the target chart"),
+    ("MANIFOLD", "index-reduction manifold projection did not converge"),
+    ("MANIFOLD_INCONSISTENT", "initial state manifold is inconsistent; settled initial states cannot be corrected"),
+    ("DELAY_TIME", "a delay channel produced an invalid delayTime; expected a finite non-negative value"),
+    ("DELAY_MAX", "a delay channel produced delayMax below delayTime")
+] %}
+{%- if not cases %}
+    RMC_FAULT_{{ name }},
+{%- elif name != "NONE" %}
+    case RMC_FAULT_{{ name }}: return "{{ message }}";
+{%- endif %}
+{%- endfor %}
+{%- endmacro %}
+
+{#- SPEC_0044 ME-PROJ-003: the one composer of every message the projection
+    kernel reports, whose messages the FMI component logs and a lane build's
+    host report gives. `rmc_fault` is kernel code (device code in a device
+    build); the composer and its tables are host code, which the kernel of a
+    lane build never calls: it keeps fault codes, sites and fallback counts
+    instead. The composer formats with the library `(snprintf)`, which a
+    device build's formatting shim does not replace. -#}
+{%- macro report_kernel(me, device=false) %}{%- set q = device_qualifier(device) %}
+{%- if me.kernel or me.assign.plan.programs|length > 0 %}
+/* The message of fault `code`. */
+static const char* rmc_fault_text(unsigned code) {
+    switch (code) {
+{{- fault_rows(true) }}
+    default: return "unknown algebraic projection fault";
+    }
+}
+{%- if me.blocks|length > 0 %}
+#define RMC_FB_PLAN {{ me.blocks|length }}
+/* The ES016 fold each block reports when its projection fails (Solve IR
+   `UnlocalizableGuard`, SPEC_0044 ME-EVENT-008): the offset of its message in
+   the pool of distinct NUL-terminated messages, or RMC_NO_FOLD. Offsets keep
+   the table free of address constants; the pool is a character array, not a
+   string literal, so no compiler's literal length bounds it. */
+#define RMC_NO_FOLD ((size_t)-1)
+static const char rmc_fold_text[] = { {{ me.block_folds.pool|join(", ") }} };
+static const size_t rmc_block_fold[{{ me.blocks|length }}] = {
+{%- for offset in me.block_folds.offsets %}
+    {% if offset is none %}RMC_NO_FOLD{% else %}{{ offset }}{% endif %},
+{%- endfor %}
+};
+/* Each block's canonical index and row count, as its fallback report names
+   them. */
+static const size_t rmc_site_canonical[{{ me.blocks|length }}] = { {% for b in me.blocks %}{{ b.canonical }}{% if not loop.last %}, {% endif %}{% endfor %} };
+static const size_t rmc_site_rows[{{ me.blocks|length }}] = { {% for b in me.blocks %}{{ b.n }}{% if not loop.last %}, {% endif %}{% endfor %} };
+/* The report of `site` once `count` of its `calls` calls fell back. */
+static void rmc_fallback_message(size_t site, size_t count, size_t calls, char* message, size_t capacity) {
+    if (site == RMC_FB_PLAN) (snprintf)(message, capacity, "the staged algebraic refresh fell back on %zu of %zu calls", count, calls);
+    else (snprintf)(message, capacity, "projection block %zu (%zu rows) fell back on %zu of %zu calls", rmc_site_canonical[site], rmc_site_rows[site], count, calls);
+}
+{%- endif %}
+/* The message of fault `code` at `site`: a failed stage names its block's
+   ES016 fold when it has one. */
+static const char* rmc_fault_message(unsigned code, size_t site) {
+{%- if me.blocks|length > 0 %}
+    if (code == RMC_FAULT_STAGE && site < RMC_FB_PLAN && rmc_block_fold[site] != RMC_NO_FOLD) return rmc_fold_text + rmc_block_fold[site];
+{%- else %}
+    (void)site;
+{%- endif %}
+    return rmc_fault_text(code);
+}
+/* A fault at `site`. An FMI component logs it under `error` as it occurs; a
+   lane build keeps the first fault and its site in the lane's status, and
+   counts every fault (saturating, so that a count wrapped to zero on a
+   32-bit target never lets a later fault replace the first). */
+RMC_COLD {{ q }} void rmc_fault(ModelInstance* m, unsigned code, size_t site) {
+#if defined(RMC_LANE_STATUS)
+    RmcLaneStatus* status = &m->rmc_lane_status;
+    if (status->faults == 0) { status->fault = code; status->fault_site = site; }
+    if (status->faults != (size_t)-1) status->faults += 1;
+#else
+    RMC_LOG(m, rmc_fault_message(code, site));
+#endif
+}
+#if defined(RMC_LANE_STATUS)
+/* The host report of one lane's status (a copy of its rmc_lane_status), in
+   the categories and messages the FMI component logs: each site whose
+   fallback rate crossed the policy rate, in site order, with the counts of
+   the call that crossed it, then the first fault. Answers the number of
+   reports. A device unit keeps it local, as every other symbol of the unit,
+   for the host code of the same unit. */
+{% if device %}RMC_UNUSED static {% else %}RMC_API {% endif %}size_t rmc_lane_report(const RmcLaneStatus* status, RmcReportSink sink, void* environment) {
+    size_t reports = 0;
+{%- if me.blocks|length > 0 %}
+    for (size_t site = 0; site <= RMC_FB_PLAN; ++site) {
+        if (status->crossed_calls[site] == 0) continue;
+        char message[192];
+        rmc_fallback_message(site, status->crossed_count[site], status->crossed_calls[site], message, sizeof message);
+        sink(environment, "projection", message);
+        reports += 1;
+    }
+{%- endif %}
+    if (status->faults > 0) {
+        sink(environment, "error", rmc_fault_message(status->fault, status->fault_site));
+        reports += 1;
+    }
+    return reports;
+}
+#endif
+{%- endif %}
+{%- endmacro %}
+{#- The host component's retained factors (ME-PROJ-001): allocated with the
+    instance by its own allocator (`rmc_instance_allocate`) and freed with
+    it. An FMU-state copy and the private point of a directional derivative
+    share them through the address they copy, which the bit key keeps
+    correct. An instance without them, such as one a harness allocates
+    itself, retains nothing. -#}
+{%- macro keep_storage(me) %}
+{%- if me.keep.doubles > 0 %}
+#define RMC_KEEP_DOUBLES {{ me.keep.doubles }}
+#define RMC_KEEP_SIZES {{ me.keep.sizes }}
+static void rmc_keep_release(ModelInstance* m) { rmc_instance_free(m, m->rmc_keep_d); rmc_instance_free(m, m->rmc_keep_s); m->rmc_keep_d = NULL; m->rmc_keep_s = NULL; }
+static bool rmc_keep_allocate(ModelInstance* m) {
+    m->rmc_keep_d = rmc_instance_allocate(m, RMC_KEEP_DOUBLES, sizeof(double)); m->rmc_keep_s = rmc_instance_allocate(m, RMC_KEEP_SIZES, sizeof(size_t));
+    if (m->rmc_keep_d && m->rmc_keep_s) return true;
+    rmc_keep_release(m); return false;
+}
+{%- else %}
+static inline void rmc_keep_release(ModelInstance* m) { (void)m; }
+static inline bool rmc_keep_allocate(ModelInstance* m) { (void)m; return true; }
+{%- endif %}
 {%- endmacro %}
 
 {#- ── generic kernel ─────────────────────────────────────────────────────── -#}
 {#- The arena, the scaled convergence tests and the scaled dense Newton
     solve every projection of the kernel shares: the refresh blocks, the
     initialization and the state manifold. `work` sizes the per-instance
-    arena (`doubles`, `sizes`). -#}
-{%- macro projection_numerics(work, device=false) %}{%- set q = device_qualifier(device) %}
+    arena (`doubles`, `sizes`); `keep` adds the solve over the nonzero lists
+    of a retained dense factor (a refresh kernel with a retaining affine
+    block, ME-PROJ-001). -#}
+{%- macro projection_numerics(work, device=false, keep=false) %}{%- set q = device_qualifier(device) %}
 #define RMC_DWORK {{ work.doubles }}
 #define RMC_SWORK {{ work.sizes }}
 typedef struct { bool changed; bool settled; } RmcUpdate;
 
 /* ── workspace: one per-instance arena, released on every return ─────── */
-RMC_COLD {{ q }} int rmc_exhausted(ModelInstance* m) { RMC_LOG(m, "algebraic projection workspace exhausted"); return -1; }
+RMC_COLD {{ q }} int rmc_exhausted(ModelInstance* m) { rmc_fault(m, RMC_FAULT_WORKSPACE, RMC_NO_SITE); return -1; }
 {{ q }} double* rmc_dalloc(ModelInstance* m, size_t count) {
     if (count > RMC_DWORK - m->rmc_dtop) return NULL;
     double* values = m->rmc_d + m->rmc_dtop; m->rmc_dtop += count;
@@ -294,13 +482,17 @@ RMC_COLD {{ q }} int rmc_svd_solve(ModelInstance* m, const double* a, size_t n, 
 }
 
 /* One scaled dense Newton factorization, reused for every right-hand side
-   while its matrix and scales are fixed (sparse_newton/dense.rs). */
-typedef struct { size_t n; double* scaled; double* lu; size_t* ipiv; const double* rscale; const double* vscale; } RmcDenseFactor;
-/* Allocate and factor; -1 error. */
-{{ q }} int rmc_dense_factor(ModelInstance* m, const double* jac, size_t n, const double* rscale, const double* vscale, RmcDenseFactor* f) {
+   while its matrix and scales are fixed (sparse_newton/dense.rs). `lists`,
+   when set, names the nonzero entries of each column of L and U (see
+   rmc_lu_lists); `scaled` may be NULL for a factor an affine block retained,
+   whose caller forms it again when the SVD fallback needs it. */
+typedef struct { size_t n; double* scaled; double* lu; size_t* ipiv; const double* rscale; const double* vscale; const size_t* lists; } RmcDenseFactor;
+/* Factor into `lu` and `ipiv` when given (a retained factor), else into the
+   arena; -1 error. `scaled` and `lu` are written in full before any read. */
+{{ q }} int rmc_dense_factor_in(ModelInstance* m, const double* jac, size_t n, const double* rscale, const double* vscale, double* lu, size_t* ipiv, RmcDenseFactor* f) {
     size_t* columns = NULL;
-    f->n = n; f->rscale = rscale; f->vscale = vscale;
-    f->scaled = rmc_dalloc(m, n * n); f->lu = rmc_dalloc(m, n * n); f->ipiv = rmc_salloc(m, n); columns = rmc_salloc(m, n);
+    f->n = n; f->rscale = rscale; f->vscale = vscale; f->lists = NULL;
+    f->scaled = rmc_dalloc_raw(m, n * n); f->lu = lu ? lu : rmc_dalloc_raw(m, n * n); f->ipiv = ipiv ? ipiv : rmc_salloc(m, n); columns = rmc_salloc(m, n);
     if (!f->scaled || !f->lu || !f->ipiv || !columns) return rmc_exhausted(m);
     for (size_t row = 0; row < n; ++row)
         for (size_t col = 0; col < n; ++col) f->scaled[row * n + col] = jac[row * n + col] * rmc_valid_scale(vscale[col]) / rmc_valid_scale(rscale[row]);
@@ -308,14 +500,80 @@ typedef struct { size_t n; double* scaled; double* lu; size_t* ipiv; const doubl
     rmc_lu(f->lu, n, f->ipiv, columns);
     return 0;
 }
+{{ q }} int rmc_dense_factor(ModelInstance* m, const double* jac, size_t n, const double* rscale, const double* vscale, RmcDenseFactor* f) {
+    return rmc_dense_factor_in(m, jac, n, rscale, vscale, NULL, NULL, f);
+}
+{%- if keep %}
+/* The rows of the nonzero entries of each column of a factored `lu`, in
+   ascending order: L's below the diagonal from lists[i] to lists[i + 1],
+   U's above it from lists[n + 1 + i] to lists[n + 2 + i], both offsets into
+   the row area at lists + 2 * (n + 1), which holds n * (n - 1) rows. */
+{{ q }} void rmc_lu_lists(const double* lu, size_t n, size_t* lists) {
+    size_t* lower = lists; size_t* upper = lists + n + 1; size_t* rows = lists + 2 * (n + 1); size_t count = 0;
+    for (size_t i = 0; i < n; ++i) { lower[i] = count; for (size_t row = i + 1; row < n; ++row) if (lu[row * n + i] != 0.0) rows[count++] = row; }
+    lower[n] = count;
+    for (size_t i = 0; i < n; ++i) { upper[i] = count; for (size_t row = 0; row < i; ++row) if (lu[row * n + i] != 0.0) rows[count++] = row; }
+    upper[n] = count;
+}
+/* An update of row r by an exactly zero factor entry adds a zero, which
+   leaves every value but -0.0 as it is and turns -0.0 into the sign of that
+   zero. The rows of `b` holding -0.0 sit in `zeros`; each takes the zero
+   entries of a column in [from, to) as rmc_lu_solve does, and leaves the
+   set once it holds anything else. A sum never makes a new -0.0, so the set
+   only shrinks; the count left is returned. */
+{{ q }} size_t rmc_lu_signed_zeros(const double* lu, size_t n, size_t col, size_t from, size_t to, double coeff, double* b, size_t* zeros, size_t count) {
+    size_t kept = 0;
+    for (size_t k = 0; k < count; ++k) {
+        size_t row = zeros[k];
+        if (row >= from && row < to && lu[row * n + col] == 0.0) b[row] += -coeff * lu[row * n + col];
+        if (b[row] == 0.0 && signbit(b[row])) zeros[kept++] = row;
+    }
+    return kept;
+}
+/* rmc_lu_solve over the listed entries, bit for bit: a zero factor entry
+   times a finite coefficient changes only a -0.0, which
+   rmc_lu_signed_zeros applies, and a non-finite coefficient takes the whole
+   column, as the dense loop does. The remaining arithmetic is
+   rmc_lu_solve's, in its order. `zeros` holds n rows. */
+{{ q }} bool rmc_lu_solve_lists(const double* lu, size_t n, const size_t* ipiv, const size_t* lists, double* b, size_t* zeros) {
+    const size_t* lower = lists; const size_t* upper = lists + n + 1; const size_t* rows = lists + 2 * (n + 1);
+    for (size_t i = 0; i < n; ++i) if (ipiv[i] != i) { double tmp = b[i]; b[i] = b[ipiv[i]]; b[ipiv[i]] = tmp; }
+    size_t count = 0;
+    for (size_t row = 0; row < n; ++row) if (b[row] == 0.0 && signbit(b[row])) zeros[count++] = row;
+    for (size_t i = 0; i < n; ++i) {
+        double coeff = b[i];
+        if (isfinite(coeff)) { for (size_t e = lower[i]; e < lower[i + 1]; ++e) b[rows[e]] += -coeff * lu[rows[e] * n + i]; }
+        else for (size_t row = i + 1; row < n; ++row) b[row] += -coeff * lu[row * n + i];
+        if (count) count = rmc_lu_signed_zeros(lu, n, i, isfinite(coeff) ? i + 1 : n, n, coeff, b, zeros, count);
+    }
+    for (size_t i = n; i-- > 0;) {
+        double diag = lu[i * n + i];
+        if (diag == 0.0) return false;
+        double coeff = b[i] / diag; b[i] = coeff;
+        if (isfinite(coeff)) { for (size_t e = upper[i]; e < upper[i + 1]; ++e) b[rows[e]] += -coeff * lu[rows[e] * n + i]; }
+        else for (size_t row = 0; row < i; ++row) b[row] += -coeff * lu[row * n + i];
+        if (count) count = rmc_lu_signed_zeros(lu, n, i, 0, isfinite(coeff) ? i : 0, coeff, b, zeros, count);
+    }
+    return true;
+}
+{%- endif %}
 /* scaling.rs: scaled_newton_delta over a prepared factor (dense LU, then the
-   SVD fallback); -1 error, 0 no solution, 1 solved */
+   SVD fallback); -1 error, 0 no solution, 1 solved, 2 the SVD fallback needs
+   the scaled matrix a retained factor does not keep */
 {{ q }} int rmc_dense_solve(ModelInstance* m, const RmcDenseFactor* f, const double* residual, double* delta) {
     RMC_MARK; size_t n = f->n; int result = 1;
     double* rhs = rmc_dalloc(m, n); double* x = rmc_dalloc(m, n);
     if (!rhs || !x) { RMC_RELEASE; return rmc_exhausted(m); }
     for (size_t row = 0; row < n; ++row) { rhs[row] = -residual[row] / rmc_valid_scale(f->rscale[row]); x[row] = rhs[row]; }
+{%- if keep %}
+    size_t* zeros = f->lists ? rmc_salloc(m, n) : NULL;
+    if (f->lists && !zeros) { RMC_RELEASE; return rmc_exhausted(m); }
+    bool solved = f->lists ? rmc_lu_solve_lists(f->lu, n, f->ipiv, f->lists, x, zeros) : rmc_lu_solve(f->lu, n, f->ipiv, x);
+    if (!solved && !f->scaled) result = 2;
+    else if (!solved && rmc_svd_solve(m, f->scaled, n, rhs, m->rmc_tol, x) != 0) result = -1;
+{%- else %}
     if (!rmc_lu_solve(f->lu, n, f->ipiv, x) && rmc_svd_solve(m, f->scaled, n, rhs, m->rmc_tol, x) != 0) result = -1;
+{%- endif %}
     if (result == 1) for (size_t col = 0; col < n; ++col) delta[col] = x[col] * rmc_valid_scale(f->vscale[col]);
     RMC_RELEASE; return result;
 }
@@ -342,7 +600,7 @@ typedef struct { size_t n; double* scaled; double* lu; size_t* ipiv; const doubl
 #define RMC_ISOLATION_OUTPUT_VALUE 1
 #define RMC_ISOLATION_PROGRAM 2
 #define RMC_RUN_ISOLATOR 1
-{{- projection_numerics(me.work, device=device) }}
+{{- projection_numerics(me.work, device=device, keep=me.keep.doubles > 0) }}
 {{ c_array("rmc_variable_scale", "double", me.variable_scales, device=device) }}
 /* scaling.rs: model_variable_scale over SolveModel::solver_variable_scale */
 {{ q }} double rmc_model_scale(size_t index, double value) {
@@ -376,7 +634,7 @@ typedef struct RmcBlockDescS {
     size_t iso_entries; size_t nlane_calls; size_t lane_calls; size_t lane_max_outputs;
     size_t lane_max; size_t nsplit; size_t split; size_t row_split; size_t inv_len;
     size_t tangent_lanes; bool tangent_directional; size_t ntangent_steps; size_t tangent_steps;
-    size_t tangent_residuals;
+    size_t tangent_residuals; bool keep; size_t keep_d; size_t keep_s;
 } RmcBlockDesc;
 {{ q }} const size_t rmc_pool[{{ me.table.pool|length }}] = {
 {%- for chunk in me.table.pool|batch(24) %}
@@ -386,35 +644,19 @@ typedef struct RmcBlockDescS {
 #define RMC_P(offset) (rmc_pool + (offset))
 {{ q }} const RmcBlockDesc rmc_block_desc[{{ me.blocks|length }}] = {
 {%- for b in me.blocks %}
-    { {{ loop.index0 }}, {{ b.canonical }}, {{ b.n }}, {{ b.y }}, {{ b.row_target }}, {{ b.row_program }}, {{ b.row_offset }}, {{ b.max_outputs }}, {{ "true" if b.affine else "false" }}, {{ "true" if b.singleton_exact else "false" }}, {{ "true" if b.has_tearing else "false" }}, {{ b.row_ptr }}, {{ b.col_idx }}, {{ b.nnz }}, {{ b.ncolors }}, {{ b.colors }}, {{ b.color_seeds }}, {{ b.color_calls }}, {{ b.placements }}, {{ b.jvp_max_outputs }}, {{ "true" if b.torn else "false" }}, {{ b.k }}, {{ b.tear_col }}, {{ b.residual_row }}, {{ b.ncausal }}, {{ b.ncruns }}, {{ b.cruns }}, {{ b.causal_target }}, {{ b.causal_col }}, {{ "true" if b.elimination else "false" }}, {{ b.nelim }}, {{ b.elim_row }}, {{ b.elim_col }}, {{ b.nelim_tear }}, {{ b.elim_residual }}, {{ b.elim_tear }}, {{ b.nguards }}, {{ b.guards }}, {{ b.guard_step }}, {{ b.elim_capacity }}, {{ b.iso_default }}, {{ b.iso_start }}, {{ b.iso_entries }}, {{ b.nlane_calls }}, {{ b.lane_calls }}, {{ b.lane_max_outputs }}, {{ b.lane_max }}, {{ b.nsplit }}, {{ b.split }}, {{ b.row_split }}, {{ b.inv_len }}, {{ b.tangent_lanes }}, {{ "true" if b.tangent_directional else "false" }}, {{ b.ntangent_steps }}, {{ b.tangent_steps }}, {{ b.tangent_residuals }} },
+    { {{ loop.index0 }}, {{ b.canonical }}, {{ b.n }}, {{ b.y }}, {{ b.row_target }}, {{ b.row_program }}, {{ b.row_offset }}, {{ b.max_outputs }}, {{ "true" if b.affine else "false" }}, {{ "true" if b.singleton_exact else "false" }}, {{ "true" if b.has_tearing else "false" }}, {{ b.row_ptr }}, {{ b.col_idx }}, {{ b.nnz }}, {{ b.ncolors }}, {{ b.colors }}, {{ b.color_seeds }}, {{ b.color_calls }}, {{ b.placements }}, {{ b.jvp_max_outputs }}, {{ "true" if b.torn else "false" }}, {{ b.k }}, {{ b.tear_col }}, {{ b.residual_row }}, {{ b.ncausal }}, {{ b.ncruns }}, {{ b.cruns }}, {{ b.causal_target }}, {{ b.causal_col }}, {{ "true" if b.elimination else "false" }}, {{ b.nelim }}, {{ b.elim_row }}, {{ b.elim_col }}, {{ b.nelim_tear }}, {{ b.elim_residual }}, {{ b.elim_tear }}, {{ b.nguards }}, {{ b.guards }}, {{ b.guard_step }}, {{ b.elim_capacity }}, {{ b.iso_default }}, {{ b.iso_start }}, {{ b.iso_entries }}, {{ b.nlane_calls }}, {{ b.lane_calls }}, {{ b.lane_max_outputs }}, {{ b.lane_max }}, {{ b.nsplit }}, {{ b.split }}, {{ b.row_split }}, {{ b.inv_len }}, {{ b.tangent_lanes }}, {{ "true" if b.tangent_directional else "false" }}, {{ b.ntangent_steps }}, {{ b.tangent_steps }}, {{ b.tangent_residuals }}, {{ "true" if b.keep else "false" }}, {{ b.keep_d }}, {{ b.keep_s }} },
 {%- endfor %}
 };
 {{ q }} inline const RmcBlock* rmc_block(size_t id) { return &rmc_block_desc[id]; }
-/* The ES016 fold each block reports when its projection fails (Solve IR
-   `UnlocalizableGuard`, SPEC_0044 ME-EVENT-008): the offset of its message in
-   the pool of distinct NUL-terminated messages, or RMC_NO_FOLD. Offsets keep
-   the table free of address constants; the pool is a character array, not a
-   string literal, so no compiler's literal length bounds it. */
-#define RMC_NO_FOLD ((size_t)-1)
-{{ q }} const char rmc_fold_text[] = { {{ me.block_folds.pool|join(", ") }} };
-{{ q }} const size_t rmc_block_fold[{{ me.blocks|length }}] = {
-{%- for offset in me.block_folds.offsets %}
-    {% if offset is none %}RMC_NO_FOLD{% else %}{{ offset }}{% endif %},
-{%- endfor %}
-};
-/* The failure a stage or complete projection of block `id` logs: its ES016
-   fold when it has one, else the generic convergence failure. */
-{{ q }} const char* rmc_projection_failure(size_t id, const char* generic) {
-    size_t fold = rmc_block_fold[id];
-    return fold != RMC_NO_FOLD ? rmc_fold_text + fold : generic;
-}
-#define RMC_FB_PLAN {{ me.blocks|length }}
 #define RMC_FALLBACK_RATE {{ me.policy.fallback_rate }}
 #define RMC_FALLBACK_MIN_CALLS {{ me.policy.fallback_min_calls }}
 /* projection_fallbacks.rs: note_fallback. A call counts once however many
    fallbacks it takes, and a fallback ahead of a site's next call (a seed
    rescue) belongs to that call. The first time the share of calls that fell
-   back exceeds the policy rate, the site is logged under `projection`. */
+   back exceeds the policy rate, the site is logged under `projection`; a
+   lane build keeps the counts of that call in its status instead (calls is
+   at least one, which marks the site as crossed there), and keeps the first
+   crossing should an FMU state restored under it cross the site again. */
 RMC_COLD {{ q }} void rmc_fb_note(ModelInstance* m, size_t site) {
     size_t call = m->rmc_fb_calls[site] + (m->rmc_fb_active[site] ? 0 : 1);
     if (m->rmc_fb_mark[site] == call) return;
@@ -422,10 +664,13 @@ RMC_COLD {{ q }} void rmc_fb_note(ModelInstance* m, size_t site) {
     size_t calls = m->rmc_fb_calls[site] > 0 ? m->rmc_fb_calls[site] : 1;
     if (m->rmc_fb_reported[site] || calls < RMC_FALLBACK_MIN_CALLS || (double)m->rmc_fb_count[site] <= RMC_FALLBACK_RATE * (double)calls) return;
     m->rmc_fb_reported[site] = true;
+#if defined(RMC_LANE_STATUS)
+    if (m->rmc_lane_status.crossed_calls[site] == 0) { m->rmc_lane_status.crossed_count[site] = m->rmc_fb_count[site]; m->rmc_lane_status.crossed_calls[site] = calls; }
+#else
     char message[192];
-    if (site == RMC_FB_PLAN) snprintf(message, sizeof message, "the staged algebraic refresh fell back on %zu of %zu calls", m->rmc_fb_count[site], calls);
-    else snprintf(message, sizeof message, "projection block %zu (%zu rows) fell back on %zu of %zu calls", rmc_block_desc[site].canonical, rmc_block_desc[site].n, m->rmc_fb_count[site], calls);
+    rmc_fallback_message(site, m->rmc_fb_count[site], calls, message, sizeof message);
     RMC_LOG_AT(m, "projection", message);
+#endif
 }
 {{ q }} bool rmc_all_zero(const double* values, size_t n) {
     for (size_t i = 0; i < n; ++i) if (values[i] != 0.0) return false;
@@ -951,10 +1196,16 @@ typedef struct {
     const size_t b_n = RMC_BS(b, n); const size_t b_elim_capacity = RMC_BS(b, elim_capacity); const size_t b_nnz = RMC_BS(b, nnz); const size_t b_nelim = RMC_BS(b, nelim); const size_t* const b_row_ptr_pool = RMC_BP(b, row_ptr); const size_t* const b_col_idx_pool = RMC_BP(b, col_idx); const size_t* const b_elim_row_pool = RMC_BP(b, elim_row); const size_t* const b_elim_col_pool = RMC_BP(b, elim_col);
     size_t n = b_n, cap = b_elim_capacity; size_t* columns = NULL;
     /* values and reduced are written in full before any read; the recovery
-       relation starts at zero. */
-    e->values = rmc_dalloc_raw(m, b_nnz + 1); e->recovery = rmc_dalloc(m, n * cap + 1); e->reduced = rmc_dalloc_raw(m, cap * cap + 1);
-    e->ipiv = rmc_salloc(m, cap + 1); columns = rmc_salloc(m, cap + 1);
-    e->promoted = rmc_salloc(m, b_nelim + 1); e->residual = rmc_salloc(m, cap + 1); e->tear = rmc_salloc(m, cap + 1);
+       relation and the step and tear lists start at zero. An elimination an
+       affine block retains (rmc_keep_elimination) arrives with its buffers. */
+    if (e->values) {
+        memset(e->recovery, 0, (n * cap + 1) * sizeof(double)); memset(e->ipiv, 0, (cap + 1) * sizeof(size_t));
+        memset(e->promoted, 0, (b_nelim + 1) * sizeof(size_t)); memset(e->residual, 0, (cap + 1) * sizeof(size_t)); memset(e->tear, 0, (cap + 1) * sizeof(size_t));
+    } else {
+        e->values = rmc_dalloc_raw(m, b_nnz + 1); e->recovery = rmc_dalloc(m, n * cap + 1); e->reduced = rmc_dalloc_raw(m, cap * cap + 1);
+        e->ipiv = rmc_salloc(m, cap + 1); e->promoted = rmc_salloc(m, b_nelim + 1); e->residual = rmc_salloc(m, cap + 1); e->tear = rmc_salloc(m, cap + 1);
+    }
+    columns = rmc_salloc(m, cap + 1);
     if (!e->values || !e->recovery || !e->reduced || !e->ipiv || !columns || !e->promoted || !e->residual || !e->tear) return rmc_exhausted(m);
     /* One accumulator per tear column: each column's sum takes the row
        entries in their pattern order, as one sum per column would. */
@@ -1040,8 +1291,84 @@ typedef struct {
 }
 typedef struct {
     const RmcBlock* block; const double* jac; const double* rscale; const double* vscale; const double* magnitudes; const size_t* derived; const double* inv;
-    bool prefer_torn; bool used_torn; RmcElimination elimination; bool factored; RmcDenseFactor dense;
+    bool prefer_torn; bool used_torn; RmcElimination elimination; bool factored; RmcDenseFactor dense; bool keep;
 } RmcAffineSystem;
+{%- if me.keep.doubles > 0 %}
+/* sparse_newton.rs: SparseNewtonCache, the factorization an affine block
+   keeps from one call to the next. The linked cache refactors only when the
+   Jacobian or a scale changes (solve_dense_scaled compares their bits,
+   TornSystem::update the revision AffineLinearization issues for them), so
+   the retained factors are bound to the bits of the block Jacobian and both
+   scale vectors they were formed from, and a call whose bits differ forms
+   them again. The factors are a function of those bits alone, so a reuse is
+   the formation it replaces, bit for bit.
+   Retained doubles: the key (Jacobian values, row scales, variable scales),
+   then the dense LU, or the elimination's values, recovery and reduced
+   matrices. Retained sizes: four flags (key bound, dense ready, elimination
+   state 0 unprepared, 1 ready, 2 rejected; its tear count), then the dense
+   pivots and nonzero lists, or the elimination's pivots, promoted steps,
+   residual rows and tears. */
+#define RMC_KEEP_KEY 0
+#define RMC_KEEP_DENSE 1
+#define RMC_KEEP_ELIM 2
+#define RMC_KEEP_ELIM_K 3
+#define RMC_KEEP_FLAGS 4
+{{ q }} inline double* rmc_keep_doubles(ModelInstance* m, const RmcBlock* b) { return m->rmc_keep_d + RMC_BS(b, keep_d); }
+{{ q }} inline size_t* rmc_keep_sizes(ModelInstance* m, const RmcBlock* b) { return m->rmc_keep_s + RMC_BS(b, keep_s); }
+/* The retained factors, after the key and after the flags. */
+{{ q }} inline double* rmc_keep_factor(ModelInstance* m, const RmcBlock* b) { return rmc_keep_doubles(m, b) + RMC_BS(b, nnz) + 2 * RMC_BS(b, n); }
+{{ q }} inline size_t* rmc_keep_factor_sizes(ModelInstance* m, const RmcBlock* b) { return rmc_keep_sizes(m, b) + RMC_KEEP_FLAGS; }
+{{ q }} void rmc_keep_bind(ModelInstance* m, const RmcBlock* b, const double* jac, const double* rscale, const double* vscale) {
+    const size_t n = RMC_BS(b, n), nnz = RMC_BS(b, nnz);
+    double* key = rmc_keep_doubles(m, b); size_t* flags = rmc_keep_sizes(m, b);
+    if (flags[RMC_KEEP_KEY] && memcmp(key, jac, nnz * sizeof(double)) == 0 && memcmp(key + nnz, rscale, n * sizeof(double)) == 0
+        && memcmp(key + nnz + n, vscale, n * sizeof(double)) == 0) return;
+    memcpy(key, jac, nnz * sizeof(double)); memcpy(key + nnz, rscale, n * sizeof(double)); memcpy(key + nnz + n, vscale, n * sizeof(double));
+    flags[RMC_KEEP_KEY] = 1; flags[RMC_KEEP_DENSE] = 0; flags[RMC_KEEP_ELIM] = 0; flags[RMC_KEEP_ELIM_K] = 0;
+}
+/* The retained elimination's buffers in `e`; its state when prepared, else -1. */
+{{ q }} int rmc_keep_elimination(ModelInstance* m, const RmcBlock* b, RmcElimination* e) {
+    const size_t n = RMC_BS(b, n), nnz = RMC_BS(b, nnz), cap = RMC_BS(b, elim_capacity), nelim = RMC_BS(b, nelim);
+    double* d = rmc_keep_factor(m, b); size_t* z = rmc_keep_sizes(m, b);
+    e->values = d; e->recovery = d + nnz + 1; e->reduced = d + nnz + 1 + n * cap + 1;
+    e->ipiv = rmc_keep_factor_sizes(m, b); e->promoted = e->ipiv + cap + 1; e->residual = e->promoted + nelim + 1; e->tear = e->residual + cap + 1;
+    if (z[RMC_KEEP_ELIM] == 0) return -1;
+    e->k = z[RMC_KEEP_ELIM_K];
+    return z[RMC_KEEP_ELIM] == 1 ? 1 : 0;
+}
+{{ q }} void rmc_keep_elimination_done(ModelInstance* m, const RmcBlock* b, const RmcElimination* e) {
+    size_t* z = rmc_keep_sizes(m, b);
+    z[RMC_KEEP_ELIM] = e->state == 1 ? 1 : 2; z[RMC_KEEP_ELIM_K] = e->k;
+}
+/* The retained dense factor in `f` when it is ready; whether it is. */
+{{ q }} bool rmc_keep_dense(ModelInstance* m, const RmcBlock* b, const double* rscale, const double* vscale, RmcDenseFactor* f) {
+    if (!rmc_keep_sizes(m, b)[RMC_KEEP_DENSE]) return false;
+    f->n = RMC_BS(b, n); f->rscale = rscale; f->vscale = vscale; f->scaled = NULL;
+    f->lu = rmc_keep_factor(m, b); f->ipiv = rmc_keep_factor_sizes(m, b); f->lists = f->ipiv + f->n;
+    return true;
+}
+/* Factor the expanded block Jacobian `dense` into the retained storage, list
+   the nonzero entries of its factors, and mark it ready; -1 error. */
+{{ q }} int rmc_keep_dense_factor(ModelInstance* m, const RmcBlock* b, const double* dense, const double* rscale, const double* vscale, RmcDenseFactor* f) {
+    const size_t n = RMC_BS(b, n); double* lu = rmc_keep_factor(m, b); size_t* ipiv = rmc_keep_factor_sizes(m, b);
+    if (rmc_dense_factor_in(m, dense, n, rscale, vscale, lu, ipiv, f) != 0) return -1;
+    rmc_lu_lists(lu, n, ipiv + n);
+    f->lists = ipiv + n; rmc_keep_sizes(m, b)[RMC_KEEP_DENSE] = 1;
+    return 0;
+}
+/* The scaled matrix rmc_dense_factor forms from the expanded block Jacobian,
+   formed again over the pattern for a retained factor's SVD fallback: an
+   entry outside the pattern is zero times a valid scale over a valid scale,
+   a positive zero as the expanded matrix gives. NULL when exhausted. */
+{{ q }} double* rmc_affine_scaled(ModelInstance* m, const RmcAffineSystem* s) {
+    const RmcBlock* b = s->block; const size_t n = RMC_BS(b, n); const size_t* const row_ptr = RMC_BP(b, row_ptr); const size_t* const col_idx = RMC_BP(b, col_idx);
+    double* scaled = rmc_dalloc(m, n * n);
+    if (!scaled) return NULL;
+    for (size_t row = 0; row < n; ++row)
+        for (size_t p = row_ptr[row]; p < row_ptr[row + 1]; ++p) scaled[row * n + col_idx[p]] = s->jac[p] * rmc_valid_scale(s->vscale[col_idx[p]]) / rmc_valid_scale(s->rscale[row]);
+    return scaled;
+}
+{%- endif %}
 /* affine.rs: AffineBlockSystem::solve with the block's cached factors; the
    caches live in the arena frame of the enclosing affine projection. A
    nonzero guard promotes its solving step inside the preparation rather than
@@ -1050,10 +1377,16 @@ typedef struct {
     const RmcBlock* b = s->block;
     const bool b_elimination = RMC_BS(b, elimination); const size_t b_n = RMC_BS(b, n); const size_t* const b_row_ptr_pool = RMC_BP(b, row_ptr); const size_t* const b_col_idx_pool = RMC_BP(b, col_idx);
     if (s->prefer_torn && b_elimination) {
+{%- if me.keep.doubles > 0 %}
+        if (s->elimination.state == -1 && s->keep) s->elimination.state = rmc_keep_elimination(m, b, &s->elimination);
+{%- endif %}
         if (s->elimination.state == -1) {
             int prepared = rmc_eliminate_prepare(m, b, s->jac, s->rscale, s->vscale, &s->elimination);
             if (prepared < 0) return -1;
             s->elimination.state = prepared;
+{%- if me.keep.doubles > 0 %}
+            if (s->keep) rmc_keep_elimination_done(m, b, &s->elimination);
+{%- endif %}
         }
         if (s->elimination.state == 1) {
             int solved = rmc_eliminate_solve(m, b, &s->elimination, residual, s->rscale, s->vscale, delta);
@@ -1063,15 +1396,32 @@ typedef struct {
         }
         else rmc_fb_note(m, b->id);
     }
+{%- if me.keep.doubles > 0 %}
+    /* A block that retains its elimination factors its dense fallback for
+       this call only. */
+    const bool keep_dense = s->keep && !b_elimination;
+    if (!s->factored && keep_dense && rmc_keep_dense(m, b, s->rscale, s->vscale, &s->dense)) s->factored = true;
+{%- endif %}
     if (!s->factored) {
         double* dense = rmc_dalloc(m, b_n * b_n);
         if (!dense) return rmc_exhausted(m);
         for (size_t row = 0; row < b_n; ++row)
             for (size_t p = b_row_ptr_pool[row]; p < b_row_ptr_pool[row + 1]; ++p) dense[row * b_n + b_col_idx_pool[p]] = s->jac[p];
+{%- if me.keep.doubles > 0 %}
+        if (keep_dense) { if (rmc_keep_dense_factor(m, b, dense, s->rscale, s->vscale, &s->dense) != 0) return -1; }
+        else
+{%- endif %}
         if (rmc_dense_factor(m, dense, b_n, s->rscale, s->vscale, &s->dense) != 0) return -1;
         s->factored = true;
     }
     int solved = rmc_dense_solve(m, &s->dense, residual, delta);
+{%- if me.keep.doubles > 0 %}
+    if (solved == 2) {
+        s->dense.scaled = rmc_affine_scaled(m, s);
+        if (!s->dense.scaled) return rmc_exhausted(m);
+        solved = rmc_dense_solve(m, &s->dense, residual, delta);
+    }
+{%- endif %}
     if (solved < 0) return -1;
     return solved == 1 && rmc_all_finite(delta, b_n) ? 1 : 0;
 }
@@ -1161,7 +1511,11 @@ typedef struct {
     if (result == 0) result = rmc_block_scales(m, b, jac, rscale, vscale);
     if (result == 0) {
         rmc_row_magnitudes(b, jac, vscale, magnitudes, derived);
-        RmcAffineSystem system = { b, jac, rscale, vscale, magnitudes, derived, inv, true, false, { -1, 0, NULL, NULL, NULL, NULL, NULL, NULL, NULL }, false, { 0, NULL, NULL, NULL, NULL, NULL } };
+        bool keep = RMC_BS(b, keep){% if me.keep.doubles > 0 and not device %} && m->rmc_keep_d != NULL{% endif %};
+{%- if me.keep.doubles > 0 %}
+        if (keep) rmc_keep_bind(m, b, jac, rscale, vscale);
+{%- endif %}
+        RmcAffineSystem system = { b, jac, rscale, vscale, magnitudes, derived, inv, true, false, { -1, 0, NULL, NULL, NULL, NULL, NULL, NULL, NULL }, false, { 0, NULL, NULL, NULL, NULL, NULL, NULL }, keep };
         result = rmc_affine_project(m, &system);
         if (result == 0 && system.used_torn) {
             system.prefer_torn = false;
@@ -1419,7 +1773,8 @@ RMC_COLD {{ q }} int rmc_plan_converged(ModelInstance* m, const size_t* entries,
     manifold.rs `project_state_manifold` and `certify_state_manifold`. The
     including unit emits `projection_numerics` first (with an arena at least
     `mf.work`) and defines `ModelInstance` with `y` (the states first), `p`,
-    `rmc_tol`, the arena fields, `RMC_LOG(m, message)` and `rmc_now(m)`. A
+    `rmc_tol`, the arena fields and `rmc_now(m)`, and declares `rmc_fault`
+    and its codes (`fault_declarations`), which report its faults. A
     target calls `rmc_project_state_manifold` after each accepted step and
     `rmc_certify_state_manifold` on a settled initialization point. With
     `device=true` every function and table is `static __device__`: a lane
@@ -1665,17 +2020,7 @@ RMC_COLD {{ q }} int rmc_mf_wide_solve(ModelInstance* m, const double* a, size_t
         if (settled) { result = 0; break; }
         if (!moved) break;
     }
-    if (result != 0 && !failed) {
-        if (rmc_mf_residual(m, full) == 0) {
-            size_t worst = 0;
-            for (size_t row = 1; row < RMC_MF_ROWS; ++row) if (!(fabs(full[row]) <= fabs(full[worst]))) worst = row;
-            char message[160];
-            snprintf(message, sizeof message, "index-reduction manifold projection did not converge; residual row %zu is %g", worst, full[worst]);
-            RMC_LOG(m, message);
-        } else {
-            RMC_LOG(m, "index-reduction manifold projection did not converge");
-        }
-    }
+    if (result != 0 && !failed) rmc_fault(m, RMC_FAULT_MANIFOLD, RMC_NO_SITE);
     if (result != 0) for (size_t i = 0; i < RMC_MF_STATES; ++i) m->y[i] = before[i];
     else for (size_t i = 0; i < RMC_MF_STATES; ++i) *changed = *changed || before[i] != m->y[i];
     RMC_RELEASE; return result;
@@ -1690,12 +2035,7 @@ RMC_COLD {{ q }} int rmc_mf_wide_solve(ModelInstance* m, const double* a, size_t
     for (size_t k = 0; k < RMC_MF_BLOCKS; ++k) {
         const RmcManifoldBlock* b = &rmc_mf_blocks[k];
         if (rmc_mf_evaluate(m, b, seed, full, residual, jac, rscale, vscale) != 0) { RMC_RELEASE; return -1; }
-        if (!rmc_scaled_converged(tol, residual, rscale, b->m)) {
-            char message[160];
-            snprintf(message, sizeof message, "initial state manifold is inconsistent in constraint block %zu; settled initial states cannot be corrected", k);
-            RMC_LOG(m, message);
-            RMC_RELEASE; return -1;
-        }
+        if (!rmc_scaled_converged(tol, residual, rscale, b->m)) { rmc_fault(m, RMC_FAULT_MANIFOLD_INCONSISTENT, RMC_NO_SITE); RMC_RELEASE; return -1; }
     }
     RMC_RELEASE; return 0;
 }
@@ -1763,13 +2103,13 @@ RMC_COLD {{ q }} int rmc_mf_wide_solve(ModelInstance* m, const double* a, size_t
 #define RMC_DEBUG_ASSERT(condition) ((void)0)
 #endif
 /* A program index outside its family's dispatcher: generated tables that
-   disagree with their programs. The fault is logged and kept on the
-   instance, RMC_FATAL tells it apart from a failed program, no fallback
-   stands in for the program, and every kernel entry reports an error until
-   the instance is reset. */
+   disagree with their programs. The fault is reported (ME-PROJ-003) and
+   marked on the instance, RMC_FATAL tells it apart from a failed program,
+   no fallback stands in for the program, and every kernel entry reports an
+   error until the instance is reset. */
 RMC_COLD {{ api }} int rmc_bad_program(ModelInstance* m, size_t program) {
     (void)program;
-    if (!m->rmc_fatal) RMC_LOG(m, "projection program index outside its dispatcher: the generated program tables are inconsistent");
+    if (!m->rmc_fatal) rmc_fault(m, RMC_FAULT_PROGRAM_TABLE, RMC_NO_SITE);
     m->rmc_fatal = true;
     RMC_DEBUG_ASSERT(!"projection program index outside its dispatcher");
     return RMC_FATAL;
@@ -1826,7 +2166,7 @@ typedef struct { unsigned char kind; size_t first; size_t count; size_t block; s
 {%- if blocks %}
         case RMC_STEP_COMPLETE:
             if (rmc_project_complete(m, complete, ncomplete) != 0) {
-                if (!m->rmc_fatal) RMC_LOG(m, "complete algebraic projection did not establish coordinate convergence");
+                if (!m->rmc_fatal) rmc_fault(m, RMC_FAULT_COMPLETE, RMC_FB_PLAN);
                 goto fail;
             }
             break;
@@ -1845,7 +2185,7 @@ typedef struct { unsigned char kind; size_t first; size_t count; size_t block; s
             }
 {%- endif %}
             if (rmc_project_stage(m, rmc_block(step->block)) != 0) {
-                if (!m->rmc_fatal) RMC_LOG(m, rmc_projection_failure(step->block, "algebraic projection did not establish coordinate convergence"));
+                if (!m->rmc_fatal) rmc_fault(m, RMC_FAULT_STAGE, step->block);
                 goto fail;
             }
             break;
@@ -1870,7 +2210,7 @@ failure:
            nor a non-finite trial value. */
         if (m->rmc_fatal) goto fail;
         if (rescued == 0) { {% if me.kernel %}RMC_RELEASE; {% endif %}return {{ prefix }}OK; }
-        RMC_LOG(m, "complete algebraic projection did not establish coordinate convergence");
+        rmc_fault(m, RMC_FAULT_COMPLETE, RMC_FB_PLAN);
         /* An evaluation error during the rescue (a failed pure call, or an
            exhausted workspace) is not a non-finite trial value. */
         if (rescued < 0) goto fail;
@@ -2018,7 +2358,8 @@ fail:
     The C components call it after their parameter refresh (refresh_values);
     a device build (`device`) calls it after its own `refresh_parameters`. -#}
 {%- macro refresh_entries(solve, me, prefix, device=false) %}
-{{- projection_kernel(me, device=device) }}
+{{- report_kernel(me, device=device) }}
+{{ projection_kernel(me, device=device) }}
 {{ refresh_kernel(me, prefix, device=device) }}
 {%- set plan_suffix = "_plan" if me.blocks|length > 0 and me.seed_rule == "CommittedAcceptedPoint" else "" %}
 {%- if me.switching %}
@@ -2035,6 +2376,32 @@ fail:
 {{ committed_seed(me, prefix, device=device) }}
 {{ initialization_kernel(me, prefix, device=device) }}
 {{- chart_kernel(solve, me, prefix, device=device) }}
+{%- endmacro %}
+
+{#- SPEC_0044 ME-PROJ-003: the faults the projection kernel reports, and the
+    host report of a lane build (RMC_LANE_STATUS). -#}
+{%- macro fault_declarations(device=false) %}
+/* SPEC_0044 ME-PROJ-003: the faults the projection kernel reports, each at a
+   site (the kernel's index of a block, not the canonical index a fallback
+   report names; RMC_FB_PLAN for the staged plan; or RMC_NO_SITE). An FMI
+   component logs each one as it occurs. A lane build (RMC_LANE_STATUS: one
+   instance per lane of a device integrator, with no logger; every device
+   build is one) keeps the first fault, its site, the number of faults and
+   the counts of each crossed site in the lane's status (rmc_lane_status),
+   and rmc_lane_report gives the host, from a copy of that status, each
+   crossed site's `projection` message and the first fault's `error`
+   message, as the FMI component logs them. */
+enum {
+{{- fault_rows(false) }}
+    RMC_FAULT_COUNT
+};
+#define RMC_NO_SITE ((size_t)-1)
+#if defined(RMC_LANE_STATUS)
+{% if not device %}{{ shared_symbol("rmc_lane_report") }}{% endif %}/* Receives each report: its category (`projection` for a fallback rate,
+   `error` for a fault) and its message. */
+typedef void (*RmcReportSink)(void* environment, const char* category, const char* message);
+{% if device %}RMC_UNUSED static {% else %}RMC_API {% endif %}size_t rmc_lane_report(const RmcLaneStatus* status, RmcReportSink sink, void* environment);
+#endif
 {%- endmacro %}
 
 {#- The active chart's plan (kernel.rs: the component's runtime is the active
@@ -2193,14 +2560,14 @@ typedef struct { size_t nrows; size_t ncols; size_t ndep; size_t dep; size_t nen
     {{- "\n    {" if device }}
     size_t active = m->rmc_chart, target = RMC_NCHARTS;
     double keep = RMC_CHART_SWITCH_KEEP * m->rmc_chart_reference;
-    if (rmc_chart_sigma(m, &rmc_charts[active], &sigma[active], &threshold[active]) != 0) { if (!m->rmc_fatal) RMC_LOG(m, "reduced-chart conditioning failed"); goto fail; }
+    if (rmc_chart_sigma(m, &rmc_charts[active], &sigma[active], &threshold[active]) != 0) { if (!m->rmc_fatal) rmc_fault(m, RMC_FAULT_CHART_CONDITIONING, RMC_NO_SITE); goto fail; }
     double current = sigma[active];
     double regular = threshold[active] * RMC_CHART_REGULAR_MULTIPLE;
     if (!(current >= keep && current >= regular)) {
         for (size_t c = 0; c < RMC_NCHARTS; ++c) {
-            if (c != active && rmc_chart_sigma(m, &rmc_charts[c], &sigma[c], &threshold[c]) != 0) { if (!m->rmc_fatal) RMC_LOG(m, "reduced-chart conditioning failed"); goto fail; }
+            if (c != active && rmc_chart_sigma(m, &rmc_charts[c], &sigma[c], &threshold[c]) != 0) { if (!m->rmc_fatal) rmc_fault(m, RMC_FAULT_CHART_CONDITIONING, RMC_NO_SITE); goto fail; }
         }
-        if (current < regular) { RMC_LOG(m, "the active reduced chart crossed its fold before a basis change could be requested"); goto fail; }
+        if (current < regular) { rmc_fault(m, RMC_FAULT_CHART_FOLD, RMC_NO_SITE); goto fail; }
         if (!(current >= keep)) {
             for (size_t c = 0; c < RMC_NCHARTS; ++c) {
                 bool qualifies = c != active && sigma[c] > RMC_CHART_SWITCH_IMPROVEMENT * current && sigma[c] >= threshold[c] * RMC_CHART_REGULAR_MULTIPLE;
@@ -2277,7 +2644,7 @@ typedef struct { size_t nrows; size_t ncols; size_t ndep; size_t dep; size_t nen
     RMC_RELEASE;
     if (m->rmc_fatal) return {{ prefix }}Error;
     m->rmc_chart_pending = false;
-    RMC_LOG(m, "the reduced-chart basis transfer did not establish the target chart");
+    rmc_fault(m, RMC_FAULT_CHART_TRANSFER, RMC_NO_SITE);
     return {{ prefix }}Error;
 }
 {%- endif %}
@@ -2350,7 +2717,7 @@ RMC_COLD {{ q }} int rmc_init_settle_view(ModelInstance* m) {
         if (changed < 0 || refresh_algebraics(m) != {{ prefix }}OK) break;
         if (pass > 0 && changed == 0) return 0;
     }
-    RMC_LOG(m, "initial residual evaluation view did not converge");
+    rmc_fault(m, RMC_FAULT_INIT_VIEW, RMC_NO_SITE);
     return -1;
 }
 /* initial_projection.rs: InitialProjectionModel::eval_initial_residual on the
@@ -2454,7 +2821,8 @@ RMC_COLD {{ q }} int rmc_tan_factor(ModelInstance* m, const RmcBlock* b, const s
    linearized rows at the current seed, `J x + base` (equal to nalgebra's
    product up to the sign of zero); zero when every entry vanishes, else one
    LU correction. -1 error */
-RMC_COLD {{ q }} int rmc_tan_refine(ModelInstance* m, const RmcBlock* b, const size_t* rows, double* seed, double* inputs, double* unit, double* out, double* scratch, double* lu, size_t* ipiv, size_t* columns) {
+RMC_COLD {{ q }} int rmc_tan_refine(ModelInstance* m, size_t block, const size_t* rows, double* seed, double* inputs, double* unit, double* out, double* scratch, double* lu, size_t* ipiv, size_t* columns) {
+    const RmcBlock* b = rmc_block(block);
     const size_t b_n = RMC_BS(b, n); const size_t* const b_y_pool = RMC_BP(b, y); const size_t* const b_row_ptr_pool = RMC_BP(b, row_ptr); const size_t* const b_col_idx_pool = RMC_BP(b, col_idx);
     size_t n = b_n; double* base = scratch; double* jac = scratch + n; double* correction = scratch + n + n * n; double* column = correction + n;
     memcpy(inputs, seed, RMC_SEED_LEN * sizeof(double));
@@ -2468,10 +2836,10 @@ RMC_COLD {{ q }} int rmc_tan_refine(ModelInstance* m, const RmcBlock* b, const s
         zero &= correction[row] == 0.0;
     }
     if (zero) return 0;
-    if (!rmc_lu_solve(lu, n, ipiv, correction)) { RMC_LOG(m, "algebraic projection sensitivity matrix is singular during refinement"); return -1; }
+    if (!rmc_lu_solve(lu, n, ipiv, correction)) { rmc_fault(m, RMC_FAULT_SENSITIVITY_REFINEMENT, block); return -1; }
     for (size_t i = 0; i < n; ++i) {
         double value = seed[b_y_pool[i]] + correction[i];
-        if (!isfinite(value)) { RMC_LOG(m, "algebraic projection produced a non-finite sensitivity"); return -1; }
+        if (!isfinite(value)) { rmc_fault(m, RMC_FAULT_SENSITIVITY_NONFINITE, block); return -1; }
         seed[b_y_pool[i]] = value;
     }
     return 0;
@@ -2495,9 +2863,9 @@ RMC_COLD {{ q }} int rmc_tan_refresh(ModelInstance* m, double* seed) {
         const RmcBlock* b = rmc_block(blocks[k]); size_t n = RMC_BS(b, n); double* rhs = scratch; double* jac = scratch + n;
         if (rmc_tan_rows(m, rows + 2 * offset, n, 2, seed, out, rhs) != 0 || rmc_tan_factor(m, b, rows + 2 * offset, unit, out, column, jac, lu, ipiv, columns) != 0) { result = -1; break; }
         for (size_t i = 0; i < n; ++i) rhs[i] = -rhs[i];
-        if (!rmc_lu_solve(lu, n, ipiv, rhs)) { RMC_LOG(m, "algebraic projection sensitivity matrix is singular"); result = -1; break; }
+        if (!rmc_lu_solve(lu, n, ipiv, rhs)) { rmc_fault(m, RMC_FAULT_SENSITIVITY_SINGULAR, blocks[k]); result = -1; break; }
         for (size_t i = 0; i < n && result == 0; ++i) {
-            if (!isfinite(rhs[i])) { RMC_LOG(m, "algebraic projection produced a non-finite sensitivity"); result = -1; }
+            if (!isfinite(rhs[i])) { rmc_fault(m, RMC_FAULT_SENSITIVITY_NONFINITE, blocks[k]); result = -1; }
             else seed[RMC_BP(b, y)[i]] = rhs[i];
         }
         if (result == 0 && rmc_block_scales_at(m, b, jac, seed, rscale + offset, vscale) != 0) result = -1;
@@ -2506,11 +2874,11 @@ RMC_COLD {{ q }} int rmc_tan_refresh(ModelInstance* m, double* seed) {
     for (int iteration = 0; iteration <= 2 && result == 0; ++iteration) {
         if (rmc_tan_rows(m, rows, RMC_TAN_ROWS, 2, seed, out, residual) != 0) { result = -1; break; }
         if (rmc_scaled_converged(m->rmc_tol, residual, rscale, RMC_TAN_ROWS)) break;
-        if (iteration == 2) { RMC_LOG(m, "algebraic projection sensitivity did not satisfy the selected residual system"); result = -1; break; }
+        if (iteration == 2) { rmc_fault(m, RMC_FAULT_SENSITIVITY_RESIDUAL, RMC_NO_SITE); result = -1; break; }
         offset = 0;
         for (size_t k = 0; k < RMC_TAN_BLOCKS && result == 0; ++k) {
             const RmcBlock* b = rmc_block(blocks[k]);
-            if (rmc_tan_refine(m, b, rows + 2 * offset, seed, inputs, unit, out, scratch, lu, ipiv, columns) != 0) result = -1;
+            if (rmc_tan_refine(m, blocks[k], rows + 2 * offset, seed, inputs, unit, out, scratch, lu, ipiv, columns) != 0) result = -1;
             else if (rmc_block_scales_at(m, b, scratch + RMC_BS(b, n), seed, rscale + offset, vscale) != 0) result = -1;
             offset += RMC_BS(b, n);
         }
@@ -2552,7 +2920,7 @@ RMC_COLD {{ q }} int rmc_init_tangent(ModelInstance* m, double* seed) {
 {%- endif %}
         if (pass > 0 && !changed) { result = 0; break; }
     }
-    if (result != 0 && !failed) RMC_LOG(m, "initial residual tangent did not converge");
+    if (result != 0 && !failed) rmc_fault(m, RMC_FAULT_INIT_TANGENT, RMC_NO_SITE);
     RMC_RELEASE; return result;
 }
 /* initial.rs: initial_block_jacobian through eval_settled_initial_jacobian_v:
@@ -2801,7 +3169,7 @@ RMC_COLD {{ q }} int rmc_init_project(ModelInstance* m) {
     }
     if (result == 1) {
         if (rmc_scaled_converged(m->rmc_tol, residual, scales, RMC_INIT_ROWS)) result = 0;
-        else { RMC_LOG(m, "initial variable projection did not satisfy the complete residual system"); result = -1; }
+        else { rmc_fault(m, RMC_FAULT_INIT_VARIABLES, RMC_NO_SITE); result = -1; }
     }
     RMC_RELEASE; return result;
 }
@@ -2863,8 +3231,8 @@ RMC_COLD {{ q }} int rmc_init_delays(ModelInstance* m) {
     if (rmc_init_delay_rows(m, source, delay_time, delay_max) != 0) { RMC_RELEASE; return -1; }
 {%- endif %}
     for (size_t k = 0; k < RMC_INIT_DELAYS; ++k) {
-        if (!isfinite(delay_time[k]) || delay_time[k] < 0.0) { RMC_LOG(m, "a delay channel produced an invalid delayTime; expected a finite non-negative value"); RMC_RELEASE; return -1; }
-        if (!isfinite(delay_max[k]) || delay_max[k] < delay_time[k]) { RMC_LOG(m, "a delay channel produced delayMax below delayTime"); RMC_RELEASE; return -1; }
+        if (!isfinite(delay_time[k]) || delay_time[k] < 0.0) { rmc_fault(m, RMC_FAULT_DELAY_TIME, RMC_NO_SITE); RMC_RELEASE; return -1; }
+        if (!isfinite(delay_max[k]) || delay_max[k] < delay_time[k]) { rmc_fault(m, RMC_FAULT_DELAY_MAX, RMC_NO_SITE); RMC_RELEASE; return -1; }
     }
     for (size_t k = 0; k < RMC_INIT_DELAYS; ++k) {
         double* slot = &m->p[rmc_init_delay_slot[k]];
@@ -2910,7 +3278,7 @@ RMC_COLD {{ q }} {{ prefix }}Status rmc_initialize(ModelInstance* m, double tole
 {%- endif %}
     m->rmc_tol = RMC_TOL; m->rmc_certify = true;
     if (m->rmc_fatal) return {{ prefix }}Error;
-    if (status != {{ prefix }}OK) RMC_LOG(m, "initial algebraic/update projection did not converge");
+    if (status != {{ prefix }}OK) rmc_fault(m, RMC_FAULT_INIT_PROJECTION, RMC_NO_SITE);
     return status;
 }
 {%- endif %}
@@ -2986,6 +3354,7 @@ RMC_COLD {{ q }} {{ prefix }}Status rmc_initialize(ModelInstance* m, double tole
 #define RMC_FAILURE(status) ((status) == RMC_FATAL ? RMC_FATAL : -1)
 #define RMC_FAULTED(m) ((m)->rmc_fatal)
 {{ api }} int rmc_bad_program(ModelInstance* m, size_t program);
+{{ fault_declarations(device) }}
 {%- else %}
 /* A component without a kernel or assignment programs has no program fault. */
 #define RMC_FAULTED(m) ((void)(m), 0)
@@ -3227,11 +3596,13 @@ RMC_API extern const size_t rmc_iso_slot[{{ me.table.isolator_slot|length }}];
 {#- ── device build ──────────────────────────────────────────────────────────
     The same kernel compiled for a device (CUDA C++, SPEC_0044 ME-PROJ-001):
     one translation unit holds the whole program, so every kernel function,
-    table and typed pure function is `static __device__`, and no symbol is
-    shared between units. Each lane runs the kernel on its own `ModelInstance`,
-    whose `y` and `p` are the lane's coordinate and parameters and whose
-    workspace (`workspace_fields`) holds its projection arena, its tolerance
-    and certification mode, its program fault and its fallback counters.
+    table and typed pure function is `static __device__`, the report composer
+    (ME-PROJ-003) is static host code, and no symbol is shared between units.
+    Each lane runs the kernel on its own `ModelInstance`, whose `y` and `p`
+    are the lane's coordinate and parameters and whose workspace
+    (`workspace_fields`) holds its projection arena, its tolerance and
+    certification mode, its program fault, its fallback counters and its
+    fault report.
 
     `device_instance` declares the instance and what the kernel reads around
     it; `device_kernel` defines the kernel and `rmc_lane_reset`, which resets
@@ -3245,20 +3616,37 @@ RMC_API extern const size_t rmc_iso_slot[{{ me.table.isolator_slot|length }}];
     (-1 error, 0 unchanged, 1 changed). The including unit includes
     <float.h>, <math.h>, <stdbool.h>, <stddef.h>, <stdint.h> and <string.h>,
     <assert.h> when it defines RMC_DEBUG, and any other standard header it
-    uses, before `device_instance`, which redefines `snprintf` and `memcmp`
-    until the end of `device_kernel`, where the includer's own definitions
-    come back (push_macro, pop_macro); the two macros include none. It emits
-    the min/max helpers its programs and typed functions call
-    (`real_extremum_prelude("cuda")`) before `device_kernel`. -#}
+    uses, before `device_instance`, which includes <stdio.h> for the host's
+    report and then redefines `snprintf` and `memcmp` until the end of
+    `device_kernel`, where the includer's own definitions come back
+    (push_macro, pop_macro); neither macro includes a header after its
+    shims. It
+    emits the min/max helpers its programs and typed functions call
+    (`real_extremum_prelude("cuda")`) before `device_kernel`. After a launch,
+    the host code of the same unit passes a copy of each lane's
+    `rmc_lane_status` (copied alone, for instance by a pitched copy of that
+    member of the lane array) to `rmc_lane_report`, a static host function,
+    for the lane's fallback and fault reports; a model with neither a
+    projection kernel nor assignment programs has no report, and its unit no
+    `rmc_lane_report`. -#}
 {%- macro device_instance(solve, me, prefix) %}
+#include <stdio.h>
 typedef enum { {{ prefix }}OK, {{ prefix }}Warning, {{ prefix }}Discard, {{ prefix }}Error, {{ prefix }}Fatal } {{ prefix }}Status;
 {{ storage_lengths(solve) }}
-typedef struct { bool parameters_dirty; bool rmc_nonfinite; bool assertion_failed; double time; double y[Y_LEN]; double p[P_LEN];{{ workspace_fields(me) }} } ModelInstance;
 /* A lane has no logger: a failure reaches its caller through the status the
-   entry returns, a program fault through `rmc_fatal`, and a fallback through
-   the instance's counters. */
-#define RMC_LOG(m, message) ((void)(m), (void)(message))
-#define RMC_LOG_AT(m, category, message) ((void)(m), (void)(category), (void)(message))
+   entry returns, and the kernel keeps its fallback and fault reports in the
+   lane's status (RMC_LANE_STATUS: rmc_lane_status), which the host reads
+   back and passes to rmc_lane_report (SPEC_0044 ME-PROJ-003): every crossed
+   site in site order, then the first fault, whatever order they occurred
+   in. The faults after the first are counted, not kept; besides those and
+   the messages of a pure call's assertions (ME-PROJ-001), only the chart
+   switch trace, which an FMI component logs when debug logging is on, is
+   dropped. */
+#ifndef RMC_LANE_STATUS
+#define RMC_LANE_STATUS 1
+#endif
+{{- lane_status_type(me) }}
+typedef struct { bool parameters_dirty; bool rmc_nonfinite; bool assertion_failed; double time; double y[Y_LEN]; double p[P_LEN];{{ workspace_fields(me, device=true) }} } ModelInstance;
 #define RMC_INFO(m, category, message) ((void)(m), (void)(category), (void)(message))
 /* The unit is a library: a lane kernel calls only the entries it needs, so
    every device function carries the unused attribute (RMC_UNUSED, which the
@@ -3269,9 +3657,10 @@ typedef struct { bool parameters_dirty; bool rmc_nonfinite; bool assertion_faile
 #define RMC_UNUSED
 #endif
 {{ device_qualifier(true) }} inline double rmc_now(const ModelInstance* m) { return m->time; }
-/* The device library has no formatted output, so a message the kernel
-   formats for its log is left empty; and no `memcmp`, which the kernel uses
-   to compare values bit for bit. */
+/* The device library has no formatted output, so the chart switch trace the
+   kernel formats is left empty (the host's report formats with the library
+   `(snprintf)`); and no `memcmp`, which the kernel uses to compare values
+   bit for bit. */
 {{ device_qualifier(true) }} inline int rmc_device_format(char* text, size_t size) { if (size > 0) text[0] = '\0'; return 0; }
 #pragma push_macro("snprintf")
 #undef snprintf
@@ -3317,13 +3706,15 @@ typedef struct { bool parameters_dirty; bool rmc_nonfinite; bool assertion_faile
    parameters and `parameters_dirty`, which the caller sets: no fault or
    failed assertion, and the projection workspace zeroed as the host
    component's allocation zeroes it (device memory comes unzeroed), then the
-   reset the component runs. The arena, the workspace's first two fields, is
-   left as it is: `rmc_dalloc` and `rmc_salloc` zero what they hand out and a
-   raw buffer is written before it is read. */
+   reset the component runs. The arena and the retained factors, the
+   workspace's first fields, are left as they are: `rmc_dalloc` and
+   `rmc_salloc` zero what they hand out, a raw buffer is written before it
+   is read, and the reset clears each retained key flag, so a factor is
+   formed again before it is read. */
 {{ device_qualifier(true) }} void rmc_lane_reset(ModelInstance* m) {
     m->rmc_nonfinite = false; m->assertion_failed = false;
     unsigned char* workspace = (unsigned char*){{ "&m->rmc_dtop" if me.kernel else "(m->p + P_LEN)" }};
-    memset(workspace, 0, (size_t)((unsigned char*)(m + 1) - workspace));{{ workspace_reset(me) }}
+    memset(workspace, 0, (size_t)((unsigned char*)(m + 1) - workspace));{{ workspace_reset(me, device=true) }}
 }
 {{ typed_functions(typed_pure_calls, typed_directional_calls if me.blocks|length > 0 or me.table.jvp.programs|length > 0 else [], device=true) }}
 {{- isolators_unit(me, device=true) }}
