@@ -13,7 +13,17 @@ void rmc_fmi3_step(void* instances, double current, double dt, int* statuses, in
         statuses[lane] = fmi3Error;
         return;
     }
+{%- if me_refresh.keep.doubles > 0 %}
+    /* The retained affine factors of a host instance are host storage
+       (SPEC_0044 ME-PROJ-001): the lane steps without them, retaining
+       nothing, and hands the host its addresses back. */
+    double* keep_d = instance->rmc_keep_d; size_t* keep_s = instance->rmc_keep_s;
+    instance->rmc_keep_d = NULL; instance->rmc_keep_s = NULL;
+{%- endif %}
     fmi3Status status = fmi3DoStep(instance, current, dt, true, &event, &terminate, &early, &last);
+{%- if me_refresh.keep.doubles > 0 %}
+    instance->rmc_keep_d = keep_d; instance->rmc_keep_s = keep_s;
+{%- endif %}
     statuses[lane] = (event || terminate || early) ? fmi3Error : status;
 }
 

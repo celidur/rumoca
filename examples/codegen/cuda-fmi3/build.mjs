@@ -18,7 +18,10 @@ if (!xml.includes('<CoSimulation') || !xml.includes('fmiVersion="3.')) {
 }
 const header = readFileSync(join(source, 'model.h'), 'utf8');
 const layout = header.match(/typedef struct \{ bool assertions_initialized;([\s\S]*?)\} ModelInstance;/)?.[1];
-if (!layout || layout.includes('*') || /<(?:String|Binary)\s/.test(xml)) {
+// The retained affine factors are the one host storage a lane may carry:
+// rmc_fmi3_step steps without them and hands the host its addresses back.
+const hostOwned = layout?.replace(' double* rmc_keep_d; size_t* rmc_keep_s;', '');
+if (!hostOwned || hostOwned.includes('*') || /<(?:String|Binary)\s/.test(xml)) {
   throw Error('CUDA lanes require a numeric component with inline state and no host-owned storage.');
 }
 const token = xml.match(/instantiationToken="([^"]+)"/)?.[1];
