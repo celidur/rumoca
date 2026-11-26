@@ -43,12 +43,13 @@ impl SolveTemplateRenderer {
     /// [`Self::new_owned_model_with_dae`] with the ME refresh view of the
     /// model (`me_refresh`), for a target that compiles the shared projection
     /// kernel for a device (`fmi-me-projection.jinja`: `device_instance` and
-    /// `device_kernel`), the parameter bindings its `binding_updates` runs
-    /// (`me_bindings`, [`solve::fmi::SolveBindingExecution`]), and the
-    /// pure-call families its programs and typed functions name and the
-    /// assertion observations of its pure calls, as the FMI renderer supplies
-    /// them. The model is admitted to the C kernel first
-    /// (`AdmittedSolveModel`), so a model the kernel refuses renders nothing.
+    /// `device_kernel`), the admitted parameter bindings its includer renders
+    /// `rmc_apply_updates` from (`me_bindings`,
+    /// [`solve::fmi::SolveBindingExecution`]), and the pure-call families its
+    /// programs and typed functions name and the assertion observations of
+    /// its pure calls, as the FMI renderer supplies them. The model is
+    /// admitted to the C kernel first (`AdmittedSolveModel`), so a model the
+    /// kernel refuses renders nothing.
     pub fn new_owned_model_with_me_projection(
         model: std::sync::Arc<solve::SolveModel>,
         dae_model: &dae::Dae,
@@ -59,13 +60,12 @@ impl SolveTemplateRenderer {
         let pure_calls = super::pure_call_families::PureCallFamilies::new(&model.pure_calls)?;
         let assertion_observations =
             super::fmi_c_assertions::observations(&model.problem, &model.pure_calls)?;
-        // The unit renders every owner as a typed body, nested regions and
-        // assertion messages included, beside the programs that inline it.
+        // The unit renders every owner as a typed body and inlines none.
         let uses_real_extremum = super::real_extremum::used_by(
             &model.problem,
             &model.artifacts,
             Some(&model.pure_calls),
-            Some(&model.pure_calls),
+            None,
         );
         let renderer = Self::new_owned_model_with_dae(model, dae_model)?;
         Ok(Self {

@@ -113,7 +113,8 @@ impl SolveBindingExecution {
             super::c_codegen::admit_kernel(model, None, true).map_err(|error| error.0)?;
         let init = &model.problem.initialization;
         let execution =
-            BindingExecution::checked(init.update_rhs(), init.update_targets(), &order)?;
+            BindingExecution::checked(init.update_rhs(), init.update_targets(), &order)?
+                .classify_quotient_seeds(&model.problem);
         Ok(Self { execution, levels })
     }
 
@@ -122,16 +123,17 @@ impl SolveBindingExecution {
         self.execution.programs()
     }
 
-    /// The dependency levels of the bindings: the simultaneous sweeps the
-    /// runtime needs to settle them, plus one to observe that nothing changed.
+    /// The number of dependency levels of the bindings: the repeated sweeps
+    /// the runtime needs to settle them (`parameter_updates::validate`).
     #[must_use]
     pub const fn levels(&self) -> usize {
         self.levels
     }
 }
 
-/// The keys the shared kernel's binding template reads from an FMI C view:
-/// `binding_execution` and `discrete_equations` (empty, see above).
+/// The keys the binding block of the FMI C refresh (`refresh_values`) reads
+/// from an FMI C view, `binding_execution` and `discrete_equations` (empty,
+/// see above), and the dependency levels as `binding_levels`.
 impl Serialize for SolveBindingExecution {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;

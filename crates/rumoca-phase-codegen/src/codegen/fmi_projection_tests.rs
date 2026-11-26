@@ -484,6 +484,31 @@ fn chain_component(model: solve::SolveModel, depth: usize) -> solve::fmi::FmiCom
         .expect("the binding chain is a checked component")
 }
 
+/// SPEC_0044 ME-PROJ-005: the kernel of an FMI component, whose importer
+/// orders its evaluations, refreshes from the committed seed; the kernel of a
+/// lowered model without a component, whose target steps it, keeps its
+/// integrator's warm start.
+#[test]
+fn the_refresh_source_names_who_orders_its_evaluations() {
+    let seed_rule = |value: minijinja::Value| {
+        value
+            .get_attr("seed_rule")
+            .expect("the refresh view states its seed rule")
+            .to_string()
+    };
+    let model = model_with_binding_chain(1);
+    let admitted = super::me_projection::AdmittedSolveModel::new(&model)
+        .expect("the binding chain is admitted to the kernel");
+    let lanes = super::me_projection::me_refresh_value(&admitted).expect("the lane view builds");
+    assert_eq!(seed_rule(lanes), "IntegratorWarmStart");
+    let view = chain_component(model_with_binding_chain(1), 1)
+        .into_codegen_view()
+        .try_c()
+        .expect("the binding chain is a C component");
+    let component = super::me_projection::me_refresh_value(&view).expect("the FMI view builds");
+    assert_eq!(seed_rule(component), "CommittedAcceptedPoint");
+}
+
 /// A Solve target without an FMI component (a per-lane CUDA initialization)
 /// runs the bindings in the order, with the levels and the lifecycle rows,
 /// the FMI C profile admits on the same model.

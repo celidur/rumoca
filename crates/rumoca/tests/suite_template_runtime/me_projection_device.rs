@@ -32,9 +32,26 @@ RMC_UNUSED static __device__ rmcStatus update_discrete_equations(ModelInstance* 
 pub(crate) fn device_unit(compiled: &rumoca::CompilationResult) -> String {
     let component =
         rumoca_sim::lower_fmi_c_export_component(&compiled.dae).expect("lower the FMI C component");
-    let model = Arc::new(component.runtime_view().model().clone());
+    render_device_unit(component.runtime_view().model().clone(), compiled)
+}
+
+/// The device unit of one compiled model, rendered from the simulation
+/// lowering a device target passes, without an FMI component.
+pub(crate) fn solve_device_unit(compiled: &rumoca::CompilationResult) -> String {
+    let lowered = rumoca_sim::lower_correlated_for_simulation_with_overrides(
+        &compiled.dae,
+        &rumoca_sim::SimOptions::default(),
+    )
+    .expect("lower the Solve model");
+    render_device_unit(lowered.model().clone(), compiled)
+}
+
+fn render_device_unit(
+    model: rumoca_ir_solve::SolveModel,
+    compiled: &rumoca::CompilationResult,
+) -> String {
     rumoca_phase_codegen::SolveTemplateRenderer::new_owned_model_with_me_projection(
-        model,
+        Arc::new(model),
         &compiled.dae,
     )
     .expect("build the device renderer")

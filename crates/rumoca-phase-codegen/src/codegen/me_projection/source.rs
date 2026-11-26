@@ -22,6 +22,8 @@ pub(crate) trait RefreshSource {
     fn instantiation_point(&self) -> (&[f64], &[f64]);
     /// The dependency levels of the parameter bindings the kernel settles.
     fn parameter_binding_levels(&self) -> usize;
+    /// Who orders the continuous-time evaluations of the rendered kernel.
+    fn executor(&self) -> solve::RefreshExecutor;
     /// Whether the target of this source projects its accepted states onto
     /// the retained state manifold (`manifold_kernel`), so the refresh admits
     /// a model that retains one and its arena also holds that projection.
@@ -46,6 +48,10 @@ impl RefreshSource for solve::fmi::FmiCCodegenView {
     }
     fn parameter_binding_levels(&self) -> usize {
         Self::parameter_binding_levels(self)
+    }
+    /// An FMU's importer orders its trial evaluations.
+    fn executor(&self) -> solve::RefreshExecutor {
+        solve::RefreshExecutor::ImporterDriven
     }
     /// FMI 3 Model Exchange has no call that moves the continuous states at
     /// an accepted point, so the C component never projects them.
@@ -76,7 +82,8 @@ impl<'a> AdmittedSolveModel<'a> {
         Ok(Self { model, bindings })
     }
 
-    /// The parameter bindings the kernel's `binding_updates` runs.
+    /// The admitted parameter bindings, from which the unit's includer renders
+    /// its `rmc_apply_updates`.
     pub(crate) fn bindings(&self) -> &solve::fmi::SolveBindingExecution {
         &self.bindings
     }
@@ -100,6 +107,10 @@ impl RefreshSource for AdmittedSolveModel<'_> {
     }
     fn parameter_binding_levels(&self) -> usize {
         self.bindings.levels()
+    }
+    /// The target's own integrator steps each lane.
+    fn executor(&self) -> solve::RefreshExecutor {
+        solve::RefreshExecutor::IntegratorDriven
     }
     fn projects_state_manifold(&self) -> bool {
         true

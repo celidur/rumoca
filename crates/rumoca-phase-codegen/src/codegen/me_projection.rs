@@ -627,7 +627,7 @@ pub(super) fn me_refresh_value(component: &impl RefreshSource) -> Result<Value, 
         lane_max => lane_max,
         variable_scales => variable_scales,
         policy => policy_value(),
-        seed_rule => importer_seed_rule(problem),
+        seed_rule => seed_rule(component),
         // The target's `rmc_initialize` certifies the settled states on the
         // retained manifold (`manifold_kernel`).
         state_manifold => component.projects_state_manifold()
@@ -733,15 +733,17 @@ fn block_folds(records: &[BlockRecord]) -> Value {
     minijinja::context! { pool => pool, offsets => offsets }
 }
 
-/// The warm-start rule the generated C translates: its component is
-/// importer-driven (SPEC_0044 ME-PROJ-005).
-fn importer_seed_rule(problem: &solve::SolveProblem) -> String {
+/// The warm-start rule the generated C translates: the rule the refresh
+/// owners state for whoever orders the source's evaluations (SPEC_0044
+/// ME-PROJ-005).
+fn seed_rule(source: &impl RefreshSource) -> String {
     format!(
         "{:?}",
-        problem
+        source
+            .problem()
             .continuous
             .refresh_owners
-            .seed_rule(solve::RefreshExecutor::ImporterDriven)
+            .seed_rule(source.executor())
     )
 }
 

@@ -14,7 +14,7 @@
 //! settles no parameter binding.
 
 use super::*;
-use crate::me_projection_device::{POINTS, device_unit, lane_harness, models};
+use crate::me_projection_device::{POINTS, device_unit, lane_harness, models, solve_device_unit};
 
 const FMI_DRIVER: &str = r#"
 #include <stdio.h>
@@ -175,6 +175,12 @@ fn a_device_build_refreshes_every_lane_as_the_fmi_component() {
         assert_eq!(
             device, points,
             "{model}: the device lanes differ from the FMI component"
+        );
+        // A device target passes the simulation lowering of the model.
+        let solve = device_points(work.path(), &solve_device_unit(&compiled), start, states);
+        assert_eq!(
+            solve, points,
+            "{model}: the lanes of the simulation lowering differ from the FMI component"
         );
     }
 }

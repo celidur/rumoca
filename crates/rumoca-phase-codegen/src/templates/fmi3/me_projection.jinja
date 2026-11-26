@@ -16,9 +16,10 @@
 #endif{#-
   Shared Model-Exchange algebraic refresh for the generated C components.
 
-  One kernel, included by every C component target, settles algebraic
-  coordinates exactly as the linked ME kernel does: the construction-issued
-  derivative and algebraic refresh plans run stage by stage, and every
+  One kernel, included by every C component target and by a device unit,
+  settles algebraic coordinates exactly as the linked ME kernel does: the
+  construction-issued derivative and algebraic refresh plans run stage by
+  stage, and every
   projection stage solves its block with the linked projection algorithms of
   `rumoca-solver` `runtime::projection` (singleton isolation, the affine
   solve with its reduced elimination, the torn reduced Newton, and the dense
@@ -26,13 +27,16 @@
   `rumoca_eval_solve::projection_policy`. Each C function names the Rust
   function it mirrors.
 
-  The including template defines `ModelInstance` (with `time`, `y`, `p`),
-  `Y_LEN`, and `RMC_LOG(m, message)`, and imports `scalar_op`.
+  Two kinds of unit include it. A C component target defines `ModelInstance`
+  (with `time`, `y`, `p`), `Y_LEN`, and `RMC_LOG(m, message)` itself and
+  calls the kernel macros with `device` false. A device unit defines none of
+  them: `device_instance` does, and `device_kernel` emits the kernel (see the
+  comment above `device_instance` for what such a unit provides).
 -#}
-{%- from "fmi-c-kernel.jinja" import scalar_op, store_range, store_target, c_string, projection_lu_kernel, shared_prefix, shared_symbol, linear_solve_kernel %}
+{%- from "fmi-c-kernel.jinja" import device_qualifier, scalar_op, store_range, store_target, c_string, projection_lu_kernel, shared_prefix, shared_symbol, linear_solve_kernel %}
 {%- from "fmi-typed-functions.jinja" import functions as typed_functions, function_prototypes as typed_function_prototypes %}
 
-{%- macro c_array(name, type, values, device=false) -%}{%- set q = "RMC_UNUSED static __device__" if device else "static" %}{%- set api = "RMC_UNUSED static __device__" if device else "RMC_API" %}
+{%- macro c_array(name, type, values, device=false) -%}{%- set q = device_qualifier(device) %}
 {%- if values|length > 0 %}
 {{ q }} const {{ type }} {{ name }}[{{ values|length }}] = { {% for value in values %}{{ value }}{% if not loop.last %}, {% endif %}{% endfor %} };
 {%- endif %}
@@ -44,7 +48,7 @@
     Past rmc_inline_program_max_ops operations it stays out of line
     (RMC_NOINLINE); a smaller one is left to the compiler, which may inline
     it into its case. -#}
-{%- macro program_function(name, program, signature, seed, dispatched=false, args=false, device=false) %}{%- set q = "RMC_UNUSED static __device__" if device else "static" %}{%- set api = "RMC_UNUSED static __device__" if device else "RMC_API" %}
+{%- macro program_function(name, program, signature, seed, dispatched=false, args=false, device=false) %}{%- set q = device_qualifier(device) %}
 {{ q }} {% if dispatched and program.ops|length > rmc_inline_program_max_ops %}RMC_NOINLINE {% endif %}int {{ name }}({{ signature }}) {
     double r[{{ program.temporary_count if program.temporary_count > 0 else 1 }}]; (void)r; (void)m; (void)o;{% if seed %} (void)seed;{% endif %}{% if args %} (void)a;{% endif %}
 {%- for op in program.ops %}
@@ -195,7 +199,7 @@ static __device__ RMC_NOINLINE int {{ name }}_g{{ g.open }}({{ params }}) {
     solve every projection of the kernel shares: the refresh blocks, the
     initialization and the state manifold. `work` sizes the per-instance
     arena (`doubles`, `sizes`). -#}
-{%- macro projection_numerics(work, device=false) %}{%- set q = "RMC_UNUSED static __device__" if device else "static" %}{%- set api = "RMC_UNUSED static __device__" if device else "RMC_API" %}
+{%- macro projection_numerics(work, device=false) %}{%- set q = device_qualifier(device) %}
 #define RMC_DWORK {{ work.doubles }}
 #define RMC_SWORK {{ work.sizes }}
 typedef struct { bool changed; bool settled; } RmcUpdate;
@@ -324,7 +328,7 @@ typedef struct { size_t n; double* scaled; double* lu; size_t* ipiv; const doubl
 }
 {%- endmacro %}
 
-{%- macro projection_kernel(me, device=false) %}{%- set q = "RMC_UNUSED static __device__" if device else "static" %}{%- set api = "RMC_UNUSED static __device__" if device else "RMC_API" %}
+{%- macro projection_kernel(me, device=false) %}{%- set q = device_qualifier(device) %}
 {%- if me.kernel %}
 #define RMC_TOL {{ me.policy.tolerance }}
 #define RMC_REFRESH_ITERS {{ me.policy.refresh_iters }}
@@ -1422,7 +1426,7 @@ RMC_COLD {{ q }} int rmc_plan_converged(ModelInstance* m, const size_t* entries,
     target emits it after `device_kernel`, whose numerics already size the
     arena for it (the refresh view of a lowered model holds `mf.work`); a
     smaller arena fails the build. -#}
-{%- macro manifold_kernel(mf, device=false) %}{%- set q = "RMC_UNUSED static __device__" if device else "static" %}{%- set api = "RMC_UNUSED static __device__" if device else "RMC_API" %}
+{%- macro manifold_kernel(mf, device=false) %}{%- set q = device_qualifier(device) %}{%- set api = device_qualifier(device, true) %}
 {%- if mf.blocks|length > 0 %}
 #define RMC_MF_ROWS {{ mf.rows }}
 #define RMC_MF_STATES {{ mf.state_count }}
@@ -1699,7 +1703,7 @@ RMC_COLD {{ q }} int rmc_mf_wide_solve(ModelInstance* m, const double* a, size_t
 
 {#- Every issued exact-assignment program once: 0 stored, 1 a non-finite
     store, -1 a failed pure call. -#}
-{%- macro assignment_functions(me, device=false) %}{%- set q = "RMC_UNUSED static __device__" if device else "static" %}{%- set api = "RMC_UNUSED static __device__" if device else "RMC_API" %}
+{%- macro assignment_functions(me, device=false) %}{%- set q = device_qualifier(device) %}{%- set api = device_qualifier(device, true) %}
 {%- for program in me.assign.plan.programs %}
 {{ q }} {% if program.ops|length > rmc_inline_program_max_ops %}RMC_NOINLINE {% endif %}int rmc_asg_p{{ loop.index0 }}(ModelInstance* m) {
     double r[{{ program.temporary_count if program.temporary_count > 0 else 1 }}]; (void)r;
@@ -1744,7 +1748,7 @@ RMC_COLD {{ q }} int rmc_mf_wide_solve(ModelInstance* m, const double* a, size_t
     projects the block, and continues, running the complete plan only when
     that projection fails; a failed pure call restores the incoming coordinate
     and reports an error. -#}
-{%- macro refresh_kernel(me, prefix, device=false) %}{%- set q = "RMC_UNUSED static __device__" if device else "static" %}{%- set api = "RMC_UNUSED static __device__" if device else "RMC_API" %}
+{%- macro refresh_kernel(me, prefix, device=false) %}{%- set q = device_qualifier(device) %}{%- set api = device_qualifier(device, true) %}
 {%- if me.kernel or me.assign.plan.programs|length > 0 %}
 /* Checks of the generated tables themselves, which abort a debug build
    (RMC_DEBUG) and compile to nothing otherwise, so a release FMU never
@@ -1886,7 +1890,7 @@ fail:
 {%- endif %}
 {%- endmacro %}
 
-{%- macro refresh_function(name, plan, prefix, arena=false, device=false) %}{%- set q = "RMC_UNUSED static __device__" if device else "static" %}{%- set api = "RMC_UNUSED static __device__" if device else "RMC_API" %}
+{%- macro refresh_function(name, plan, prefix, arena=false, device=false) %}{%- set q = device_qualifier(device) %}
 {%- if plan.steps|length > 0 %}
 {{ q }} const RmcStep rmc_steps_{{ name }}[{{ plan.steps|length }}] = {
 {%- for step in plan.steps %}
@@ -1944,7 +1948,7 @@ fail:
     checked FMI C component, or a Solve target's `SolveBindingExecution`.
     A device build (`device`) qualifies both functions for the device; it
     defines `update_discrete_equations` itself. -#}
-{%- macro binding_updates(solve, fmi, prefix, device=false) %}{%- set q = "RMC_UNUSED static __device__" if device else "static" %}
+{%- macro binding_updates(solve, fmi, prefix, device=false) %}{%- set q = device_qualifier(device) %}
 {%- set targets = solve.initialization.update_targets %}
 {%- if device and targets|length > 0 %}
 {%- set programs = solve.initialization.update_plan.programs %}
@@ -2034,7 +2038,7 @@ fail:
 
 {#- The active chart's plan (kernel.rs: the component's runtime is the active
     chart's; SPEC_0040 STRUCT-T07 constraint-fold chart rows). -#}
-{%- macro chart_dispatch(name, me, prefix, device=false) %}{%- set q = "RMC_UNUSED static __device__" if device else "static" %}{%- set api = "RMC_UNUSED static __device__" if device else "RMC_API" %}
+{%- macro chart_dispatch(name, me, prefix, device=false) %}{%- set q = device_qualifier(device) %}
 {{ q }} {{ prefix }}Status ({{ name }})(ModelInstance* m) {
     switch (m->rmc_chart) {
 {%- for chart in me.charts %}
@@ -2050,7 +2054,7 @@ fail:
     and hysteresis, and the Event-Mode basis transfer. The conditioning is the
     dense_basis.rs `dependent_conditioning` of the chart's slope matrix, with
     nalgebra's column-pivoted QR reproduced operation for operation. -#}
-{%- macro chart_kernel(solve, me, prefix, device=false) %}{%- set q = "RMC_UNUSED static __device__" if device else "static" %}{%- set api = "RMC_UNUSED static __device__" if device else "RMC_API" %}
+{%- macro chart_kernel(solve, me, prefix, device=false) %}{%- set q = device_qualifier(device) %}
 {%- if me.switching %}
 {%- if not device %}
 #include <stdio.h>
@@ -2286,7 +2290,7 @@ typedef struct { size_t nrows; size_t ncols; size_t ndep; size_t dep; size_t nen
     the residual's partial forward derivative (InitialProjectionModel without
     refreshes_algebraic_reads). Combined unknown indices below the solver
     length are solver coordinates, the rest parameters. -#}
-{%- macro initialization_kernel(me, prefix, device=false) %}{%- set q = "RMC_UNUSED static __device__" if device else "static" %}{%- set api = "RMC_UNUSED static __device__" if device else "RMC_API" %}
+{%- macro initialization_kernel(me, prefix, device=false) %}{%- set q = device_qualifier(device) %}{%- set api = device_qualifier(device, true) %}
 {%- set init = me.init %}
 {%- if init.rows > 0 %}
 #define RMC_INIT_ROWS {{ init.rows }}
@@ -2917,7 +2921,7 @@ RMC_COLD {{ q }} {{ prefix }}Status rmc_initialize(ModelInstance* m, double tole
     a switch the family's program unit defines that calls each program
     directly. A family with no program gets an inline stub instead, which
     reports any index as a bad one (rmc_bad_program). -#}
-{%- macro kernel_declarations(me, device=false) %}{%- set q = "RMC_UNUSED static __device__" if device else "static" %}{%- set api = "RMC_UNUSED static __device__" if device else "RMC_API" %}
+{%- macro kernel_declarations(me, device=false) %}{%- set q = device_qualifier(device) %}{%- set api = device_qualifier(device, true) %}
 /* The kernel symbols the component's units share carry the model identifier
    (shared_prefix): a shared library also hides them (RMC_API), and a static
    build links the units beside other components. */
@@ -3027,7 +3031,7 @@ RMC_API extern const size_t rmc_iso_slot[{{ me.table.isolator_slot|length }}];
 {%- endmacro %}
 
 {#- The residual-row programs of the projection blocks. -#}
-{%- macro rows_unit(me, device=false) %}{%- set q = "RMC_UNUSED static __device__" if device else "static" %}{%- set api = "RMC_UNUSED static __device__" if device else "RMC_API" %}
+{%- macro rows_unit(me, device=false) %}{%- set q = device_qualifier(device) %}{%- set api = device_qualifier(device, true) %}
 {%- if me.blocks|length > 0 %}
 {%- set sharing = me.table.row_sharing %}
 {%- set nshapes = sharing.shapes.programs|length %}
@@ -3108,7 +3112,7 @@ RMC_API extern const size_t rmc_iso_slot[{{ me.table.isolator_slot|length }}];
 {%- endmacro %}
 
 {#- The forward-Jacobian programs of the projection blocks. -#}
-{%- macro jacobian_unit(me, device=false) %}{%- set q = "RMC_UNUSED static __device__" if device else "static" %}{%- set api = "RMC_UNUSED static __device__" if device else "RMC_API" %}
+{%- macro jacobian_unit(me, device=false) %}{%- set q = device_qualifier(device) %}{%- set api = device_qualifier(device, true) %}
 {%- for program in me.table.jvp.programs %}
 {{ program_function("rmc_jvp_p" ~ loop.index0, program, "ModelInstance* m, const double* seed, double* o", true, true, device=device) }}
 {%- endfor %}
@@ -3126,7 +3130,7 @@ RMC_API extern const size_t rmc_iso_slot[{{ me.table.isolator_slot|length }}];
 {%- endmacro %}
 
 {#- The target isolators and causal runs of the projection blocks. -#}
-{%- macro isolators_unit(me, device=false) %}{%- set q = "RMC_UNUSED static __device__" if device else "static" %}{%- set api = "RMC_UNUSED static __device__" if device else "RMC_API" %}
+{%- macro isolators_unit(me, device=false) %}{%- set q = device_qualifier(device) %}{%- set api = device_qualifier(device, true) %}
 {%- if me.blocks|length > 0 %}
 {%- for program in me.table.isolators.programs %}
 {{ program_function("rmc_iso_p" ~ loop.index0, program, "ModelInstance* m, double* o", false, true, device=device) }}
@@ -3167,7 +3171,7 @@ RMC_API extern const size_t rmc_iso_slot[{{ me.table.isolator_slot|length }}];
     from the previous seed; that refresh runs once, on the first refresh
     after the step, and a derivative query at the accepted point reads it.
     Event Mode and Co-Simulation keep their own iteration's warm start. -#}
-{%- macro committed_seed(me, prefix, device=false) %}{%- set q = "RMC_UNUSED static __device__" if device else "static" %}{%- set api = "RMC_UNUSED static __device__" if device else "RMC_API" %}
+{%- macro committed_seed(me, prefix, device=false) %}{%- set q = device_qualifier(device) %}
 {%- if me.blocks|length > 0 and me.seed_rule == "CommittedAcceptedPoint" %}
 {{ q }} bool rmc_at_mark(const ModelInstance* m) {
     return memcmp(&m->time, &m->rmc_mark_t, sizeof(double)) == 0 && memcmp(m->y, m->rmc_mark_x, sizeof(m->rmc_mark_x)) == 0;
@@ -3262,15 +3266,15 @@ typedef struct { bool parameters_dirty; bool rmc_nonfinite; bool assertion_faile
 #else
 #define RMC_UNUSED
 #endif
-RMC_UNUSED static __device__ inline double rmc_now(const ModelInstance* m) { return m->time; }
+{{ device_qualifier(true) }} inline double rmc_now(const ModelInstance* m) { return m->time; }
 /* The device library has no formatted output, so a message the kernel
    formats for its log is left empty; and no `memcmp`, which the kernel uses
    to compare values bit for bit. */
-RMC_UNUSED static __device__ inline int rmc_device_format(char* text, size_t size) { if (size > 0) text[0] = '\0'; return 0; }
+{{ device_qualifier(true) }} inline int rmc_device_format(char* text, size_t size) { if (size > 0) text[0] = '\0'; return 0; }
 #pragma push_macro("snprintf")
 #undef snprintf
 #define snprintf(text, size, ...) rmc_device_format((text), (size))
-RMC_UNUSED static __device__ inline int rmc_device_memcmp(const void* a, const void* b, size_t n) {
+{{ device_qualifier(true) }} inline int rmc_device_memcmp(const void* a, const void* b, size_t n) {
     const unsigned char* x = (const unsigned char*)a; const unsigned char* y = (const unsigned char*)b;
     for (size_t i = 0; i < n; ++i) if (x[i] != y[i]) return x[i] < y[i] ? -1 : 1;
     return 0;
@@ -3287,7 +3291,7 @@ RMC_UNUSED static __device__ inline int rmc_device_memcmp(const void* a, const v
    model does not issue, or one with another capture count, fails the call;
    an error-level action observed for its error marks the lane; a warning
    records no notice. */
-RMC_UNUSED static __device__ int rmc_model_assertion(void* context, size_t predicate, const void* const captures[], size_t count) {
+{{ device_qualifier(true) }} int rmc_model_assertion(void* context, size_t predicate, const void* const captures[], size_t count) {
     RmcModelAssertionContext* observed = (RmcModelAssertionContext*)context;
     (void)observed; (void)predicate; (void)captures; (void)count;
 {%- for observation in fmi_assertion_observations %}
@@ -3302,7 +3306,7 @@ RMC_UNUSED static __device__ int rmc_model_assertion(void* context, size_t predi
 {%- endfor %}
     return 1;
 }
-RMC_UNUSED static __device__ void rmc_finish_assertion_observation(RmcModelAssertionContext* context, int status) { (void)context; (void)status; }
+{{ device_qualifier(true) }} void rmc_finish_assertion_observation(RmcModelAssertionContext* context, int status) { (void)context; (void)status; }
 /* A lane as a new instance starts it, but for its time, coordinate,
    parameters and `parameters_dirty`, which the caller sets: no fault or
    failed assertion, and the projection workspace zeroed as the host
@@ -3310,7 +3314,7 @@ RMC_UNUSED static __device__ void rmc_finish_assertion_observation(RmcModelAsser
    reset the component runs. The arena, the workspace's first two fields, is
    left as it is: `rmc_dalloc` and `rmc_salloc` zero what they hand out and a
    raw buffer is written before it is read. */
-RMC_UNUSED static __device__ void rmc_lane_reset(ModelInstance* m) {
+{{ device_qualifier(true) }} void rmc_lane_reset(ModelInstance* m) {
     m->rmc_nonfinite = false; m->assertion_failed = false;
     unsigned char* workspace = (unsigned char*){{ "&m->rmc_dtop" if me.kernel else "(m->p + P_LEN)" }};
     memset(workspace, 0, (size_t)((unsigned char*)(m + 1) - workspace));{{ workspace_reset(me) }}
