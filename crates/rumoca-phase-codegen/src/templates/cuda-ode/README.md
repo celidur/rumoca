@@ -27,6 +27,11 @@ and integration (including event location and stopping at time events).
   `blockIdx.x * blockDim.x + threadIdx.x`) names the calling thread's lane.
   `<model>_refresh_batch` and `<model>_rhs_batch` report a failed refresh in
   `status`.
+  The kernel keeps each lane's fallback and fault reports (SPEC_0044
+  ME-PROJ-003) in `<model>_LANE_STATUS_BYTES` bytes at offset
+  `<model>_LANE_STATUS_OFFSET` of the lane's instance: the host copies them
+  back and passes each copy to `<model>_lane_report`, which gives its sink
+  the FMI component's categories and messages.
 - State manifold: when index reduction retains constraints over the states
   (`<model>_MANIFOLD_BLOCKS` is not 0), the same kernel certifies the
   initialized states on them and `<model>_project_states_batch` moves the
