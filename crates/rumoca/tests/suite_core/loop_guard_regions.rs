@@ -102,6 +102,38 @@ end Probe;
 }
 
 #[test]
+fn a_while_condition_that_reads_a_table_at_its_index_guards_no_region_in_the_pass() {
+    let source = r#"
+function Locate
+  input Real x[5];
+  input Real xi;
+  output Real y;
+protected
+  Integer i;
+algorithm
+  i := 1;
+  while i < 5 and xi >= x[i] loop
+    i := i + 1;
+  end while;
+  y := x[i];
+end Locate;
+model Probe
+  input Real xi = 2.5;
+  output Real r;
+equation
+  r = Locate({0.0, 1.0, 2.0, 3.0, 4.0}, xi);
+end Probe;
+"#;
+    let (regions, value) = probe(source);
+    assert_eq!(
+        regions, 0,
+        "the pass reads the table at the index the loop condition read it at"
+    );
+    // The search stops at the first abscissa above 2.5.
+    assert_eq!(value, 3.0);
+}
+
+#[test]
 fn a_guard_the_exit_test_does_not_name_keeps_its_region() {
     let source = r#"
 function Accumulate

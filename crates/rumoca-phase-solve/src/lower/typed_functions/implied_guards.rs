@@ -147,6 +147,31 @@ fn same_value<'dae>(
             x == y && p.len() == q.len() && p.iter().zip(&q).all(|(x, y)| same(*x, *y))
         }
         (
+            O::Index {
+                base: p,
+                subscripts: x,
+            },
+            O::Index {
+                base: q,
+                subscripts: y,
+            },
+        ) => {
+            same(p, q)
+                && x.len() == y.len()
+                && x.iter().zip(y.iter()).all(|pair| match pair {
+                    (
+                        dae::SubscriptView::Index { expression: i, .. },
+                        dae::SubscriptView::Index { expression: j, .. },
+                    )
+                    | (
+                        dae::SubscriptView::Slice { expression: i, .. },
+                        dae::SubscriptView::Slice { expression: j, .. },
+                    ) => same(i, j),
+                    (dae::SubscriptView::Whole { .. }, dae::SubscriptView::Whole { .. }) => true,
+                    _ => false,
+                })
+        }
+        (
             O::FunctionFoldParameter {
                 fold: x,
                 carried: p,
