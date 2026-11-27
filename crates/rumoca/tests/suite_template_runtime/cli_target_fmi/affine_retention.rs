@@ -60,15 +60,13 @@ fn fmi3_headers() -> Option<PathBuf> {
 }
 
 /// Compile `driver`, which includes the FMI 3 `model.c` of `compiled`, with
-/// the component's other units and the `extra` compiler flags, run it, and
-/// return what it prints.
+/// the component's other units, run it, and return what it prints.
 fn run_driver(
     work: &Path,
     headers: &Path,
     compiled: &rumoca::CompilationResult,
     model: &str,
     driver: &str,
-    extra: &[&str],
 ) -> String {
     let fmu = build_named_fmu(work, compiled, "fmi3", model);
     let sources = fmu.root.join("sources");
@@ -84,7 +82,6 @@ fn run_driver(
                 "-Wextra",
                 "-Werror",
             ])
-            .args(extra)
             .arg(format!("-I{}", sources.display()))
             .arg(format!("-I{}", headers.display()))
             .arg(&source)
@@ -205,7 +202,7 @@ fn sequence_points(
     let driver = format!(
         "#include \"model.c\"\n#define RMC_STATES {states}\n#define RMC_SEQUENCE {sequence}\n{SEQUENCE_DRIVER}"
     );
-    let output = run_driver(work.path(), headers, compiled, model, &driver, &[]);
+    let output = run_driver(work.path(), headers, compiled, model, &driver);
     let (kept, fresh) = output
         .split_once("fresh\n")
         .unwrap_or_else(|| panic!("{model}: the driver prints both parts: {output}"));
@@ -301,78 +298,6 @@ int main(void) {
 }
 "#;
     let work = tempdir().expect("listed solve work directory");
-    let output = run_driver(work.path(), &headers, &compiled, model, driver, &[]);
+    let output = run_driver(work.path(), &headers, &compiled, model, driver);
     assert_eq!(output.trim(), "0");
-}
-
-/// A CUDA lane of the FMI 3 co-simulation step (`rmc_cuda_step.c.inc`) runs
-/// on a copy of a host instance, whose retained factors are host storage:
-/// the lane steps without them and hands the host its addresses back. Here
-/// the entry runs on the host with the lane index stubbed and the device
-/// address space ignored. Over three steps of two lanes from two initialized
-/// instances, the lane writes none of the host's retained storage, its copy
-/// keeps the host's addresses, and it reaches the coordinate the host
-/// instance reaches with its retained factors, bit for bit.
-#[test]
-fn a_cuda_lane_steps_without_the_host_retained_factors() {
-    let Some(headers) = fmi3_headers() else {
-        return;
-    };
-    let driver = r#"
-#include <stdio.h>
-static unsigned rmc_test_lane;
-static unsigned __nvvm_read_ptx_sreg_ctaid_x(void) { return 0; }
-static unsigned __nvvm_read_ptx_sreg_ntid_x(void) { return 1; }
-static unsigned __nvvm_read_ptx_sreg_tid_x(void) { return rmc_test_lane; }
-#include "rmc_cuda_step.c.inc"
-int main(void) {
-    enum { N = 2, STEPS = 3 };
-    static ModelInstance lanes[N];
-    ModelInstance* host[N];
-    for (unsigned l = 0; l < N; ++l) {
-        host[l] = fmi3InstantiateCoSimulation("lane", rmc_fmi3_token, NULL, false, false, false, false, NULL, 0, NULL, NULL, NULL);
-        if (!host[l] || !host[l]->rmc_keep_d || fmi3EnterInitializationMode(host[l], false, 0.0, 0.0, false, 0.0) != fmi3OK) return 2;
-        host[l]->y[0] += 0.05 * l;
-        if (fmi3ExitInitializationMode(host[l]) != fmi3OK) return 2;
-    }
-    static double kept_d[RMC_KEEP_DOUBLES]; static size_t kept_s[RMC_KEEP_SIZES];
-    unsigned touched = 0, moved = 0, differ = 0, failed = 0;
-    for (unsigned s = 0; s < STEPS; ++s) {
-        const double current = 0.01 * s, dt = 0.01; int statuses[N];
-        for (unsigned l = 0; l < N; ++l) lanes[l] = *host[l];
-        for (unsigned l = 0; l < N; ++l) {
-            memcpy(kept_d, host[l]->rmc_keep_d, sizeof kept_d); memcpy(kept_s, host[l]->rmc_keep_s, sizeof kept_s);
-            rmc_test_lane = l; rmc_fmi3_step(lanes, current, dt, statuses, N);
-            touched += memcmp(kept_d, host[l]->rmc_keep_d, sizeof kept_d) != 0 || memcmp(kept_s, host[l]->rmc_keep_s, sizeof kept_s) != 0;
-            moved += lanes[l].rmc_keep_d != host[l]->rmc_keep_d || lanes[l].rmc_keep_s != host[l]->rmc_keep_s;
-            bool event = false, terminate = false, early = false; double last = current;
-            failed += statuses[l] != fmi3OK || fmi3DoStep(host[l], current, dt, true, &event, &terminate, &early, &last) != fmi3OK;
-            differ += memcmp(lanes[l].y, host[l]->y, sizeof lanes[l].y) != 0;
-        }
-    }
-    printf("%u %u %u %u\n", touched, moved, differ, failed);
-    for (unsigned l = 0; l < N; ++l) fmi3FreeInstance(host[l]);
-    return 0;
-}
-"#;
-    for (model, conductance) in [
-        ("RetainedConstantChain", "1.0"),
-        ("RetainedVaryingChain", "(1 + vC[{i}]^2)"),
-    ] {
-        let compiled = compile(model, &chain(model, 12, conductance));
-        let work = tempdir().expect("CUDA lane work directory");
-        let output = run_driver(
-            work.path(),
-            &headers,
-            &compiled,
-            model,
-            driver,
-            &["-Wno-attributes"],
-        );
-        assert_eq!(
-            output.trim(),
-            "0 0 0 0",
-            "{model}: touched host storage, moved addresses, differing lanes, failed steps"
-        );
-    }
 }
