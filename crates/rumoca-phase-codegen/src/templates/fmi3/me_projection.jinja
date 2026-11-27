@@ -3793,10 +3793,12 @@ typedef enum { {{ prefix }}OK, {{ prefix }}Warning, {{ prefix }}Discard, {{ pref
 {{- lane_status_type(me) }}
 {%- set bindings = solve.initialization.update_targets|length %}
 {#- With `views`, a lane's coordinate and parameters are the caller's own
-    arrays, which each entry points the instance at, instead of copies; with
-    `settled` too, the instance holds a coordinate of its own
-    (`rmc_settled_y`) for an entry that settles a copy of the caller's. #}
-typedef struct { bool parameters_dirty; bool rmc_nonfinite; bool assertion_failed; double time;{% if views %} double* y; double* p;{% if settled %} double rmc_settled_y[Y_LEN];{% endif %}{% else %} double y[Y_LEN]; double p[P_LEN];{% endif %}{% if bindings > 0 %} double rmc_bind_before[{{ bindings }}]; double rmc_bind_output[{{ bindings }}];{% endif %}{{ workspace_fields(me, device=true) }} } ModelInstance;
+    arrays, which each entry points the instance at, instead of copies, and
+    the instance keeps the lane's last recorded fixed point of its refresh
+    (`rmc_fixed_*`, which cuda-ode records and reads); with `settled` too,
+    the instance holds a coordinate of its own (`rmc_settled_y`) for an entry
+    that settles a copy of the caller's. #}
+typedef struct { bool parameters_dirty; bool rmc_nonfinite; bool assertion_failed; double time;{% if views %} double* y; double* p;{% if settled %} double rmc_settled_y[Y_LEN];{% endif %}{% else %} double y[Y_LEN]; double p[P_LEN];{% endif %}{% if bindings > 0 %} double rmc_bind_before[{{ bindings }}]; double rmc_bind_output[{{ bindings }}];{% endif %}{{ workspace_fields(me, device=true) }}{% if views %} bool rmc_fixed_valid; bool rmc_fixed_certify; double rmc_fixed_time; double rmc_fixed_tol; size_t rmc_fixed_chart; double rmc_fixed_y[Y_LEN]; double rmc_fixed_p[P_LEN];{% endif %} } ModelInstance;
 #define RMC_INFO(m, category, message) ((void)(m), (void)(category), (void)(message))
 /* The unit is a library: a lane kernel calls only the entries it needs, so
    every device function carries the unused attribute (RMC_UNUSED, which the
