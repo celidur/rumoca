@@ -33,6 +33,7 @@ mod lifecycle;
 mod mass_matrix;
 mod projection;
 mod real_extrema;
+mod refresh_sensitivity;
 mod reported_models;
 mod residual_split_harness;
 mod shared_rows_harness;

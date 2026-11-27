@@ -2,6 +2,7 @@ mod affine;
 mod block_jacobian;
 mod block_step;
 mod branch_continuity;
+mod converged_correction;
 mod homotopy;
 mod initial;
 mod initial_diagnostics;
@@ -29,13 +30,14 @@ use block_step::{
     algebraic_step_at_resolution, block_values, block_values_changed, next_scaled_backtrack,
     restore_block_values,
 };
+use converged_correction::Correction;
 use initial_diagnostics::initial_projection_error;
 use scaling::{
     CertificateScales, OriginRowScales, algebraic_block_scales, algebraic_plan_row_scales,
     fallback_targets, initial_block_fallback_scales, initial_residual_scales, jacobian_row_derived,
     jacobian_row_magnitudes, jacobian_row_scales, model_variable_scale,
-    origin_bounded_residual_converged, scaled_correction_converged, scaled_residual_converged,
-    scaled_residual_norm, scaled_tolerance,
+    origin_bounded_residual_converged, scaled_residual_converged, scaled_residual_norm,
+    scaled_tolerance,
 };
 pub(crate) use scaling::{ScaledNewtonSystem, scaled_newton_delta, scaled_newton_delta_with_cache};
 pub(crate) use scaling::{scaled_newton_delta_issued_torn, scaled_newton_delta_with_tearing};
@@ -1156,11 +1158,9 @@ fn project_algebraic_residual_block<M: ImplicitProjectionModel>(
             settled: false,
         });
     };
-    if residual_converged && scaled_correction_converged(delta.as_slice(), &variable_scales, tol) {
-        return Ok(ProjectionBlockUpdate {
-            changed,
-            settled: true,
-        });
+    let correction = Correction::new(delta.as_slice(), &variable_scales, tol);
+    if residual_converged && correction.converged() {
+        return Ok(correction.apply(y, block, changed));
     }
 
     let update = accept_algebraic_block_delta(
