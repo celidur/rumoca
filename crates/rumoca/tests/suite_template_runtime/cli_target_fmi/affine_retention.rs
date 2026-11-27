@@ -301,3 +301,109 @@ int main(void) {
     let output = run_driver(work.path(), &headers, &compiled, model, driver);
     assert_eq!(output.trim(), "0");
 }
+
+/// A coupled affine block whose rows all carry the parameter-static gradient
+/// certificate keeps its origin linearization and reuses it while the
+/// certified parameter slots keep their bits, without forming its Jacobian
+/// again (SPEC_0044 ME-PROJ-001, `runtime::projection::affine`). Before each
+/// point the driver sets each such block's linearization flag to 2, which a
+/// formation sets to 1: a line ends in `F` when the point formed a
+/// linearization and in `R` when it reused one. At the fourth point it scales
+/// the block's first certified parameter, on the kept instance and on the
+/// fresh one alike.
+const LINEARIZATION_DRIVER: &str = r#"
+#include <stdio.h>
+static ModelInstance* fresh(bool keep) {
+    ModelInstance* m = calloc(1, sizeof *m);
+    if (!m || (keep && !rmc_keep_allocate(m))) exit(1);
+    initialize_values(m);
+    if (refresh_parameters(m) != fmi3OK) { printf("parameters failed\n"); exit(1); }
+    return m;
+}
+enum { BLOCKS = sizeof rmc_block_desc / sizeof rmc_block_desc[0] };
+static void scale_parameter(ModelInstance* m) {
+    for (size_t b = 0; b < BLOCKS; ++b)
+        if (rmc_block_desc[b].lin && rmc_block_desc[b].nlin_params > 0) { m->p[rmc_pool[rmc_block_desc[b].lin_params]] *= 1.25; return; }
+}
+static size_t* lin_flag(ModelInstance* m, size_t b) { return m->rmc_keep_s + rmc_block_desc[b].keep_s + rmc_block_desc[b].lin_s + rmc_block_desc[b].n; }
+static void point(ModelInstance* m, const double* start, unsigned k) {
+    memcpy(m->y, start, sizeof m->y);
+    for (size_t i = 0; i < RMC_STATES; ++i) m->y[i] = start[i] * (1.0 + 0.05 * k) + 0.01 * (double)(i + 1);
+    int code = refresh_algebraics(m) == fmi3OK;
+    code |= (refresh_derivative_values(m) == fmi3OK) << 1;
+    printf("%d", code); for (size_t i = 0; i < Y_LEN; ++i) printf(" %a", m->y[i]); printf("\n");
+}
+int main(void) {
+    ModelInstance* m = fresh(true);
+    double start[Y_LEN]; memcpy(start, m->y, sizeof start);
+    size_t lin = 0;
+    for (size_t b = 0; b < BLOCKS; ++b) lin += rmc_block_desc[b].lin;
+    printf("lin %zu\n", lin);
+    for (unsigned k = 1; k <= 5; ++k) {
+        if (k == 4) scale_parameter(m);
+        for (size_t b = 0; b < BLOCKS; ++b) if (rmc_block_desc[b].lin) *lin_flag(m, b) = 2;
+        point(m, start, k);
+        bool formed = false;
+        for (size_t b = 0; b < BLOCKS; ++b) if (rmc_block_desc[b].lin && *lin_flag(m, b) == 1) formed = true;
+        printf("%c\n", formed ? 'F' : 'R');
+    }
+    rmc_keep_release(m); free(m);
+    printf("fresh\n");
+    for (unsigned k = 1; k <= 5; ++k) { m = fresh(false); if (k >= 4) scale_parameter(m); point(m, start, k); free(m); }
+    return 0;
+}
+"#;
+
+/// Four nodes coupled through a parameter conductance `G`: one coupled
+/// affine block whose every row has a parameter-only gradient.
+const CERTIFIED_CHAIN: &str = "model CertifiedChain
+  parameter Real G = 2;
+  parameter Real Rm = 10;
+  Real vC[4](start={0.1, 0.2, 0.3, 0.4}, each fixed=true);
+  Real v[4];
+equation
+  (vC[1] - v[1]) * G + (v[2] - v[1]) = v[1] / Rm;
+  (v[1] - v[2]) * G + (v[3] - v[2]) * G = (v[2] - vC[2]) / Rm;
+  (v[2] - v[3]) * G + (v[4] - v[3]) = (v[3] - vC[3]) / Rm;
+  (v[3] - v[4]) * G = (v[4] - vC[4]) / Rm;
+  der(vC) = v - vC;
+end CertifiedChain;
+";
+
+#[test]
+fn a_certified_affine_block_reuses_its_linearization_while_its_parameters_hold() {
+    let Some(headers) = fmi3_headers() else {
+        return;
+    };
+    let model = "CertifiedChain";
+    let compiled = compile(model, CERTIFIED_CHAIN);
+    let states = rumoca_sim::lower_fmi_c_export_component(&compiled.dae)
+        .expect("lower the FMI C component")
+        .problem()
+        .solve_layout
+        .state_scalar_count();
+    let work = tempdir().expect("linearization work directory");
+    let driver =
+        format!("#include \"model.c\"\n#define RMC_STATES {states}\n{LINEARIZATION_DRIVER}");
+    let output = run_driver(work.path(), &headers, &compiled, model, &driver);
+    let (kept, fresh) = output
+        .split_once("fresh\n")
+        .unwrap_or_else(|| panic!("the driver prints both parts: {output}"));
+    let mut lines = kept.lines();
+    let lin = lines.next().expect("the count of reusing blocks");
+    assert_ne!(
+        lin, "lin 0",
+        "the chain's coupled block is certified: {output}"
+    );
+    let kept: Vec<&str> = lines.collect();
+    let (points, marks): (Vec<&str>, String) = kept
+        .chunks(2)
+        .map(|pair| (pair[0], pair[1].chars().next().expect("a mark")))
+        .unzip();
+    assert_eq!(
+        points,
+        fresh.lines().collect::<Vec<_>>(),
+        "the reused linearization refreshes as a formed one"
+    );
+    assert_eq!(marks, "FRRFR", "the points that formed the linearization");
+}
