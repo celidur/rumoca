@@ -68,8 +68,9 @@ and integration (including event location and stopping at time events).
   lane.
 - Functions: pure-function bodies that cannot be inlined (data-dependent
   loops, such as table interpolation or sorting) are emitted as typed
-  `__device__` functions. A failed error-level assertion inside one is
-  observed as an event root; a domain error makes that lane's results NaN.
+  `__device__` functions. A failed error-level assertion inside one fails
+  the call, which makes that lane's results NaN as a domain error does; the
+  lane does not locate it as an event.
 - Code size: the device build of the shared kernel keeps every function
   that many entries reach out of line (`__noinline__`): its program
   dispatchers, split into groups of consecutive programs; its runs of whole
