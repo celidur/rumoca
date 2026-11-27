@@ -1569,7 +1569,43 @@ typedef struct {
    contribution falls below its origin value while none overflows, and a row
    without a nonzero entry keeps its growing fallback); any other row forms
    that scale exactly. -1 error */
+{%- set origin_unrolled = device and me.blocks|selectattr("origin")|list|length > 0 %}
+{%- if origin_unrolled %}
+/* rmc_origin_converged of one coupled affine block, the pooled loops
+   unrolled over its coordinates and pattern: the same operations in the
+   same order, the block's coordinates read at once. */
+{%- for b in me.blocks %}{% if b.origin %}{% set o = b.origin %}
+{{ q }} int rmc_origin_converged_{{ loop.index0 }}(ModelInstance* m, const RmcAffineSystem* s, const double* residual, bool* converged) {
+    double vscale[{{ o.y|length }}], valid[{{ o.y|length }}], largest = 0.0;
+{%- for index in o.y %}
+    vscale[{{ loop.index0 }}] = rmc_model_scale({{ index }}, m->y[{{ index }}]); valid[{{ loop.index0 }}] = rmc_valid_scale(vscale[{{ loop.index0 }}]); largest = rmc_max(largest, valid[{{ loop.index0 }}]);
+{%- endfor %}
+    *converged = true;
+{%- for row in o.rows %}
+    {
+        double value = residual[{{ loop.index0 }}];
+        bool bounded = isfinite(s->magnitudes[{{ loop.index0 }}] * largest) && (s->derived[{{ loop.index0 }}] || s->magnitudes[{{ loop.index0 }}] == 0.0);
+        if (!(bounded && fabs(value) <= rmc_scaled_tolerance(m->rmc_tol, s->rscale[{{ loop.index0 }}]))) {
+            double scale = 0.0;{% for entry in row.entries %}
+            { double contribution = fabs(s->jac[{{ entry[0] }}]) * valid[{{ entry[1] }}]; if (isfinite(contribution)) scale = rmc_max(scale, contribution); }{% endfor %}
+            if (!(scale > 0.0)) scale = {% if row.target != 0 %}rmc_model_scale({{ row.target - 1 }}, m->y[{{ row.target - 1 }}]){% else %}vscale[{{ loop.index0 }}]{% endif %};
+            if (!isfinite(value) || fabs(value) > rmc_scaled_tolerance(m->rmc_tol, scale)) { *converged = false; return 0; }
+        }
+    }
+{%- endfor %}
+    return 0;
+}
+{%- endif %}{% endfor %}
+{%- endif %}
 {{ q }} int rmc_origin_converged(ModelInstance* m, const RmcBlock* b, const RmcAffineSystem* s, const double* residual, bool* converged) {
+{%- if origin_unrolled %}
+    switch (b->id) {
+{%- for b in me.blocks %}{% if b.origin %}
+    case {{ loop.index0 }}: return rmc_origin_converged_{{ loop.index0 }}(m, s, residual, converged);
+{%- endif %}{% endfor %}
+    default: break;
+    }
+{%- endif %}
     const size_t b_n = RMC_BS(b, n); const size_t* const b_y_pool = RMC_BP(b, y); const size_t* const b_row_ptr_pool = RMC_BP(b, row_ptr); const size_t* const b_col_idx_pool = RMC_BP(b, col_idx); const size_t* const b_row_target_pool = RMC_BP(b, row_target);
     RMC_MARK; size_t n = b_n; double largest = 0.0;
     double* vscale = rmc_dalloc_raw(m, n); double* valid = rmc_dalloc_raw(m, n);

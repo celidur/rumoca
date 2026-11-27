@@ -209,6 +209,24 @@ fn a_device_unit_unrolls_the_elimination_of_an_affine_block() {
     );
 }
 
+/// A device unit unrolls the origin convergence test of a coupled affine
+/// block over its coordinates and pattern: through it, the lanes of
+/// `a_device_build_refreshes_every_lane_as_the_fmi_component` refresh as the
+/// FMI component, whose C keeps the pooled loops, bit for bit.
+#[test]
+fn a_device_unit_unrolls_the_origin_test_of_an_affine_block() {
+    let mut unrolled = Vec::new();
+    for (compiled, model) in models() {
+        if device_unit(&compiled).contains(": return rmc_origin_converged_") {
+            unrolled.push(model);
+        }
+    }
+    assert!(
+        unrolled.contains(&"DeviceAffineSplit") && unrolled.contains(&"DeviceAffineChain"),
+        "the coupled affine blocks unroll their origin test: {unrolled:?}"
+    );
+}
+
 /// A lowered model reaches the device kernel through the admission of the C
 /// component: one whose initial vector disagrees with its layout is refused
 /// before any unit is rendered, with the component's reason.
