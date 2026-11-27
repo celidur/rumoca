@@ -296,11 +296,12 @@ typedef unsigned long long uint64_t;
 {%- set init = none if shared_init else lanes.initialization %}
 {%- set starts = lanes.starts %}
 {%- set nroots = ev.event_roots | length %}
+{%- set ncross = ev.crossings | length %}
 
 #define {{ NAME }}_Y_LEN {{ y_len }}
 #define {{ NAME }}_P_LEN {{ p_len }}
 #define {{ NAME }}_STATE_COUNT {{ state_count }}
-#define {{ NAME }}_EVENT_INDICATORS {{ nroots }}
+#define {{ NAME }}_EVENT_INDICATORS {{ nroots + ncross }}
 #define {{ NAME }}_TIME_EVENTS {{ ev.time_events | length }}
 #define {{ NAME }}_DELAYS {{ delays.count }}
 // Blocks of the retained state manifold. When it is not 0, launch
@@ -835,8 +836,13 @@ __device__ int {{ name }}_event_iterate(double time, double *batch_y, double *ba
             return -1;
         }
         int changed = 0;
-{%- if nroots > 0 %}
+{%- if nroots + ncross > 0 %}
         {{ name }}_roots(time, batch_y, batch_p, roots);
+{%- for crossing in ev.crossings %}
+        if (!isfinite(roots[{{ crossing.root }}])) {
+            return -1;
+        }
+{%- endfor %}
         for (int k = 0; k < {{ nroots }}; ++k) {
             double root = roots[root_index[k]];
             if (!isfinite(root)) {
@@ -902,7 +908,7 @@ extern "C" __global__ void {{ name }}_event_indicators_batch(
     double *batch_z = z + ((long long)batch * (long long)z_stride);
     (void)batch_z;
     (void){{ name }}_refresh(time, batch_y, batch_p);
-{%- if nroots > 0 %}
+{%- if nroots + ncross > 0 %}
     double roots[{{ [ev.root_count, 1] | max }}];
     {{ name }}_roots(time, batch_y, batch_p, roots);
 {%- for event_root in ev.event_roots %}
@@ -918,6 +924,17 @@ extern "C" __global__ void {{ name }}_event_indicators_batch(
 {%- endif %}
         }
         batch_z[{{ loop.index0 }}] = value;
+    }
+{%- endfor %}
+{%- for crossing in ev.crossings %}
+    {
+        double value = roots[{{ crossing.root }}];
+{%- if crossing.zero != 0 %}
+        if (value == 0.0) {
+            value = {{ "" if crossing.zero > 0 else "-" }}2.220446049250313e-16;
+        }
+{%- endif %}
+        batch_z[{{ nroots + loop.index0 }}] = value;
     }
 {%- endfor %}
 {%- endif %}

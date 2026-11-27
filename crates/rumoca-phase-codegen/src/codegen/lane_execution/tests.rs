@@ -176,9 +176,8 @@ fn a_row_block_keeps_the_row_of_each_output() {
 }
 
 #[test]
-fn a_root_without_a_relation_memory_is_refused() {
-    // A plain crossing is never re-encoded by the event iteration, and no
-    // lane kernel would report it.
+fn a_root_without_a_relation_memory_is_a_reported_crossing() {
+    // The event iteration never re-encodes it; the host locates it.
     let mut problem = solve::SolveProblem::default();
     problem.events.root_conditions = solve::ScalarProgramBlock::with_output_indices(
         vec![affine_binding(0, 1.0, -1.0)],
@@ -187,11 +186,22 @@ fn a_root_without_a_relation_memory_is_refused() {
     )
     .expect("one root");
     problem.events.root_relation_memory_targets = vec![None];
-    problem.events.root_zero_domains = vec![solve::RootZeroDomain::Previous];
-    let error = events_value(&problem, None).expect_err("the root is refused");
-    assert!(
-        error.to_string().contains("no relation memory"),
-        "unexpected refusal: {error}"
+    problem.events.root_zero_domains = vec![solve::RootZeroDomain::Positive];
+    let events = events_value(&problem, None).expect("the root is admitted");
+    let crossings = events
+        .get_attr("crossings")
+        .expect("crossings")
+        .try_iter()
+        .expect("a list")
+        .collect::<Vec<_>>();
+    assert_eq!(crossings.len(), 1);
+    assert_eq!(
+        crossings[0].get_attr("root").expect("root").as_usize(),
+        Some(0)
+    );
+    assert_eq!(
+        events.get_attr("event_roots").expect("event roots").len(),
+        Some(0)
     );
 }
 
