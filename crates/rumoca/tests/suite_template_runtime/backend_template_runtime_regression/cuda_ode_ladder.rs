@@ -449,3 +449,75 @@ int main() {{
         "execute CUDA ODE shared delay emulation",
     );
 }
+
+/// A lane's instance views the caller's coordinate and parameters instead of
+/// copying them in and out at every entry: after a derivative evaluation, the
+/// instance of each lane points at that lane's slices, which hold the
+/// settled algebraic slots.
+#[test]
+fn cuda_ode_lane_instances_view_the_lane_arrays() {
+    let (directory, path, _) = ladder_source();
+    let harness = directory.path().join("views.cpp");
+    fs::write(
+        &harness,
+        format!(
+            r#"#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+struct Dim3 {{ int x; }};
+static Dim3 blockIdx, blockDim, threadIdx;
+#define __global__
+#define __host__
+#define __device__
+#include {path:?}
+static_assert(sizeof(((ModelInstance*)nullptr)->y) == sizeof(double*), "the instance holds a view of y");
+static_assert(sizeof(((ModelInstance*)nullptr)->p) == sizeof(double*), "the instance holds a view of p");
+
+int main() {{
+    enum {{ LANES = 2, NY = RLCLADDER_LADDER_Y_LEN, NP = RLCLADDER_LADDER_P_LEN, NS = RLCLADDER_LADDER_STATE_COUNT }};
+    static double y[LANES * NY], p[LANES * NP], out[LANES * NS];
+    int status[LANES] = {{-1, -1}};
+    blockDim.x = 1; threadIdx.x = 0;
+    void *lanes = std::malloc(LANES * RLCLADDER_LADDER_LANE_WORKSPACE_BYTES);
+    for (int l = 0; l < LANES; ++l) {{ blockIdx.x = l; RlcLadder_Ladder_workspace_init_batch(lanes, LANES); }}
+    for (int l = 0; l < LANES; ++l) {{
+        blockIdx.x = l;
+        RlcLadder_Ladder_load_starts_batch(y, p, NY, NP, LANES);
+        RlcLadder_Ladder_initialize_batch(0.0, y, p, status, NY, NP, LANES);
+    }}
+    for (int l = 0; l < LANES; ++l) {{
+        blockIdx.x = l;
+        RlcLadder_Ladder_rhs_batch(1e-3, y, p, out, status, NY, NP, NS, LANES);
+        const ModelInstance *m = (const ModelInstance *)lanes + l;
+        if (status[l] != 0 || m->y != y + l * NY || m->p != p + l * NP) {{
+            std::printf("lane %d: status %d, views %d %d\n", l, status[l], m->y == y + l * NY, m->p == p + l * NP);
+            return 1;
+        }}
+    }}
+    if (std::memcmp(y, y + NY, sizeof(double) * NY) != 0) {{
+        std::printf("two lanes from one start differ\n");
+        return 1;
+    }}
+    std::free(lanes);
+    return 0;
+}}
+"#
+        ),
+    )
+    .expect("write views harness");
+    let executable = directory.path().join("cuda-ode-views");
+    run_checked(
+        Command::new("c++")
+            .args(["-std=c++17", "-Wall", "-Wextra", "-Werror"])
+            .arg(&harness)
+            .arg("-o")
+            .arg(&executable)
+            .current_dir(directory.path()),
+        "compile CUDA ODE lane views emulation",
+    );
+    run_checked(
+        &mut Command::new(executable),
+        "execute CUDA ODE lane views emulation",
+    );
+}

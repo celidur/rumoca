@@ -338,7 +338,7 @@ const double {{ name }}_time_events[{{ ev.time_events | length }}] = { {% for ti
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-function"
 #endif
-{{ device_instance(solve, me_refresh, "rmc") }}
+{{ device_instance(solve, me_refresh, "rmc", views=true, settled=shared and (delays.settle_times or delays.settle_sources)) }}
 // The lane's parameter bindings, as the linked runtime applies them
 // (`SolveBindingExecution`). No discrete equation settles with them: the
 // initial event iteration settles the discrete rows after initialization.
@@ -413,19 +413,12 @@ extern "C" __global__ void {{ name }}_project_states_batch(
     const double *batch_p = p + ((long long)batch * (long long)p_stride);
     ModelInstance *m = {{ name }}_lane_instances + RUMOCA_LANE_INDEX;
     m->time = time;
-    for (int i = 0; i < {{ y_len }}; ++i) {
-        m->y[i] = batch_y[i];
-    }
-    for (int i = 0; i < {{ p_len }}; ++i) {
-        m->p[i] = batch_p[i];
-    }
+    // The lane's own arrays: the projection moves only the states, and
+    // restores them when it fails.
+    m->y = batch_y;
+    m->p = (double *)batch_p;
     bool changed = false;
     int failed = rmc_project_state_manifold(m, m->rmc_tol, &changed) != 0;
-    if (changed && !failed) {
-        for (int i = 0; i < {{ state_count }}; ++i) {
-            batch_y[i] = m->y[i];
-        }
-    }
     if (status) {
         status[batch] = failed;
     }
@@ -447,18 +440,12 @@ __device__ __noinline__ int {{ name }}_refresh(double time, double *batch_y, con
 {%- if shared %}
     ModelInstance *m = {{ name }}_lane_instances + RUMOCA_LANE_INDEX;
     m->time = time;
-    for (int i = 0; i < {{ y_len }}; ++i) {
-        m->y[i] = batch_y[i];
-    }
-    for (int i = 0; i < {{ p_len }}; ++i) {
-        m->p[i] = batch_p[i];
-    }
+    // The lane's own arrays: the refresh settles the algebraic slots in
+    // place and writes no parameter (a lane's bindings are settled).
+    m->y = batch_y;
+    m->p = (double *)batch_p;
     m->assertion_failed = false;
-    int failed = refresh_algebraics{{ "_plan" if me_refresh.seed_rule == "CommittedAcceptedPoint" else "" }}(m) != rmcOK || m->assertion_failed;
-    for (int i = 0; i < {{ y_len }}; ++i) {
-        batch_y[i] = m->y[i];
-    }
-    return failed;
+    return refresh_algebraics{{ "_plan" if me_refresh.seed_rule == "CommittedAcceptedPoint" else "" }}(m) != rmcOK || m->assertion_failed;
 {%- elif exact_refresh %}
 {{ programs(alg, out="batch_y") }}
     return 0;
@@ -883,20 +870,9 @@ __device__ __noinline__ int {{ name }}_initial_projection(double time, double *b
     m->parameters_dirty = false;
     m->rmc_nonfinite = false;
     m->assertion_failed = false;
-    for (int i = 0; i < {{ y_len }}; ++i) {
-        m->y[i] = batch_y[i];
-    }
-    for (int i = 0; i < {{ p_len }}; ++i) {
-        m->p[i] = batch_p[i];
-    }
-    int failed = rmc_initialize(m, {{ NAME }}_INIT_TOLERANCE) != rmcOK || m->assertion_failed;
-    for (int i = 0; i < {{ y_len }}; ++i) {
-        batch_y[i] = m->y[i];
-    }
-    for (int i = 0; i < {{ p_len }}; ++i) {
-        batch_p[i] = m->p[i];
-    }
-    return failed;
+    m->y = batch_y;
+    m->p = batch_p;
+    return rmc_initialize(m, {{ NAME }}_INIT_TOLERANCE) != rmcOK || m->assertion_failed;
 }
 {%- else %}
 // Parameter and start bindings, the algebraic refresh, and the initial
@@ -1096,33 +1072,24 @@ __device__ int {{ name }}_delay_reads_current(const double *history, double time
     return count <= 0 || delay_time == 0.0 || time - delay_time >= history[2 + (head + count - 1) % capacity];
 }
 
+{%- if delays.settle_times or delays.settle_sources %}
+
 // The lane's coordinate with its algebraic slots settled, for the delay rows
-// that read them: {% if shared %}the coordinate of the lane's kernel instance
-// after its refresh (`scratch` is unused){% else %}`scratch` holds a settled
-// copy of `batch_y`{% endif %}.
+// that read them: a settled copy of `batch_y`, {% if shared %}held by the lane's kernel
+// instance (`scratch` is unused){% else %}in `scratch`{% endif %}.
 __device__ const double *{{ name }}_delay_settle(double time, const double *batch_y, const double *batch_p, double *scratch)
 {
 {%- if shared %}
     (void)scratch;
-    ModelInstance *m = {{ name }}_lane_instances + RUMOCA_LANE_INDEX;
-    m->time = time;
-    for (int i = 0; i < {{ y_len }}; ++i) {
-        m->y[i] = batch_y[i];
-    }
-    for (int i = 0; i < {{ p_len }}; ++i) {
-        m->p[i] = batch_p[i];
-    }
-    m->assertion_failed = false;
-    (void)refresh_algebraics{{ "_plan" if me_refresh.seed_rule == "CommittedAcceptedPoint" else "" }}(m);
-    return m->y;
-{%- else %}
+    scratch = ({{ name }}_lane_instances + RUMOCA_LANE_INDEX)->rmc_settled_y;
+{%- endif %}
     for (int i = 0; i < {{ y_len }}; ++i) {
         scratch[i] = batch_y[i];
     }
     (void){{ name }}_refresh(time, scratch, batch_p);
     return scratch;
-{%- endif %}
 }
+{%- endif %}
 
 __device__ void {{ name }}_delay_append(double *history, double time, const double *sources)
 {
