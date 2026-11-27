@@ -82,6 +82,32 @@ fn lane_seed_loads_are_checked_in_their_own_units() {
     assert!(check_seed_loads(0, &tensor(seed_len - 1), seed_len, lanes).is_err());
 }
 
+/// The lane seed array a block needs ends one past the last position its
+/// lane programs read: a `LoadSeed` index is a position, a tensor load covers
+/// its seeds' positions in every lane.
+#[test]
+fn the_lane_seed_extent_is_one_past_the_last_position_read() {
+    use rumoca_ir_solve::{LinearOp, TensorInputKind};
+
+    use super::block::seed_extent;
+
+    let lanes = 3;
+    let load = |index| LinearOp::LoadSeed { dst: 0, index };
+    let tensor = |seed_start, count| LinearOp::TensorLoad {
+        dst_start: 0,
+        input: TensorInputKind::Y,
+        input_start: 0,
+        count,
+        seed_start: Some(seed_start),
+        lanes: lanes + 1,
+    };
+    assert_eq!(seed_extent(&[]), 0);
+    assert_eq!(seed_extent(&[load(7)]), 8);
+    // Seeds 2 and 3 in three lanes: positions 6 to 11.
+    assert_eq!(seed_extent(&[tensor(2, 2)]), 12);
+    assert_eq!(seed_extent(&[load(20), tensor(2, 2), load(4)]), 21);
+}
+
 /// A dispatched program stays out of line past the inlining bound only, so a
 /// small program may be inlined into its case and a large one keeps its own
 /// function.
