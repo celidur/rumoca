@@ -821,9 +821,9 @@ __device__ int {{ name }}_event_iterate(double time, double *batch_y, double *ba
 {
     double roots[{{ [ev.root_count, 1] | max }}];
     double values[{{ [ev.discrete_count, 1] | max }}];
-    const int root_index[{{ [nroots, 1] | max }}] = {{ int_list(ev.event_roots | map(attribute="root") | list) }};
-    const int memory[{{ [nroots, 1] | max }}] = {{ int_list(ev.event_roots | map(attribute="memory") | list) }};
-    const int zero[{{ [nroots, 1] | max }}] = {{ int_list(ev.event_roots | map(attribute="zero") | list) }};
+    static const int root_index[{{ [nroots, 1] | max }}] = {{ int_list(ev.event_roots | map(attribute="root") | list) }};
+    static const int memory[{{ [nroots, 1] | max }}] = {{ int_list(ev.event_roots | map(attribute="memory") | list) }};
+    static const int zero[{{ [nroots, 1] | max }}] = {{ int_list(ev.event_roots | map(attribute="zero") | list) }};
     (void)roots;
     (void)values;
     (void)root_index;
@@ -1261,7 +1261,7 @@ extern "C" __global__ void {{ name }}_delay_init_batch(
 {%- if delays.count > 0 %}
     batch_history[0] = 0.0;
     batch_history[1] = 0.0;
-    const int value_parameter[{{ delays.count }}] = {{ int_list(delays.value_parameters) }};
+    static const int value_parameter[{{ delays.count }}] = {{ int_list(delays.value_parameters) }};
     double sources[{{ delays.count }}];
     // The delayed values feed the rows their sources read: settle the
     // start-time fixed point a few times.
@@ -1307,8 +1307,8 @@ extern "C" __global__ void {{ name }}_delay_apply_batch(
     (void)batch_p;
     (void)batch_history;
 {%- if delays.count > 0 %}
-    const int value_parameter[{{ delays.count }}] = {{ int_list(delays.value_parameters) }};
-    const int discrete[{{ delays.count }}] = {{ int_list(delays.discrete) }};
+    static const int value_parameter[{{ delays.count }}] = {{ int_list(delays.value_parameters) }};
+    static const int discrete[{{ delays.count }}] = {{ int_list(delays.discrete) }};
     double delay_time[{{ delays.count }}];
     double delay_max[{{ delays.count }}];
     double sources[{{ delays.count }}];
