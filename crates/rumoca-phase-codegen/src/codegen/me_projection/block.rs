@@ -155,6 +155,94 @@ pub(super) struct BlockRecord {
     /// Whether every row of a coupled affine block carries the certificate.
     #[serde(skip)]
     lin_certified: bool,
+    /// The elimination solve of an eliminating block with no promoted step,
+    /// unrolled for a device unit (`EliminationSolve`).
+    elim_solve: Option<EliminationSolve>,
+}
+
+/// `rmc_eliminate_solve` of one eliminating affine block with no promoted
+/// step, its pools unrolled: the causal steps in order, each with its row,
+/// solved column, pivot entry and the other entries of its row as `(entry,
+/// column)` in pattern order; the reduced residual rows with all their
+/// entries; and the tear columns. A device unit renders it as straight-line
+/// code with the operations of the pooled loops in their order.
+#[derive(Serialize)]
+pub(super) struct EliminationSolve {
+    n: usize,
+    capacity: usize,
+    steps: Vec<EliminationStep>,
+    residuals: Vec<EliminationRow>,
+    tears: Vec<usize>,
+}
+
+#[derive(Serialize)]
+struct EliminationStep {
+    row: usize,
+    target: usize,
+    pivot: Option<usize>,
+    entries: Vec<(usize, usize)>,
+}
+
+#[derive(Serialize)]
+struct EliminationRow {
+    row: usize,
+    entries: Vec<(usize, usize)>,
+}
+
+/// Entries an unrolled elimination solve may hold: larger blocks keep the
+/// pooled loops, whose code does not grow with the block.
+const UNROLLED_ELIMINATION_ENTRIES: usize = 1024;
+
+fn elimination_solve(
+    csr: &Csr,
+    layout: &solve::AffineEliminationLayout,
+    n: usize,
+    capacity: usize,
+) -> Option<EliminationSolve> {
+    let row_entries = |row: usize| {
+        (csr.row_ptr[row]..csr.row_ptr[row + 1])
+            .map(|entry| (entry, csr.col_idx[entry]))
+            .collect::<Vec<_>>()
+    };
+    let steps: Vec<EliminationStep> = layout
+        .causal()
+        .iter()
+        .map(|&(row, target)| {
+            let all = row_entries(row);
+            EliminationStep {
+                row,
+                target,
+                pivot: all
+                    .iter()
+                    .find(|&&(_, column)| column == target)
+                    .map(|&(entry, _)| entry),
+                entries: all
+                    .into_iter()
+                    .filter(|&(_, column)| column != target)
+                    .collect(),
+            }
+        })
+        .collect();
+    let residuals: Vec<EliminationRow> = layout
+        .residuals()
+        .iter()
+        .map(|&row| EliminationRow {
+            row,
+            entries: row_entries(row),
+        })
+        .collect();
+    let terms = steps
+        .iter()
+        .map(|step| step.entries.len() + layout.tears().len())
+        .sum::<usize>()
+        + residuals.iter().map(|row| row.entries.len()).sum::<usize>();
+    (terms <= UNROLLED_ELIMINATION_ENTRIES).then(|| EliminationSolve {
+        n,
+        capacity,
+        steps,
+        residuals,
+        tears: layout.tears().to_vec(),
+    })
 }
 
 pub(super) fn refuse(canonical: usize, reason: &str) -> CodegenError {
@@ -1024,6 +1112,7 @@ fn record_elimination(
             .flat_map(|&(holder, solver)| [holder, solver]),
     );
     record.elim_capacity = capacity;
+    record.elim_solve = elimination_solve(csr, layout, n, capacity);
     Ok(())
 }
 

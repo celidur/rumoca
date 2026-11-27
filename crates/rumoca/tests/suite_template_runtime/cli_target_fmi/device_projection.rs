@@ -185,6 +185,30 @@ fn a_device_build_refreshes_every_lane_as_the_fmi_component() {
     }
 }
 
+/// A device unit unrolls the elimination solve of an eliminating affine
+/// block with no promoted step into straight-line code over its pattern,
+/// with the pooled loops kept for every other call: through it, the lanes of
+/// `a_device_build_refreshes_every_lane_as_the_fmi_component` refresh as the
+/// FMI component, whose C keeps the pooled loops, bit for bit.
+#[test]
+fn a_device_unit_unrolls_the_elimination_of_an_affine_block() {
+    let mut unrolled = Vec::new();
+    for (compiled, model) in models() {
+        let unit = device_unit(&compiled);
+        if unit.contains(": return rmc_eliminate_solve_") {
+            assert!(
+                unit.contains("if (e->k == RMC_BS(b, nelim_tear))"),
+                "{model}: an unrolled solve serves only a call with no promoted step"
+            );
+            unrolled.push(model);
+        }
+    }
+    assert!(
+        unrolled.contains(&"DeviceAffineSplit"),
+        "the eliminating affine block unrolls its solve: {unrolled:?}"
+    );
+}
+
 /// A lowered model reaches the device kernel through the admission of the C
 /// component: one whose initial vector disagrees with its layout is refused
 /// before any unit is rendered, with the component's reason.
