@@ -1194,11 +1194,15 @@ __device__ void {{ name }}_delay_locate(const double *history, double time, doub
 #undef {{ NAME }}_AT
     place->points = points;
     if (points >= 3) {
+        double distance[4];
+        for (int j = 0; j < points; ++j) {
+            distance[j] = query - stencil_time[j];
+        }
         for (int i = 0; i < points; ++i) {
             double weight = 1.0;
             for (int j = 0; j < points; ++j) {
                 if (j != i) {
-                    weight *= (query - stencil_time[j]) / (stencil_time[i] - stencil_time[j]);
+                    weight *= distance[j] / (stencil_time[i] - stencil_time[j]);
                 }
             }
             place->weight[i] = weight;
@@ -1227,24 +1231,26 @@ __device__ double {{ name }}_delay_read(const double *history, int channel, doub
     if (place->kind == {{ NAME }}_DELAY_FIRST) {
         return place->dropped ? NAN : values[place->slot[0]];
     }
-    double lower_value = values[place->slot[place->lower]];
     if (discrete || place->kind == {{ NAME }}_DELAY_LEFT) {
-        return lower_value;
+        return values[place->slot[place->lower]];
     }
-    int next_slot = place->slot[place->lower + 1];
-    double next_value = next_slot < 0 ? current : values[next_slot];
     if (place->kind == {{ NAME }}_DELAY_NEXT) {
-        return next_value;
+        return place->slot[1] < 0 ? current : values[place->slot[1]];
     }
+    double point[4];
+    for (int i = 0; i < place->points; ++i) {
+        point[i] = place->slot[i] < 0 ? current : values[place->slot[i]];
+    }
+    double lower_value = point[place->lower];
+    double next_value = point[place->lower + 1];
     if (place->points >= 3) {
         // Offsets from the lower point, so that a constant run reads back
         // exactly.
         int finite = 1;
         double offset = -0.0;
         for (int i = 0; i < place->points; ++i) {
-            double point = place->slot[i] < 0 ? current : values[place->slot[i]];
-            finite = finite && isfinite(point);
-            offset += place->weight[i] * (point - lower_value);
+            finite = finite && isfinite(point[i]);
+            offset += place->weight[i] * (point[i] - lower_value);
         }
         double value = lower_value + offset;
         if (finite && isfinite(value)) {
@@ -1381,6 +1387,10 @@ extern "C" __global__ void {{ name }}_delay_apply_batch(
 {%- if delays.count > 0 %}
     static const int value_parameter[{{ delays.count }}] = {{ int_list(delays.value_parameters) }};
     static const int discrete[{{ delays.count }}] = {{ int_list(delays.discrete) }};
+    // The channels in groups of one delay-time row, which ask at one instant:
+    // group `g` ends before `group_end[g]` in `member`.
+    static const int member[{{ delays.count }}] = {{ int_list(delays.time_members) }};
+    static const int group_end[{{ delays.time_group_ends | length }}] = {{ int_list(delays.time_group_ends) }};
     double delay_time[{{ delays.count }}];
 {%- if delays.distinct_maxima %}
     double delay_max[{{ delays.count }}];
@@ -1403,31 +1413,32 @@ extern "C" __global__ void {{ name }}_delay_apply_batch(
 {%- endif %}
 {%- if delays.settle_sources and not delays.settle_times %}
     int current = 0;
-    for (int channel = 0; channel < {{ delays.count }}; ++channel) {
-        current |= {{ name }}_delay_reads_current(batch_history, time, delay_time[channel]);
+    for (int group = 0, first = 0; group < {{ delays.time_group_ends | length }}; first = group_end[group++]) {
+        current |= {{ name }}_delay_reads_current(batch_history, time, delay_time[member[first]]);
     }
     if (current) {
         view = {{ name }}_delay_settle(time, batch_y, batch_p, scratch);
     }
 {%- endif %}
     {{ name }}_delay_sources(time, view, batch_p, sources);
-    // A channel asking at one of the last four instants placed takes that
-    // place in the history's times: the channels of one delay time ask at
-    // one instant, and those of a few delay times often alternate.
+    // A group asking at one of the last four instants placed takes that
+    // place in the history's times: the groups of a few delay times often
+    // alternate.
     double placed[4] = {NAN, NAN, NAN, NAN};
     {{ name }}_delay_place places[4];
     int oldest = 0;
-    for (int channel = 0; channel < {{ delays.count }}; ++channel) {
+    for (int group = 0, first = 0; group < {{ delays.time_group_ends | length }}; ++group) {
+        const double delay = delay_time[member[first]];
         // A delay time outside [0, delayMax], which the runtime refuses, has
         // no value: the lane reads NaN, which its derivatives carry to the host.
 {%- if not delays.distinct_maxima %}
         // Every delayMax row is its delay-time row here, so the maximum is
         // the delay time itself.
 {%- endif %}
-        double value = NAN;
-        if (isfinite(delay_time[channel]) && delay_time[channel] >= 0.0{% if delays.distinct_maxima %} && isfinite(delay_max[channel]) && delay_max[channel] >= delay_time[channel]{% endif %}) {
-            double query = time - delay_time[channel];
-            int place = 0;
+        const int timed = isfinite(delay) && delay >= 0.0;
+        int place = 0;
+        if (timed) {
+            double query = time - delay;
             if (query == placed[0]) {
                 place = 0;
             } else if (query == placed[1]) {
@@ -1442,9 +1453,15 @@ extern "C" __global__ void {{ name }}_delay_apply_batch(
                 {{ name }}_delay_locate(batch_history, time, query, &places[place]);
                 placed[place] = query;
             }
-            value = {{ name }}_delay_read(batch_history, channel, delay_time[channel], sources[channel], discrete[channel], &places[place]);
         }
-        batch_p[value_parameter[channel]] = value;
+        for (; first < group_end[group]; ++first) {
+            const int channel = member[first];
+            double value = NAN;
+            if (timed{% if delays.distinct_maxima %} && isfinite(delay_max[channel]) && delay_max[channel] >= delay{% endif %}) {
+                value = {{ name }}_delay_read(batch_history, channel, delay, sources[channel], discrete[channel], &places[place]);
+            }
+            batch_p[value_parameter[channel]] = value;
+        }
     }
 {%- endif %}
 }

@@ -1,17 +1,35 @@
-//! cuda-ode delays: channels that ask at one instant share its place in the
-//! history's times and the stencil over them, and channels of a few delay
-//! times take the places of the last instants placed.
+//! cuda-ode delays: the channels of one delay-time row are read together at
+//! the place of their instant in the history's times, with the stencil over
+//! them, and rows of a few delay times take the places of the last instants
+//! placed.
 
 use super::{rendered_model_target, run_checked};
 use rumoca::Compiler;
 use std::fs;
 use std::process::Command;
 
-/// Channels of eight delay times, in an order that takes each of the four
-/// kept places and asks again at an instant the kernel no longer keeps. The
-/// last three ask beside a jump of the history and past its last point.
+/// Channels of eight delay times, each from a parameter of its own, in an
+/// order that takes each of the four kept places and asks again at an instant
+/// the kernel no longer keeps; three of them ask beside a jump of the history
+/// and past its last point. The last two channels share the parameter of an
+/// earlier one, and are read with it.
 const PLACES: &str = r#"
 model DelayPlaces
+  parameter Real t1 = 0.002;
+  parameter Real t2 = 0.0005;
+  parameter Real t3 = 0.002;
+  parameter Real t4 = 0.001;
+  parameter Real t5 = 0.0015;
+  parameter Real t6 = 0.0007;
+  parameter Real t7 = 0.0005;
+  parameter Real t8 = 0.0015;
+  parameter Real t9 = 0.0021;
+  parameter Real t10 = 0.0021;
+  parameter Real t11 = 0.0015;
+  parameter Real t12 = 0.0005;
+  parameter Real t13 = 0.0019;
+  parameter Real t14 = 0.00003;
+  parameter Real t15 = 0.00003;
   Real x(start = 1, fixed = true);
   Real w(start = 0, fixed = true);
   Real d1;
@@ -29,24 +47,28 @@ model DelayPlaces
   Real d13;
   Real d14;
   Real d15;
+  Real d16;
+  Real d17;
 equation
   der(x) = -x;
   der(w) = 1;
-  d1 = delay(x, 0.002);
-  d2 = delay(w, 0.0005);
-  d3 = delay(w, 0.002);
-  d4 = delay(x, 0.001);
-  d5 = delay(w, 0.0015);
-  d6 = delay(x, 0.0007);
-  d7 = delay(x, 0.0005);
-  d8 = delay(x, 0.0015);
-  d9 = delay(x, 0.0021);
-  d10 = delay(w, 0.0021);
-  d11 = delay(w, 0.0015);
-  d12 = delay(w, 0.0005);
-  d13 = delay(x, 0.0019);
-  d14 = delay(w, 0.00003);
-  d15 = delay(x, 0.00003);
+  d1 = delay(x, t1);
+  d2 = delay(w, t2);
+  d3 = delay(w, t3);
+  d4 = delay(x, t4);
+  d5 = delay(w, t5);
+  d6 = delay(x, t6);
+  d7 = delay(x, t7);
+  d8 = delay(x, t8);
+  d9 = delay(x, t9);
+  d10 = delay(w, t10);
+  d11 = delay(w, t11);
+  d12 = delay(w, t12);
+  d13 = delay(x, t13);
+  d14 = delay(w, t14);
+  d15 = delay(x, t15);
+  d16 = delay(w, t1);
+  d17 = delay(x, t13);
 end DelayPlaces;
 "#;
 
@@ -103,10 +125,10 @@ static double sampled(const double *times, const double *values, int count, doub
 }
 
 int main() {
-    enum { CHANNELS = 15 };
-    static const char *names[CHANNELS] = {"d1", "d2", "d3", "d4", "d5", "d6", "d7", "d8", "d9", "d10", "d11", "d12", "d13", "d14", "d15"};
-    static const int of_x[CHANNELS] = {1, 0, 0, 1, 0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 1};
-    static const double delays[CHANNELS] = {0.002, 0.0005, 0.002, 0.001, 0.0015, 0.0007, 0.0005, 0.0015, 0.0021, 0.0021, 0.0015, 0.0005, 0.0019, 0.00003, 0.00003};
+    enum { CHANNELS = 17 };
+    static const char *names[CHANNELS] = {"d1", "d2", "d3", "d4", "d5", "d6", "d7", "d8", "d9", "d10", "d11", "d12", "d13", "d14", "d15", "d16", "d17"};
+    static const int of_x[CHANNELS] = {1, 0, 0, 1, 0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 1, 0, 1};
+    static const double delays[CHANNELS] = {0.002, 0.0005, 0.002, 0.001, 0.0015, 0.0007, 0.0005, 0.0015, 0.0021, 0.0021, 0.0015, 0.0005, 0.0019, 0.00003, 0.00003, 0.002, 0.0019};
     const int x = slot("x"), w = slot("w");
     if (x < 0 || w < 0) { std::printf("missing slots\n"); return 1; }
     enum { STEPS = 40, SAMPLES = STEPS + 1 };
@@ -160,6 +182,12 @@ fn cuda_ode_lanes_place_alternating_delay_times_in_the_history() {
         .iter()
         .find(|file| file.path.ends_with("_ode.cu"))
         .expect("cuda-ode emits its kernel");
+    // Seventeen channels of fifteen delay-time rows.
+    assert!(
+        source.content.contains("static const int member[17] = ")
+            && source.content.contains("static const int group_end[15] = "),
+        "the channels of one delay-time row form one group"
+    );
     let path = directory.path().join("delays.cpp");
     let prelude = "#include <cmath>\n#include <cstdio>\n#include <cstdlib>\n#include <cstring>\n\
         struct Dim3 { int x; };\nstatic Dim3 blockIdx, blockDim, threadIdx;\n\

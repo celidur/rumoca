@@ -440,6 +440,25 @@ fn delays_value(
             "delay rows are not aligned with their slots",
         ));
     }
+    let time_groups = delay_time_groups(&delays.delay_time_rhs);
+    if time_groups.iter().map(Vec::len).sum::<usize>() != count
+        || time_groups
+            .iter()
+            .flatten()
+            .any(|channel| *channel >= count)
+    {
+        return Err(refuse(
+            "runtime_events",
+            "delay rows are not aligned with their slots",
+        ));
+    }
+    let time_group_ends = time_groups
+        .iter()
+        .scan(0, |end, group| {
+            *end += group.len();
+            Some(*end)
+        })
+        .collect::<Vec<_>>();
     // The rows that read an algebraic slot read it settled; the others read
     // the lane's coordinate as it is.
     let algebraic: std::collections::BTreeSet<usize> =
@@ -461,10 +480,48 @@ fn delays_value(
             || delays.delay_max_rhs.output_indices() != delays.delay_time_rhs.output_indices(),
         source => source,
         delay_time => delay_time,
+        time_members => time_groups.concat(),
+        time_group_ends => time_group_ends,
         delay_max => delay_max,
         value_parameters => delays.value_parameter_indices.clone(),
         discrete => delays.source_is_discrete.iter().map(|discrete| u8::from(*discrete)).collect::<Vec<_>>(),
     })
+}
+
+/// The delay channels in groups of one delay-time row: channels whose rows
+/// are the same program, at the same output of it, read the same delay time.
+/// The groups keep the order of their first channels.
+fn delay_time_groups(block: &solve::ScalarProgramBlock) -> Vec<Vec<usize>> {
+    let indices = block.output_indices();
+    let mut leads: Vec<(usize, usize)> = Vec::new();
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut by_text: std::collections::HashMap<(String, usize), Vec<usize>> =
+        std::collections::HashMap::new();
+    for (index, program) in block.programs().iter().enumerate() {
+        let Some(ordinals) = block.program_output_ordinals(index) else {
+            continue;
+        };
+        for (offset, ordinal) in ordinals.enumerate() {
+            let Some(&channel) = indices.get(ordinal) else {
+                continue;
+            };
+            // The text only buckets the candidates; the programs decide.
+            let candidates = by_text.entry((format!("{program:?}"), offset)).or_default();
+            let group = candidates.iter().copied().find(|group| {
+                let (lead, lead_offset) = leads[*group];
+                lead_offset == offset && block.programs()[lead] == *program
+            });
+            match group {
+                Some(group) => groups[group].push(channel),
+                None => {
+                    candidates.push(groups.len());
+                    leads.push((index, offset));
+                    groups.push(vec![channel]);
+                }
+            }
+        }
+    }
+    groups
 }
 
 /// Whether `program` reads one of `slots` (`column` `"y"` or `"p"`).
