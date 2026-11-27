@@ -17,6 +17,7 @@ mod chart_block_folds;
 mod chart_switching;
 mod co_simulation_step;
 mod declared_causality;
+mod dense_scalar;
 mod derivative_kinks;
 mod device_initialization;
 mod device_projection;
