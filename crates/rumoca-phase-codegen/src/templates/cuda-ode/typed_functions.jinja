@@ -28,7 +28,7 @@
 {% for destination in op.destinations -%}
 {{ arithmetic({"operation": "constant", "destination": destination, "value": inactive_assertion_message(program.register_types[destination].scalar)}, program) -}}
 {% endfor -%}
-if (!r{{ op.condition }}[0] && obs) { obs[{{ op.predicate_output }}]=0.0;{% if assertion_outputs[op.predicate_output].role.level == "error" %} return 2;{% endif %} }
+if (!r{{ op.condition }}[0]) { if (obs) obs[{{ op.predicate_output }}]=0.0;{% if assertion_outputs[op.predicate_output].role.level == "error" %} return 2;{% endif %} }
 
 {% elif op.operation in ["constant", "unary", "binary", "broadcast_binary", "compare", "convert"] -%}
 {{ arithmetic(op, program) -}}

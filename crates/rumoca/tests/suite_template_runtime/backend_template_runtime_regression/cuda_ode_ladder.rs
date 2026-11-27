@@ -231,3 +231,221 @@ int main() {{
         "execute CUDA ODE torn-block emulation",
     );
 }
+
+#[test]
+fn cuda_ode_event_iteration_reports_a_failed_refresh() {
+    // `z * z = 1 + x` has no real root once x < -1: the shared kernel fails,
+    // and the event iteration must say so instead of handling the event on
+    // slots it could not settle.
+    let compiled = Compiler::new()
+        .model("NoRoot")
+        .compile_str(
+            r#"
+model NoRoot
+  Real x(start = 0, fixed = true);
+  Real z(start = 1);
+  Real drive;
+equation
+  der(x) = drive;
+  z * z + 0.1 * z = 1 + x;
+  drive = if x > 0.5 then -1 else 1;
+end NoRoot;
+"#,
+            "NoRoot.mo",
+        )
+        .expect("the compiler accepts the model");
+    let (directory, files) = rendered_model_target(&compiled, "NoRoot", "cuda-ode");
+    let source = files
+        .iter()
+        .find(|file| file.path.ends_with("_ode.cu"))
+        .expect("cuda-ode emits its kernel");
+    assert!(
+        source.content.contains("rmc_project_block("),
+        "the model must keep a projection block for this test to bite"
+    );
+    let harness = directory.path().join("noroot.cpp");
+    fs::write(
+        &harness,
+        format!(
+            r#"#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+struct Dim3 {{ int x; }};
+static Dim3 blockIdx, blockDim, threadIdx;
+#define __global__
+#define __host__
+#define __device__
+#include {:?}
+
+static int slot(const char *name) {{
+    for (int i = 0; i < NOROOT_Y_LEN; ++i) {{
+        if (std::strcmp(NoRoot_y_names[i], name) == 0) {{
+            return i;
+        }}
+    }}
+    return -1;
+}}
+
+int main() {{
+    blockIdx.x = 0;
+    blockDim.x = 1;
+    threadIdx.x = 0;
+    void *lanes = std::malloc(NOROOT_LANE_WORKSPACE_BYTES);
+    NoRoot_workspace_init_batch(lanes, 1);
+    double y[NOROOT_Y_LEN] = {{0.0}};
+    double p[NOROOT_P_LEN + 1] = {{0.0}};
+    int status = -1;
+    NoRoot_load_starts_batch(y, p, NOROOT_Y_LEN, NOROOT_P_LEN, 1);
+    NoRoot_initialize_batch(0.0, y, p, &status, NOROOT_Y_LEN, NOROOT_P_LEN, 1);
+    if (status != 0) {{
+        std::printf("initialize status %d\n", status);
+        return 1;
+    }}
+    int passes = 0;
+    NoRoot_event_update_batch(0.0, y, p, &passes, NOROOT_Y_LEN, NOROOT_P_LEN, 1);
+    if (passes < 1) {{
+        std::printf("settled event: passes %d\n", passes);
+        return 1;
+    }}
+    y[slot("x")] = -3.0;
+    NoRoot_event_update_batch(0.0, y, p, &passes, NOROOT_Y_LEN, NOROOT_P_LEN, 1);
+    if (passes != -1) {{
+        std::printf("failed refresh: passes %d\n", passes);
+        return 1;
+    }}
+    std::free(lanes);
+    return 0;
+}}
+"#,
+            source.path,
+        ),
+    )
+    .expect("write harness");
+    let executable = directory.path().join("cuda-ode-noroot");
+    run_checked(
+        Command::new("c++")
+            .args(["-std=c++17", "-Wall", "-Wextra", "-Werror"])
+            .arg(&harness)
+            .arg("-o")
+            .arg(&executable)
+            .current_dir(directory.path()),
+        "compile CUDA ODE failed-refresh emulation",
+    );
+    run_checked(
+        &mut Command::new(executable),
+        "execute CUDA ODE failed-refresh emulation",
+    );
+}
+
+#[test]
+fn cuda_ode_lane_settles_a_delay_source_in_its_kernel_instance() {
+    // z^3 + z = 1 + x keeps a projection block; a zero delay reads z settled
+    // from x, whatever the caller left in its slot.
+    let compiled = Compiler::new()
+        .model("LagLoop")
+        .compile_str(
+            r#"
+model LagLoop
+  parameter Real tau = 0.02;
+  Real x(start = 0, fixed = true);
+  Real z(start = 1);
+  Real d;
+equation
+  der(x) = 1 - d;
+  z * z * z + z = 1 + x;
+  d = delay(z, tau, 1);
+end LagLoop;
+"#,
+            "LagLoop.mo",
+        )
+        .expect("the compiler accepts the model");
+    let (directory, files) = rendered_model_target(&compiled, "LagLoop", "cuda-ode");
+    let source = files
+        .iter()
+        .find(|file| file.path.ends_with("_ode.cu"))
+        .expect("cuda-ode emits its kernel");
+    assert!(
+        source.content.contains("rmc_project_block("),
+        "the model must keep a projection block for this test to bite"
+    );
+    let harness = directory.path().join("lagloop.cpp");
+    fs::write(
+        &harness,
+        format!(
+            r#"#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+struct Dim3 {{ int x; }};
+static Dim3 blockIdx, blockDim, threadIdx;
+#define __global__
+#define __host__
+#define __device__
+#include {:?}
+
+static int slot(const char *name) {{
+    for (int i = 0; i < LAGLOOP_Y_LEN; ++i) {{
+        if (std::strcmp(LagLoop_y_names[i], name) == 0) {{
+            return i;
+        }}
+    }}
+    return -1;
+}}
+
+int main() {{
+    blockIdx.x = 0;
+    blockDim.x = 1;
+    threadIdx.x = 0;
+    void *lanes = std::malloc(LAGLOOP_LANE_WORKSPACE_BYTES);
+    LagLoop_workspace_init_batch(lanes, 1);
+    double y[LAGLOOP_Y_LEN] = {{0.0}};
+    double p[LAGLOOP_P_LEN] = {{0.0}};
+    static double history[LAGLOOP_DELAY_HISTORY_STRIDE];
+    int status = -1;
+    LagLoop_load_starts_batch(y, p, LAGLOOP_Y_LEN, LAGLOOP_P_LEN, 1);
+    LagLoop_initialize_batch(0.0, y, p, &status, LAGLOOP_Y_LEN, LAGLOOP_P_LEN, 1);
+    LagLoop_delay_init_batch(0.0, y, p, history, LAGLOOP_Y_LEN, LAGLOOP_P_LEN, LAGLOOP_DELAY_HISTORY_STRIDE, 1);
+    const int x = slot("x"), z = slot("z");
+    // x = 1: z^3 + z = 2 has the root z = 1.
+    y[x] = 1.0;
+    y[z] = 1.25;
+    // p[0] is tau (0.02): a zero delay reads the current source.
+    if (p[0] != 0.02) {{
+        std::printf("p[0] %.17g is not tau\n", p[0]);
+        return 1;
+    }}
+    p[0] = 0.0;
+    LagLoop_delay_apply_batch(0.5, y, p, history, LAGLOOP_Y_LEN, LAGLOOP_P_LEN, LAGLOOP_DELAY_HISTORY_STRIDE, 1);
+    // delay_apply leaves the caller's slots alone; der(x) = 1 - d is 0 when
+    // the delayed source was settled.
+    const double stale = y[z];
+    double out[LAGLOOP_STATE_COUNT] = {{0.0}};
+    LagLoop_rhs_batch(0.5, y, p, out, &status, LAGLOOP_Y_LEN, LAGLOOP_P_LEN, LAGLOOP_STATE_COUNT, 1);
+    if (status != 0 || x < 0 || z < 0 || stale != 1.25 || !(std::fabs(out[0]) < 1e-9)) {{
+        std::printf("status %d, der %.17g, z %.17g\n", status, out[0], stale);
+        return 1;
+    }}
+    std::free(lanes);
+    return 0;
+}}
+"#,
+            source.path,
+        ),
+    )
+    .expect("write harness");
+    let executable = directory.path().join("cuda-ode-lagloop");
+    run_checked(
+        Command::new("c++")
+            .args(["-std=c++17", "-Wall", "-Wextra", "-Werror"])
+            .arg(&harness)
+            .arg("-o")
+            .arg(&executable)
+            .current_dir(directory.path()),
+        "compile CUDA ODE shared delay emulation",
+    );
+    run_checked(
+        &mut Command::new(executable),
+        "execute CUDA ODE shared delay emulation",
+    );
+}

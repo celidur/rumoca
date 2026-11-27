@@ -118,7 +118,7 @@ fn empty_block() -> Value {
     }
 }
 
-/// A whole scalar row block, its outputs renumbered densely in store order.
+/// A whole scalar row block, each output at its row (`output_indices`).
 fn dense_rows_value(
     block: &solve::ScalarProgramBlock,
     pure_calls: Option<&solve::SolvePureCallTable>,
@@ -128,7 +128,7 @@ fn dense_rows_value(
     let value = scalar_block_value(
         block.programs().to_vec(),
         block.program_spans().to_vec(),
-        (0..count).collect(),
+        block.output_indices().to_vec(),
         pure_calls,
         feature,
     )?;
@@ -218,7 +218,7 @@ fn require_lane_events(problem: &solve::SolveProblem) -> Result<(), CodegenError
     const FEATURE: &str = "events";
     let discrete = &problem.discrete;
     let events = &problem.events;
-    let checks: [(bool, &str); 13] = [
+    let checks: [(bool, &str); 14] = [
         (
             !discrete.event_iteration_plan.runs.is_empty(),
             "the event iteration plan has partition runs",
@@ -263,6 +263,16 @@ fn require_lane_events(problem: &solve::SolveProblem) -> Result<(), CodegenError
                 .any(|action| matches!(action.kind, solve::SolveEventActionKind::Terminate)),
             "terminate() actions are present",
         ),
+        // A lane neither checks nor reports a model assertion: an
+        // error-level one would let a violated lane run on. An assertion
+        // inside a called function fails that call instead.
+        (
+            events.actions.iter().any(|action| {
+                matches!(action.kind, solve::SolveEventActionKind::Assert)
+                    && action.assertion_projection.is_none()
+            }),
+            "error-level assert() actions are present",
+        ),
         (
             discrete.row_roles.len() != discrete.pre_modes.len(),
             "discrete row roles and pre() modes are not aligned",
@@ -300,7 +310,11 @@ fn events_value(
     let (roots, root_count) = dense_rows_value(&events.root_conditions, pure_calls, "events")?;
     let mut event_roots = Vec::new();
     for (root, target) in events.root_relation_memory_targets.iter().enumerate() {
-        let Some(target) = target else { continue };
+        // A root without a relation memory is a plain crossing the event
+        // iteration never re-encodes; no lane kernel reports it.
+        let Some(target) = target else {
+            return Err(refuse("events", "a root has no relation memory"));
+        };
         let solve::ScalarSlot::P { index, .. } = target else {
             return Err(refuse(
                 "events",
@@ -376,8 +390,20 @@ fn delays_value(
             "delay rows are not aligned with their slots",
         ));
     }
+    // The rows that read an algebraic slot read it settled; the others read
+    // the lane's coordinate as it is.
+    let algebraic: std::collections::BTreeSet<usize> =
+        (problem.solve_layout.state_scalar_count()..problem.layout.y_scalars()).collect();
+    let reads_algebraic = |block: &solve::ScalarProgramBlock| {
+        block
+            .programs()
+            .iter()
+            .any(|program| reads_slot(program, "y", &algebraic))
+    };
     Ok(minijinja::context! {
         count => count,
+        settle_times => reads_algebraic(&delays.delay_time_rhs) || reads_algebraic(&delays.delay_max_rhs),
+        settle_sources => reads_algebraic(&delays.source_rhs),
         source => source,
         delay_time => delay_time,
         delay_max => delay_max,
@@ -386,29 +412,141 @@ fn delays_value(
     })
 }
 
-/// Whether `program` reads any of the y slots in `slots`.
-fn reads_any_y(program: &[solve::LinearOp], slots: &std::collections::BTreeSet<usize>) -> bool {
-    program.iter().any(|op| match op {
-        solve::LinearOp::LoadY { index, .. } => slots.contains(index),
-        solve::LinearOp::TensorLoad {
-            input: solve::TensorInputKind::Y,
-            input_start,
-            count,
-            ..
-        } => slots
-            .range(*input_start..input_start + count)
-            .next()
-            .is_some(),
+/// Whether `program` reads one of `slots` (`column` `"y"` or `"p"`).
+fn reads_slot(
+    program: &[solve::LinearOp],
+    column: &str,
+    slots: &std::collections::BTreeSet<usize>,
+) -> bool {
+    let reads = |start: usize, count: usize| slots.range(start..start + count).next().is_some();
+    program.iter().any(|op| match (column, op) {
+        ("y", solve::LinearOp::LoadY { index, .. })
+        | ("p", solve::LinearOp::LoadP { index, .. }) => slots.contains(index),
+        ("p", solve::LinearOp::LoadIndexedP { base, count, .. }) => reads(*base, *count),
+        (
+            "y",
+            solve::LinearOp::TensorLoad {
+                input: solve::TensorInputKind::Y,
+                input_start,
+                count,
+                ..
+            },
+        )
+        | (
+            "p",
+            solve::LinearOp::TensorLoad {
+                input: solve::TensorInputKind::P,
+                input_start,
+                count,
+                ..
+            },
+        ) => reads(*input_start, *count),
+        (
+            _,
+            solve::LinearOp::FunctionFold { program, .. }
+            | solve::LinearOp::GuardedFunctionFold { program, .. },
+        ) => program
+            .regions()
+            .any(|region| reads_slot(region, column, slots)),
+        (_, solve::LinearOp::FunctionConditional { program, .. }) => {
+            program.arms.iter().any(|arm| {
+                reads_slot(&arm.condition, column, slots) || reads_slot(&arm.result, column, slots)
+            }) || reads_slot(&program.fallback, column, slots)
+        }
         _ => false,
     })
 }
 
-/// The bindings that write one column (p or y), in checked order.
-#[derive(Default)]
-struct BindingColumn {
-    programs: Vec<Vec<solve::LinearOp>>,
-    spans: Vec<rumoca_core::Span>,
+/// One parameter or start binding: its program and the slots of one column
+/// it writes, in store order.
+#[derive(Debug)]
+struct Binding {
+    program: Vec<solve::LinearOp>,
+    span: rumoca_core::Span,
+    column: &'static str,
     outputs: Vec<usize>,
+}
+
+/// The bindings in dependency order: each runs once, after every binding
+/// that writes a slot it reads, so that one pass computes the values the
+/// runtime's repeated sweeps settle on (`apply_prepared_update_rows_until_stable`).
+/// A binding that reads its own output or a cycle is refused.
+fn binding_order(bindings: Vec<Binding>, feature: &str) -> Result<Vec<Binding>, CodegenError> {
+    let mut pending = bindings;
+    let mut order = Vec::with_capacity(pending.len());
+    while !pending.is_empty() {
+        let written = |column: &str| {
+            pending
+                .iter()
+                .filter(|binding| binding.column == column)
+                .flat_map(|binding| binding.outputs.iter().copied())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let (y, p) = (written("y"), written("p"));
+        let (ready, waiting): (Vec<_>, Vec<_>) = pending.into_iter().partition(|binding| {
+            !reads_slot(&binding.program, "y", &y) && !reads_slot(&binding.program, "p", &p)
+        });
+        if ready.is_empty() {
+            return Err(refuse(
+                feature,
+                "the bindings read their own outputs in a cycle",
+            ));
+        }
+        order.extend(ready);
+        pending = waiting;
+    }
+    Ok(order)
+}
+
+/// The parameter and start bindings of `init` in dependency order, each
+/// storing its outputs at the targets its output indices name.
+fn ordered_bindings(
+    init: &solve::InitializationSolveSystem,
+    feature: &str,
+) -> Result<Vec<Binding>, CodegenError> {
+    let update = init.update_rhs();
+    let targets = init.update_targets();
+    if update.stored_output_count() != targets.len() {
+        return Err(refuse(feature, "bindings and targets are not aligned"));
+    }
+    let mut bindings = Vec::new();
+    let mut cursor = 0;
+    for (index, program) in update.programs().iter().enumerate() {
+        let count = solve::ScalarProgramBlock::checked_program_output_count(program)
+            .ok_or_else(|| refuse(feature, "a binding has no output count"))?;
+        let slots = update
+            .output_indices()
+            .get(cursor..cursor + count)
+            .ok_or_else(|| refuse(feature, "bindings and targets are not aligned"))?
+            .iter()
+            .map(|row| {
+                targets
+                    .get(*row)
+                    .ok_or_else(|| refuse(feature, "bindings and targets are not aligned"))
+                    .and_then(|target| slot(*target, feature))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        cursor += count;
+        let Some(first) = slots.first() else {
+            continue;
+        };
+        let column = first.column;
+        if slots.iter().any(|slot| slot.column != column) {
+            return Err(refuse(
+                feature,
+                "a binding writes a parameter and a start value",
+            ));
+        }
+        bindings.push(Binding {
+            program: program.clone(),
+            span: update
+                .program_span(index)
+                .ok_or_else(|| refuse(feature, "a binding has no provenance"))?,
+            column,
+            outputs: slots.iter().map(|slot| slot.index).collect(),
+        });
+    }
+    binding_order(bindings, feature)
 }
 
 fn initialization_value(
@@ -423,60 +561,31 @@ fn initialization_value(
             "the initialization retains residual blocks, which only the shared projection kernel (`me_refresh`) solves",
         ));
     }
-    // Ordered bindings, partitioned by the column they write: parameter
-    // bindings first (a state start may read a parameter), each partition in
-    // checked order, every output written straight into its slot.
-    let update = init.update_rhs();
-    if update.stored_output_count() != init.update_targets().len() {
-        return Err(refuse(FEATURE, "bindings and targets are not aligned"));
+    // Consecutive bindings of one column form one block, written straight
+    // into that column.
+    let mut runs: Vec<(&'static str, Vec<Binding>)> = Vec::new();
+    for binding in ordered_bindings(init, FEATURE)? {
+        match runs.last_mut() {
+            Some((column, run)) if *column == binding.column => run.push(binding),
+            _ => runs.push((binding.column, vec![binding])),
+        }
     }
-    let mut columns: [BindingColumn; 2] = Default::default();
-    let mut y_written = std::collections::BTreeSet::new();
-    for (index, program) in update.programs().iter().enumerate() {
-        if solve::ScalarProgramBlock::program_output_count(program) != 1 {
-            return Err(refuse(FEATURE, "a binding stores several outputs"));
-        }
-        let target = slot(init.update_targets()[index], FEATURE)?;
-        if target.column == "y" {
-            y_written.insert(target.index);
-        } else if reads_any_y(program, &y_written) {
-            // The parameter bindings run before the start bindings, which
-            // keeps the checked order only while no parameter binding reads
-            // a start value an earlier binding sets.
-            return Err(refuse(
-                FEATURE,
-                "a parameter binding reads a start value an earlier binding sets",
-            ));
-        }
-        let column = &mut columns[usize::from(target.column == "y")];
-        column.programs.push(program.clone());
-        column.spans.push(
-            update
-                .program_span(index)
-                .ok_or_else(|| refuse(FEATURE, "a binding has no provenance"))?,
-        );
-        column.outputs.push(target.index);
-    }
-    let [p_bindings, y_bindings] = columns;
-    let binding_value = |column: BindingColumn| {
-        if column.programs.is_empty() {
-            Ok(Value::from(()))
-        } else {
-            scalar_block_value(
-                column.programs,
-                column.spans,
-                column.outputs,
-                pure_calls,
-                FEATURE,
-            )
-        }
-    };
-    let p_bindings = binding_value(p_bindings)?;
-    let y_bindings = binding_value(y_bindings)?;
-    Ok(minijinja::context! {
-        p_bindings => p_bindings,
-        y_bindings => y_bindings,
-    })
+    let runs = runs
+        .into_iter()
+        .map(|(column, run)| {
+            let mut programs = Vec::with_capacity(run.len());
+            let mut spans = Vec::with_capacity(run.len());
+            let mut outputs = Vec::new();
+            for binding in run {
+                programs.push(binding.program);
+                spans.push(binding.span);
+                outputs.extend(binding.outputs);
+            }
+            let rows = scalar_block_value(programs, spans, outputs, pure_calls, FEATURE)?;
+            Ok(minijinja::context! { column => column, rows => rows })
+        })
+        .collect::<Result<Vec<_>, CodegenError>>()?;
+    Ok(minijinja::context! { bindings => runs })
 }
 
 fn float_literal(value: f64) -> String {

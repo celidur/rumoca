@@ -240,6 +240,12 @@
 #include <float.h>
 #include <stdbool.h>
 {%- endif %}
+#else
+typedef long long int64_t;
+typedef unsigned long long uint64_t;
+#ifndef NAN
+#define NAN nan("")
+#endif
 #endif
 #if defined(__CUDACC__) && !defined(__CUDACC_RTC__)
 // Generated registers are often read by only one branch; keep nvcc quiet.
@@ -535,6 +541,10 @@ extern "C" __global__ void {{ name }}_init_state_batch(
 
 // The derivative of the states of every lane. Only the state slots of `y`
 // are read: the algebraic slots are settled on a per-thread copy first.
+{%- if shared %}
+// The shared kernel starts its projections from that copy, so the algebraic
+// slots of `y` are the integrator's warm start (SPEC_0044 ME-PROJ-005).
+{%- endif %}
 // A model with many algebraic slots needs a large thread stack for that copy
 // (cudaDeviceSetLimit(cudaLimitStackSize, ...)); `{{ name }}_rhs_batch`
 // settles them in place instead.
@@ -697,10 +707,23 @@ __device__ __noinline__ void {{ name }}_discrete_rows(double time, const double 
 {{ programs(ev.discrete, out="__values") }}
 }
 
+// Whether storing `value` over `stored` changes its bits, as the runtime
+// compares a slot it writes (a NaN that stays NaN is no change).
+__device__ int {{ name }}_changes(double stored, double value)
+{
+    unsigned long long a;
+    unsigned long long b;
+    memcpy(&a, &stored, sizeof a);
+    memcpy(&b, &value, sizeof b);
+    return a != b;
+}
+
 // One event iteration at `time`: settle the algebraic slots, re-encode every
 // relation memory from its root, apply the discrete equations, and repeat
 // until nothing changes; then advance the condition memories. Returns the
-// number of passes, or -1 when the iteration did not settle.
+// number of passes, or -1 when the iteration did not settle, a refresh
+// failed or a root is not finite (the runtime refuses a non-finite root
+// condition).
 __device__ int {{ name }}_event_iterate(double time, double *batch_y, double *batch_p)
 {
     double roots[{{ [ev.root_count, 1] | max }}];
@@ -716,20 +739,25 @@ __device__ int {{ name }}_event_iterate(double time, double *batch_y, double *ba
     int passes = 0;
     int settled = 0;
     for (; passes < {{ NAME }}_EVENT_MAX_PASSES && !settled; ++passes) {
-        (void){{ name }}_refresh(time, batch_y, batch_p);
+        if ({{ name }}_refresh(time, batch_y, batch_p)) {
+            return -1;
+        }
         int changed = 0;
 {%- if nroots > 0 %}
         {{ name }}_roots(time, batch_y, batch_p, roots);
         for (int k = 0; k < {{ nroots }}; ++k) {
             double root = roots[root_index[k]];
+            if (!isfinite(root)) {
+                return -1;
+            }
+            // The runtime's `orient_typed_root_zero` and
+            // `relation_memory_value_from_root`: a zero left unoriented
+            // encodes false.
             if (root == 0.0) {
                 root = zero[k] > 0 ? 2.220446049250313e-16 : (zero[k] < 0 ? -2.220446049250313e-16 : root);
             }
             double value = root < 0.0 ? 1.0 : 0.0;
-            if (root == 0.0) {
-                value = batch_p[memory[k]];
-            }
-            changed |= batch_p[memory[k]] != value;
+            changed |= {{ name }}_changes(batch_p[memory[k]], value);
             batch_p[memory[k]] = value;
         }
 {%- endif %}
@@ -737,7 +765,7 @@ __device__ int {{ name }}_event_iterate(double time, double *batch_y, double *ba
         {{ name }}_discrete_rows(time, batch_y, batch_p, values);
 {%- for target in ev.discrete_targets %}
 {%- if not ev.discrete_memory[loop.index0] %}
-        changed |= batch_{{ target.column }}[{{ target.index }}] != values[{{ loop.index0 }}];
+        changed |= {{ name }}_changes(batch_{{ target.column }}[{{ target.index }}], values[{{ loop.index0 }}]);
         batch_{{ target.column }}[{{ target.index }}] = values[{{ loop.index0 }}];
 {%- endif %}
 {%- endfor %}
@@ -746,8 +774,8 @@ __device__ int {{ name }}_event_iterate(double time, double *batch_y, double *ba
     }
     // A settled pass changed nothing after its own refresh, so the slots are
     // settled already; refresh again only after the last unsettled pass.
-    if (!settled) {
-        (void){{ name }}_refresh(time, batch_y, batch_p);
+    if (!settled && {{ name }}_refresh(time, batch_y, batch_p)) {
+        return -1;
     }
 {%- if ev.discrete_count > 0 %}
     {{ name }}_discrete_rows(time, batch_y, batch_p, values);
@@ -805,7 +833,8 @@ extern "C" __global__ void {{ name }}_event_indicators_batch(
 
 // Handle an event at `time` for every lane (static time event or located
 // state event): see `{{ name }}_event_iterate`. `passes` (may be null)
-// receives the passes taken, or -1 when the iteration did not settle.
+// receives the passes taken, or -1 when the iteration did not settle, a
+// refresh failed or a root is not finite.
 extern "C" __global__ void {{ name }}_event_update_batch(
     double time,
     double *y,
@@ -838,9 +867,10 @@ extern "C" __global__ void {{ name }}_event_update_batch(
 // unknowns, states and `fixed = false` parameters, from the lane's start
 // values as guesses. The initial event and the algebraic refresh follow.
 // `status` (may be null) receives 0, or the sum of 1 when the initial event
-// did not settle and 2 when the initialization did not converge. The
-// tolerance of the initial equations is {{ NAME }}_INIT_TOLERANCE (0 takes
-// the kernel's refresh tolerance); override it with -D before compiling.
+// did not settle or a refresh failed and 2 when the initialization did not
+// converge. The tolerance of the initial equations is
+// {{ NAME }}_INIT_TOLERANCE (0 takes the kernel's refresh tolerance);
+// override it with -D before compiling.
 #ifndef {{ NAME }}_INIT_TOLERANCE
 #define {{ NAME }}_INIT_TOLERANCE 0.0
 #endif
@@ -871,19 +901,16 @@ __device__ __noinline__ int {{ name }}_initial_projection(double time, double *b
 {%- else %}
 // Parameter and start bindings, the algebraic refresh, and the initial
 // event. `status` (may be null) receives 0, or 1 when the initial event did
-// not settle.
+// not settle or a refresh failed.
 
 __device__ __noinline__ void {{ name }}_bindings(double time, double *batch_y, double *batch_p)
 {
     (void)time;
     (void)batch_y;
     (void)batch_p;
-{%- if init.p_bindings %}
-{{ programs(init.p_bindings, out="batch_p") }}
-{%- endif %}
-{%- if init.y_bindings %}
-{{ programs(init.y_bindings, out="batch_y") }}
-{%- endif %}
+{%- for run in init.bindings %}
+{{ programs(run.rows, out="batch_" ~ run.column) }}
+{%- endfor %}
 }
 {%- endif %}
 
@@ -917,7 +944,7 @@ extern "C" __global__ void {{ name }}_initialize_batch(
 {%- if ev.initial_flag is not none %}
     batch_p[{{ ev.initial_flag }}] = 0.0;
 {%- endif %}
-    (void){{ name }}_refresh(time, batch_y, batch_p);
+    unsettled |= {{ name }}_refresh(time, batch_y, batch_p);
     if (status) {
         status[batch] = unsettled{% if shared_init %} + 2 * unconverged{% endif %};
     }
@@ -931,7 +958,9 @@ extern "C" __global__ void {{ name }}_initialize_batch(
 // `{{ name }}_delay_apply_batch` at the time of every derivative evaluation
 // (before it), and `{{ name }}_delay_commit_batch` after every accepted step.
 // The capacity must cover the longest delay at the smallest step; override it
-// with -D{{ NAME }}_DELAY_CAPACITY=n.
+// with -D{{ NAME }}_DELAY_CAPACITY=n. `history[0]` holds the number of points,
+// plus one once the ring has dropped its oldest point, and `history[1]` the
+// slot of the oldest one.
 #ifndef {{ NAME }}_DELAY_CAPACITY
 #define {{ NAME }}_DELAY_CAPACITY 1024
 #endif
@@ -954,44 +983,145 @@ __device__ __noinline__ void {{ name }}_delay_times(double time, const double *b
 {{ programs(delays.delay_time, out="__times") }}
 }
 
-// The history value of channel `channel` at `query`: the oldest point before
-// the history, the newest after it, the left point for a discrete source,
-// and linear interpolation otherwise.
-__device__ double {{ name }}_delay_read(const double *history, int channel, double query, int discrete)
+__device__ void {{ name }}_delay_maxima(double time, const double *batch_y, const double *batch_p, double *__maxima)
+{
+    (void)time;
+    (void)batch_y;
+    (void)batch_p;
+{{ programs(delays.delay_max, out="__maxima") }}
+}
+
+// The delayed value of channel `channel` at `time` (the runtime's
+// `delayed_value`, delay.rs): the current source `current` for a zero delay;
+// before the history, its first point, or NaN once the ring has dropped the
+// points the query needs; the left point for a discrete source
+// or an event's equal-time pair; otherwise, between the bracketing points (the
+// last one and (time, current) past the history), the cubic or quadratic
+// Lagrange stencil over them and one neighbour on each side across strictly
+// increasing times, or linear interpolation when it has fewer than three
+// finite points.
+__device__ double {{ name }}_delay_read(const double *history, int channel, double time, double delay_time, double current, int discrete)
 {
     const int capacity = {{ NAME }}_DELAY_CAPACITY;
     int count = (int)history[0];
     int head = (int)history[1];
+    int dropped = count > capacity;
+    count = dropped ? capacity : count;
     const double *times = history + 2;
     const double *values = history + 2 + (long long)capacity * (long long)(1 + channel);
-    if (count <= 0) {
-        return NAN;
+#define {{ NAME }}_AT(i) ((head + (i)) % capacity)
+    double query = time - delay_time;
+    if (count <= 0 || (delay_time == 0.0 && times[{{ NAME }}_AT(count - 1)] <= time)) {
+        return current;
     }
     if (query <= times[head]) {
-        return values[head];
+        return dropped && query < times[head] ? NAN : values[head];
     }
-    int last = (head + count - 1) % capacity;
-    if (query >= times[last]) {
-        return values[last];
-    }
+    // The first point after `query` (`partition_point`); at least one is
+    // before it.
     int low = 0;
-    int high = count - 1;
-    while (high - low > 1) {
+    int high = count;
+    while (low < high) {
         int middle = (low + high) / 2;
-        if (times[(head + middle) % capacity] <= query) {
-            low = middle;
+        if (times[{{ NAME }}_AT(middle)] <= query) {
+            low = middle + 1;
         } else {
             high = middle;
         }
     }
-    int lower = (head + low) % capacity;
-    int upper = (head + high) % capacity;
-    double span = times[upper] - times[lower];
-    if (discrete || !(span > 0.0)) {
-        return values[lower];
+    int upper = low;
+    int lower = upper - 1;
+    double lower_time = times[{{ NAME }}_AT(lower)];
+    double lower_value = values[{{ NAME }}_AT(lower)];
+    if (discrete || (upper < count && times[{{ NAME }}_AT(upper)] == lower_time)) {
+        return lower_value;
     }
-    double fraction = (query - times[lower]) / span;
-    return values[lower] + fraction * (values[upper] - values[lower]);
+    double next_time = upper < count ? times[{{ NAME }}_AT(upper)] : time;
+    double next_value = upper < count ? values[{{ NAME }}_AT(upper)] : current;
+    if (next_time <= lower_time) {
+        return next_value;
+    }
+    double stencil_time[4];
+    double stencil_value[4];
+    int points = 0;
+    if (lower >= 1 && times[{{ NAME }}_AT(lower - 1)] < lower_time) {
+        stencil_time[points] = times[{{ NAME }}_AT(lower - 1)];
+        stencil_value[points++] = values[{{ NAME }}_AT(lower - 1)];
+    }
+    stencil_time[points] = lower_time;
+    stencil_value[points++] = lower_value;
+    stencil_time[points] = next_time;
+    stencil_value[points++] = next_value;
+    if (upper + 1 < count && times[{{ NAME }}_AT(upper + 1)] > next_time) {
+        stencil_time[points] = times[{{ NAME }}_AT(upper + 1)];
+        stencil_value[points++] = values[{{ NAME }}_AT(upper + 1)];
+    }
+#undef {{ NAME }}_AT
+    int finite = points >= 3;
+    for (int i = 0; i < points; ++i) {
+        finite = finite && isfinite(stencil_value[i]);
+    }
+    if (finite) {
+        // Offsets from the lower point, so that a constant run reads back
+        // exactly.
+        double offset = -0.0;
+        for (int i = 0; i < points; ++i) {
+            double weight = 1.0;
+            for (int j = 0; j < points; ++j) {
+                if (j != i) {
+                    weight *= (query - stencil_time[j]) / (stencil_time[i] - stencil_time[j]);
+                }
+            }
+            offset += weight * (stencil_value[i] - lower_value);
+        }
+        double value = lower_value + offset;
+        if (isfinite(value)) {
+            return value;
+        }
+    }
+    double fraction = (query - lower_time) / (next_time - lower_time);
+    fraction = fraction < 0.0 ? 0.0 : (fraction > 1.0 ? 1.0 : fraction);
+    return lower_value + fraction * (next_value - lower_value);
+}
+
+// Whether `{{ name }}_delay_read` reads the current source of a channel at
+// `time`: a zero delay, an empty history, or a query at or past its last
+// point.
+__device__ int {{ name }}_delay_reads_current(const double *history, double time, double delay_time)
+{
+    const int capacity = {{ NAME }}_DELAY_CAPACITY;
+    int count = (int)history[0];
+    count = count > capacity ? capacity : count;
+    int head = (int)history[1];
+    return count <= 0 || delay_time == 0.0 || time - delay_time >= history[2 + (head + count - 1) % capacity];
+}
+
+// The lane's coordinate with its algebraic slots settled, for the delay rows
+// that read them: {% if shared %}the coordinate of the lane's kernel instance
+// after its refresh (`scratch` is unused){% else %}`scratch` holds a settled
+// copy of `batch_y`{% endif %}.
+__device__ const double *{{ name }}_delay_settle(double time, const double *batch_y, const double *batch_p, double *scratch)
+{
+{%- if shared %}
+    (void)scratch;
+    ModelInstance *m = {{ name }}_lane_instances + RUMOCA_LANE_INDEX;
+    m->time = time;
+    for (int i = 0; i < {{ y_len }}; ++i) {
+        m->y[i] = batch_y[i];
+    }
+    for (int i = 0; i < {{ p_len }}; ++i) {
+        m->p[i] = batch_p[i];
+    }
+    m->assertion_failed = false;
+    (void)refresh_algebraics{{ "_plan" if me_refresh.seed_rule == "CommittedAcceptedPoint" else "" }}(m);
+    return m->y;
+{%- else %}
+    for (int i = 0; i < {{ y_len }}; ++i) {
+        scratch[i] = batch_y[i];
+    }
+    (void){{ name }}_refresh(time, scratch, batch_p);
+    return scratch;
+{%- endif %}
 }
 
 __device__ void {{ name }}_delay_append(double *history, double time, const double *sources)
@@ -999,16 +1129,19 @@ __device__ void {{ name }}_delay_append(double *history, double time, const doub
     const int capacity = {{ NAME }}_DELAY_CAPACITY;
     int count = (int)history[0];
     int head = (int)history[1];
+    int dropped = count > capacity;
+    count = dropped ? capacity : count;
     if (count == capacity) {
         head = (head + 1) % capacity;
         count -= 1;
+        dropped = 1;
     }
     int slot = (head + count) % capacity;
     history[2 + slot] = time;
     for (int channel = 0; channel < {{ delays.count }}; ++channel) {
         history[2 + (long long)capacity * (long long)(1 + channel) + slot] = sources[channel];
     }
-    history[0] = (double)(count + 1);
+    history[0] = (double)(count + 1 + dropped);
     history[1] = (double)head;
 }
 {%- endif %}
@@ -1035,9 +1168,10 @@ extern "C" __global__ void {{ name }}_delay_init_batch(
     (void)time;
     (void)batch_y;
     (void)batch_p;
+    (void)batch_history;
+{%- if delays.count > 0 %}
     batch_history[0] = 0.0;
     batch_history[1] = 0.0;
-{%- if delays.count > 0 %}
     const int value_parameter[{{ delays.count }}] = {{ int_list(delays.value_parameters) }};
     double sources[{{ delays.count }}];
     // The delayed values feed the rows their sources read: settle the
@@ -1047,7 +1181,7 @@ extern "C" __global__ void {{ name }}_delay_init_batch(
         {{ name }}_delay_sources(time, batch_y, batch_p, sources);
         int changed = 0;
         for (int channel = 0; channel < {{ delays.count }}; ++channel) {
-            changed |= batch_p[value_parameter[channel]] != sources[channel];
+            changed |= {{ name }}_changes(batch_p[value_parameter[channel]], sources[channel]);
             batch_p[value_parameter[channel]] = sources[channel];
         }
         if (!changed) {
@@ -1060,7 +1194,8 @@ extern "C" __global__ void {{ name }}_delay_init_batch(
 {%- endif %}
 }
 
-// Write every delayed value at `time` into its parameter slot.
+// Write every delayed value at `time` into its parameter slot, or NaN for a
+// delay time outside [0, delayMax].
 extern "C" __global__ void {{ name }}_delay_apply_batch(
     double time,
     const double *y,
@@ -1086,9 +1221,39 @@ extern "C" __global__ void {{ name }}_delay_apply_batch(
     const int value_parameter[{{ delays.count }}] = {{ int_list(delays.value_parameters) }};
     const int discrete[{{ delays.count }}] = {{ int_list(delays.discrete) }};
     double delay_time[{{ delays.count }}];
-    {{ name }}_delay_times(time, batch_y, batch_p, delay_time);
+    double delay_max[{{ delays.count }}];
+    double sources[{{ delays.count }}];
+    // Rows that read algebraic slots read them settled; the sources are read
+    // only when a channel needs its current value.
+    const double *view = batch_y;
+{%- if (delays.settle_times or delays.settle_sources) and shared %}
+    double *scratch = 0;
+{%- elif delays.settle_times or delays.settle_sources %}
+    double scratch[{{ [y_len, 1] | max }}];
+{%- endif %}
+{%- if delays.settle_times %}
+    view = {{ name }}_delay_settle(time, batch_y, batch_p, scratch);
+{%- endif %}
+    {{ name }}_delay_times(time, view, batch_p, delay_time);
+    {{ name }}_delay_maxima(time, view, batch_p, delay_max);
+{%- if delays.settle_sources and not delays.settle_times %}
+    int current = 0;
     for (int channel = 0; channel < {{ delays.count }}; ++channel) {
-        batch_p[value_parameter[channel]] = {{ name }}_delay_read(batch_history, channel, time - delay_time[channel], discrete[channel]);
+        current |= {{ name }}_delay_reads_current(batch_history, time, delay_time[channel]);
+    }
+    if (current) {
+        view = {{ name }}_delay_settle(time, batch_y, batch_p, scratch);
+    }
+{%- endif %}
+    {{ name }}_delay_sources(time, view, batch_p, sources);
+    for (int channel = 0; channel < {{ delays.count }}; ++channel) {
+        // A delay time outside [0, delayMax], which the runtime refuses, has
+        // no value: the lane reads NaN, which its derivatives carry to the host.
+        double value = NAN;
+        if (isfinite(delay_time[channel]) && delay_time[channel] >= 0.0 && isfinite(delay_max[channel]) && delay_max[channel] >= delay_time[channel]) {
+            value = {{ name }}_delay_read(batch_history, channel, time, delay_time[channel], sources[channel], discrete[channel]);
+        }
+        batch_p[value_parameter[channel]] = value;
     }
 {%- endif %}
 }

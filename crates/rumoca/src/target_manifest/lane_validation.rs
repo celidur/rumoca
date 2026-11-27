@@ -10,7 +10,9 @@ use rumoca_compile::codegen::targets::{
 /// lane itself, so it needs the start values of the complete lowered model.
 /// Its capability gate and its renderer (`ManifestRenderer::SolveModel`) both
 /// follow this one predicate, so the gate always reads the lowering the
-/// renderer renders.
+/// renderer renders. Such a target executes the per-lane view
+/// (`solve_blocks.lanes`): the gate admits its staged refresh without
+/// residual export.
 pub(super) fn initializes_lanes(manifest: &TargetManifest) -> bool {
     manifest.ir == TargetTemplateIr::Solve
         && manifest
@@ -40,6 +42,20 @@ pub(super) fn validate(
     // (SPEC_0044 ME-PROJ-001), so neither needs residual export. That kernel
     // also projects the lane's states onto a retained state manifold.
     let problem = &lowered.model().problem;
+    // A lane refreshes on the primary chart alone: no lane kernel switches
+    // among the executable alternate charts of a reduced chart set (SPEC_0040
+    // STRUCT-T07), so such a model is refused rather than integrated on one.
+    if problem
+        .continuous
+        .reduced_chart_set
+        .charts
+        .iter()
+        .any(|chart| chart.plan.is_some())
+    {
+        anyhow::bail!(
+            "unsupported-feature:reduced_charts: a lane cannot switch among the alternate charts of a reduced chart set"
+        );
+    }
     let mut capabilities = capabilities.clone();
     if capabilities.exact_algebraic_assignments == Some(true)
         && (rumoca_phase_codegen::lane_refresh_admissible(problem)
