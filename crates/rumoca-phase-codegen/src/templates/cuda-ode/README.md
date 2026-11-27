@@ -40,7 +40,10 @@ and integration (including event location and stopping at time events).
   initialized states on them and `<model>_project_states_batch` moves the
   accepted states of every lane back onto them. Launch it after each
   accepted step; it reports a failed projection in `status`.
-- Events: `<model>_event_indicators_batch` returns the root functions,
+- Events: `<model>_event_indicators_batch` returns the root functions
+  (those of the relation memories, then the crossings whose relation the
+  rows read directly, such as `time < Tclose`; function assertions have
+  none),
   `<model>_event_update_batch` iterates relation memories and discrete
   equations to a fixed point, and reports a non-finite root as `-1` passes.
   It re-encodes each relation from the sign of its root alone, so the host

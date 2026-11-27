@@ -309,22 +309,30 @@ fn events_value(
     let discrete = &problem.discrete;
     let (roots, root_count) = lane_roots_value(&events.root_conditions, pure_calls)?;
     let mut event_roots = Vec::new();
+    let mut crossings = Vec::new();
     for (root, target) in events.root_relation_memory_targets.iter().enumerate() {
+        let zero = events
+            .root_zero_domains
+            .get(root)
+            .copied()
+            .map(zero_domain)
+            .unwrap_or(0);
         // A root without a relation memory is a crossing the event iteration
-        // never re-encodes. That of a function assertion, which observes the
-        // call, needs none: the lane checks the assertion in the call itself
-        // and fails at the first point that violates it. No lane kernel
-        // reports any other.
+        // never re-encodes: the rows read its relation directly, so the lane
+        // only reports it to the host, which locates it. That of a function
+        // assertion, which observes the call, is not even reported: the lane
+        // checks the assertion in the call itself and fails at the first
+        // point that violates it.
         let Some(target) = target else {
             let roots = &events.root_conditions;
-            if roots
+            if !roots
                 .program_index_for_output(root)
                 .and_then(|program| roots.program(program))
                 .is_some_and(observes_call)
             {
-                continue;
+                crossings.push(minijinja::context! { root => root, zero => zero });
             }
-            return Err(refuse("events", "a root has no relation memory"));
+            continue;
         };
         let solve::ScalarSlot::P { index, .. } = target else {
             return Err(refuse(
@@ -332,12 +340,6 @@ fn events_value(
                 "a relation memory is not parameter storage",
             ));
         };
-        let zero = events
-            .root_zero_domains
-            .get(root)
-            .copied()
-            .map(zero_domain)
-            .unwrap_or(0);
         event_roots.push(minijinja::context! { root => root, memory => *index, zero => zero });
     }
     let (rows, row_count) = dense_rows_value(&discrete.rhs, pure_calls, "events")?;
@@ -369,6 +371,7 @@ fn events_value(
         roots => roots,
         root_count => root_count,
         event_roots => event_roots,
+        crossings => crossings,
         discrete => rows,
         discrete_count => row_count,
         discrete_targets => targets,

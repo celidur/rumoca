@@ -422,6 +422,50 @@ int main() {
 }
 
 #[test]
+fn cuda_ode_reports_a_crossing_its_rows_read_directly() {
+    // `x[i] < 0.5` has no relation memory: the rows read it directly, and
+    // the lane reports its root after those of the relation memories.
+    run_lane_harness(
+        r#"
+model Crossing
+  Real x[3](start = {1, 2, 3}, each fixed = true);
+  Real v[3];
+equation
+  for i in 1:3 loop
+    v[i] = if x[i] < 0.5 then 0 else 1;
+    der(x[i]) = -v[i];
+  end for;
+end Crossing;
+"#,
+        "Crossing",
+        r#"
+int main() {
+    blockIdx.x = 0;
+    blockDim.x = 1;
+    threadIdx.x = 0;
+    double y[CROSSING_Y_LEN + 1] = {0.0};
+    double p[CROSSING_P_LEN + 1] = {0.0};
+    double z[CROSSING_EVENT_INDICATORS + 1] = {0.0};
+    double der[CROSSING_STATE_COUNT + 1] = {0.0};
+    int status = -1, passes = -1;
+    CHECK(CROSSING_EVENT_INDICATORS == 3, "every crossing is an indicator");
+    Crossing_load_starts_batch(y, p, CROSSING_Y_LEN, CROSSING_P_LEN, 1);
+    Crossing_initialize_batch(0.0, y, p, &status, CROSSING_Y_LEN, CROSSING_P_LEN, 1);
+    CHECK(status == 0, "the initial event settles");
+    y[0] = 0.25;
+    Crossing_event_indicators_batch(0.0, y, p, z, CROSSING_Y_LEN, CROSSING_P_LEN, CROSSING_EVENT_INDICATORS, 1);
+    CHECK(z[0] == -0.25 && z[1] == 1.5 && z[2] == 2.5, "the indicators are the roots");
+    Crossing_event_update_batch(0.0, y, p, &passes, CROSSING_Y_LEN, CROSSING_P_LEN, 1);
+    CHECK(passes > 0, "the event iteration settles");
+    Crossing_rhs_batch(0.0, y, p, der, &status, CROSSING_Y_LEN, CROSSING_P_LEN, CROSSING_STATE_COUNT, 1);
+    CHECK(status == 0 && der[0] == 0.0 && der[1] == -1.0, "the rows read the relation");
+    return 0;
+}
+"#,
+    );
+}
+
+#[test]
 fn cuda_ode_event_iteration_refuses_a_non_finite_root() {
     // sqrt(x) - 0.5 has no value for x < 0: the runtime refuses the root,
     // and the lane must not encode its relation as false.
