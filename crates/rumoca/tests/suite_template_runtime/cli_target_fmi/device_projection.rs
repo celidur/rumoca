@@ -337,3 +337,49 @@ fn the_device_unit_includes_no_header_after_its_shims() {
         assert!(!unit.contains("[]){"), "{model}");
     }
 }
+
+/// A device reserves a thread's stack for every resident thread, so the
+/// unit's parameter bindings keep their previous values and outputs in the
+/// lane's instance: `rmc_apply_updates` holds no array sized to its binding
+/// targets (one of 9133 doubles twice set the stack of an integrator kernel
+/// over 100 KB per thread on the IEEE 39 bus model).
+#[test]
+fn the_device_bindings_keep_no_array_on_the_thread_stack() {
+    let bound = rumoca::Compiler::new()
+        .model("BoundParameters")
+        .compile_str(
+            "model BoundParameters
+  parameter Real a = 2;
+  parameter Real b = 3*a;
+  parameter Real c = a + b;
+  Real x(start=1, fixed=true);
+  Real u;
+equation
+  u + 0.1*u*u*u = c*x;
+  der(x) = -u;
+end BoundParameters;",
+            "BoundParameters.mo",
+        )
+        .unwrap_or_else(|error| panic!("compile BoundParameters: {error:?}"));
+    let mut checked = 0;
+    for (compiled, model) in models().into_iter().chain([(bound, "BoundParameters")]) {
+        let unit = device_unit(&compiled);
+        let Some(start) = unit.find(" int rmc_apply_updates(") else {
+            continue;
+        };
+        if !unit.contains(" rmc_binding_runs(") {
+            continue;
+        }
+        let body = &unit[start..start + unit[start..].find("\n}\n").expect("the function ends")];
+        assert!(
+            !body.contains("double before[") && !body.contains("double binding_output["),
+            "{model}: {body}"
+        );
+        assert!(
+            body.contains("m->rmc_bind_before") && body.contains("m->rmc_bind_output"),
+            "{model}: {body}"
+        );
+        checked += 1;
+    }
+    assert!(checked > 0, "BoundParameters has parameter bindings");
+}
