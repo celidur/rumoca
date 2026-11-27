@@ -2818,10 +2818,10 @@ RMC_COLD {{ q }} int rmc_init_settled(ModelInstance* m, double* out) {
     RMC_MARK; bool dirty = m->parameters_dirty;
     double* y = rmc_dalloc(m, Y_LEN); double* p = rmc_dalloc(m, P_LEN);
     if (!y || !p) { RMC_RELEASE; return rmc_exhausted(m); }
-    memcpy(y, m->y, sizeof(m->y)); memcpy(p, m->p, sizeof(m->p));
+    memcpy(y, m->y, Y_LEN * sizeof(double)); memcpy(p, m->p, P_LEN * sizeof(double));
     int result = rmc_init_settle_view(m);
     if (result == 0 && rmc_init_residual(m, out) != 0) result = -1;
-    memcpy(m->y, y, sizeof(m->y)); memcpy(m->p, p, sizeof(m->p)); m->parameters_dirty = dirty;
+    memcpy(m->y, y, Y_LEN * sizeof(double)); memcpy(m->p, p, P_LEN * sizeof(double)); m->parameters_dirty = dirty;
     RMC_RELEASE; return result;
 }
 {%- else %}
@@ -3024,7 +3024,7 @@ RMC_COLD {{ q }} int rmc_init_jacobian(ModelInstance* m, const RmcInitBlock* b, 
     double* y = rmc_dalloc(m, Y_LEN); double* p = rmc_dalloc(m, P_LEN); double* seed = rmc_dalloc(m, RMC_SEED_LEN);
     double* residual = rmc_dalloc(m, RMC_INIT_ROWS); double* out = rmc_dalloc(m, RMC_TAN_OUTPUTS + 1);
     if (!y || !p || !seed || !residual || !out) { RMC_RELEASE; return rmc_exhausted(m); }
-    memcpy(y, m->y, sizeof(m->y)); memcpy(p, m->p, sizeof(m->p));
+    memcpy(y, m->y, Y_LEN * sizeof(double)); memcpy(p, m->p, P_LEN * sizeof(double));
     if (rmc_init_settle_view(m) != 0) result = -1;
     for (size_t col = 0; col < n && result == 0; ++col) {
         memset(seed, 0, RMC_SEED_LEN * sizeof(double));
@@ -3032,7 +3032,7 @@ RMC_COLD {{ q }} int rmc_init_jacobian(ModelInstance* m, const RmcInitBlock* b, 
         if (rmc_init_tangent(m, seed) != 0 || rmc_tan_rows(m, rows, RMC_INIT_ROWS, 2, seed, out, residual) != 0) { result = -1; break; }
         for (size_t row = 0; row < n; ++row) jac[row * n + col] = residual[rmc_init_pool[b->rows + row]];
     }
-    memcpy(m->y, y, sizeof(m->y)); memcpy(m->p, p, sizeof(m->p)); m->parameters_dirty = dirty;
+    memcpy(m->y, y, Y_LEN * sizeof(double)); memcpy(m->p, p, P_LEN * sizeof(double)); m->parameters_dirty = dirty;
     RMC_RELEASE; return result;
 }
 {%- else %}
@@ -3315,9 +3315,9 @@ RMC_COLD {{ q }} int rmc_init_delays(ModelInstance* m) {
 {%- if delays.reads_algebraics %}
     double* y = rmc_dalloc(m, Y_LEN);
     if (!y) { RMC_RELEASE; return rmc_exhausted(m); }
-    memcpy(y, m->y, sizeof(m->y));
+    memcpy(y, m->y, Y_LEN * sizeof(double));
     int rows = refresh_algebraics(m) == {{ prefix }}OK ? rmc_init_delay_rows(m, source, delay_time, delay_max) : -1;
-    memcpy(m->y, y, sizeof(m->y));
+    memcpy(m->y, y, Y_LEN * sizeof(double));
     if (rows != 0) { RMC_RELEASE; return -1; }
 {%- else %}
     if (rmc_init_delay_rows(m, source, delay_time, delay_max) != 0) { RMC_RELEASE; return -1; }
@@ -3640,7 +3640,7 @@ RMC_API extern const size_t rmc_iso_slot[{{ me.table.isolator_slot|length }}];
 }
 /* Commit the settled coordinate (event exit) as the continuous-time seed. */
 {{ q }} inline void rmc_seed_commit(ModelInstance* m) {
-    memcpy(m->rmc_commit_y, m->y, sizeof(m->y));
+    memcpy(m->rmc_commit_y, m->y, Y_LEN * sizeof(double));
     m->rmc_mark_pending = false; m->rmc_mark_resolved = false; m->rmc_seeding = true;
 }
 /* Mark the accepted point of a completed integrator step. */
@@ -3652,16 +3652,16 @@ RMC_API extern const size_t rmc_iso_slot[{{ me.table.isolator_slot|length }}];
 {{ q }} inline void rmc_seed_suspend(ModelInstance* m) { m->rmc_seeding = false; }
 {{ q }} void rmc_seed_load(ModelInstance* m) {
     double x[STATE_LEN]; memcpy(x, m->y, sizeof(x));
-    memcpy(m->y, m->rmc_commit_y, sizeof(m->y)); memcpy(m->y, x, sizeof(x));
+    memcpy(m->y, m->rmc_commit_y, Y_LEN * sizeof(double)); memcpy(m->y, x, sizeof(x));
 }
 /* The next seed: the derivative refresh at the marked point from the
    current seed. */
 {{ q }} {{ prefix }}Status rmc_seed_resolve(ModelInstance* m) {
     if (!m->rmc_mark_pending) return {{ prefix }}OK;
     double t = m->time; double x[STATE_LEN]; memcpy(x, m->y, sizeof(x));
-    memcpy(m->y, m->rmc_commit_y, sizeof(m->y)); memcpy(m->y, m->rmc_mark_x, sizeof(x)); m->time = m->rmc_mark_t;
+    memcpy(m->y, m->rmc_commit_y, Y_LEN * sizeof(double)); memcpy(m->y, m->rmc_mark_x, sizeof(x)); m->time = m->rmc_mark_t;
     {{ prefix }}Status status = refresh_derivative_values_plan(m);
-    if (status == {{ prefix }}OK) { memcpy(m->rmc_commit_y, m->y, sizeof(m->y)); m->rmc_mark_pending = false; m->rmc_mark_resolved = true; }
+    if (status == {{ prefix }}OK) { memcpy(m->rmc_commit_y, m->y, Y_LEN * sizeof(double)); m->rmc_mark_pending = false; m->rmc_mark_resolved = true; }
     m->time = t; memcpy(m->y, x, sizeof(x));
     return status;
 }
@@ -3721,7 +3721,7 @@ RMC_API extern const size_t rmc_iso_slot[{{ me.table.isolator_slot|length }}];
     for the lane's fallback and fault reports; a model with neither a
     projection kernel nor assignment programs has no report, and its unit no
     `rmc_lane_report`. -#}
-{%- macro device_instance(solve, me, prefix) %}
+{%- macro device_instance(solve, me, prefix, views=false, settled=false) %}
 #include <stdio.h>
 typedef enum { {{ prefix }}OK, {{ prefix }}Warning, {{ prefix }}Discard, {{ prefix }}Error, {{ prefix }}Fatal } {{ prefix }}Status;
 {{ storage_lengths(solve) }}
@@ -3739,7 +3739,11 @@ typedef enum { {{ prefix }}OK, {{ prefix }}Warning, {{ prefix }}Discard, {{ pref
 #endif
 {{- lane_status_type(me) }}
 {%- set bindings = solve.initialization.update_targets|length %}
-typedef struct { bool parameters_dirty; bool rmc_nonfinite; bool assertion_failed; double time; double y[Y_LEN]; double p[P_LEN];{% if bindings > 0 %} double rmc_bind_before[{{ bindings }}]; double rmc_bind_output[{{ bindings }}];{% endif %}{{ workspace_fields(me, device=true) }} } ModelInstance;
+{#- With `views`, a lane's coordinate and parameters are the caller's own
+    arrays, which each entry points the instance at, instead of copies; with
+    `settled` too, the instance holds a coordinate of its own
+    (`rmc_settled_y`) for an entry that settles a copy of the caller's. #}
+typedef struct { bool parameters_dirty; bool rmc_nonfinite; bool assertion_failed; double time;{% if views %} double* y; double* p;{% if settled %} double rmc_settled_y[Y_LEN];{% endif %}{% else %} double y[Y_LEN]; double p[P_LEN];{% endif %}{% if bindings > 0 %} double rmc_bind_before[{{ bindings }}]; double rmc_bind_output[{{ bindings }}];{% endif %}{{ workspace_fields(me, device=true) }} } ModelInstance;
 #define RMC_INFO(m, category, message) ((void)(m), (void)(category), (void)(message))
 /* The unit is a library: a lane kernel calls only the entries it needs, so
    every device function carries the unused attribute (RMC_UNUSED, which the
@@ -3819,7 +3823,7 @@ typedef struct { bool parameters_dirty; bool rmc_nonfinite; bool assertion_faile
    formed again before it is read. */
 {{ device_qualifier(true) }} void rmc_lane_reset(ModelInstance* m) {
     m->rmc_nonfinite = false; m->assertion_failed = false;
-    unsigned char* workspace = (unsigned char*){{ "&m->rmc_dtop" if me.kernel else "(m->p + P_LEN)" }};
+    unsigned char* workspace = (unsigned char*){{ "&m->rmc_dtop" if me.kernel else "(&m->p + 1)" }};
     memset(workspace, 0, (size_t)((unsigned char*)(m + 1) - workspace));{{ workspace_reset(me, device=true) }}
 }
 {{ typed_functions(typed_pure_calls, typed_directional_calls if me.blocks|length > 0 or me.table.jvp.programs|length > 0 else [], device=true) }}
