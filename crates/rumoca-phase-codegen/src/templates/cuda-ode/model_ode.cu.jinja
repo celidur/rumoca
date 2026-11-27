@@ -1072,16 +1072,38 @@ __device__ void {{ name }}_delay_maxima(double time, const double *batch_y, cons
 {{ programs(delays.delay_max, out="__maxima") }}
 }
 
-// The delayed value of channel `channel` at `time` (the runtime's
-// `delayed_value`, delay.rs): the current source `current` for a zero delay;
-// before the history, its first point, or NaN once the ring has dropped the
-// points the query needs; the left point for a discrete source
-// or an event's equal-time pair; otherwise, between the bracketing points (the
-// last one and (time, current) past the history), the cubic or quadratic
-// Lagrange stencil over them and one neighbour on each side across strictly
-// increasing times, or linear interpolation when it has fewer than three
-// finite points.
-__device__ double {{ name }}_delay_read(const double *history, int channel, double time, double delay_time, double current, int discrete)
+// The place of a query in the history's times, which the channels asking
+// at that instant share: where it falls and, between two points, the stencil
+// over the times around it. The times alone decide the points and their
+// weights, so a channel reads its own values through them.
+#define {{ NAME }}_DELAY_EMPTY 0
+#define {{ NAME }}_DELAY_FIRST 1
+#define {{ NAME }}_DELAY_LEFT 2
+#define {{ NAME }}_DELAY_NEXT 3
+#define {{ NAME }}_DELAY_BETWEEN 4
+typedef struct {
+    // EMPTY: no point. FIRST: at or before the first point. LEFT: an event's
+    // equal-time pair. NEXT: no span to the next point. BETWEEN: two points.
+    int kind;
+    // The last point is at or before the time of the read.
+    int past;
+    // FIRST: before a first point the ring dropped points before.
+    int dropped;
+    // The stencil's points, the lower one at `lower` and the next one after
+    // it: history slots, or -1 for the point (time, current source).
+    int points;
+    int lower;
+    int slot[4];
+    // The Lagrange weights of a stencil of three or four points, and the
+    // fraction of the linear form.
+    double weight[4];
+    double fraction;
+} {{ name }}_delay_place;
+
+// Place `query` in the history's times for a read at `time`. The probe wraps
+// by a subtraction: the oldest slot and the probe are both below the
+// capacity.
+__device__ void {{ name }}_delay_locate(const double *history, double time, double query, {{ name }}_delay_place *place)
 {
     const int capacity = {{ NAME }}_DELAY_CAPACITY;
     int count = (int)history[0];
@@ -1089,14 +1111,22 @@ __device__ double {{ name }}_delay_read(const double *history, int channel, doub
     int dropped = count > capacity;
     count = dropped ? capacity : count;
     const double *times = history + 2;
-    const double *values = history + 2 + (long long)capacity * (long long)(1 + channel);
-#define {{ NAME }}_AT(i) ((head + (i)) % capacity)
-    double query = time - delay_time;
-    if (count <= 0 || (delay_time == 0.0 && times[{{ NAME }}_AT(count - 1)] <= time)) {
-        return current;
+#define {{ NAME }}_AT(i) (head + (i) >= capacity ? head + (i) - capacity : head + (i))
+    place->kind = {{ NAME }}_DELAY_EMPTY;
+    place->past = 0;
+    place->dropped = 0;
+    place->points = 0;
+    place->lower = 0;
+    place->fraction = 0.0;
+    if (count <= 0) {
+        return;
     }
+    place->past = times[{{ NAME }}_AT(count - 1)] <= time;
     if (query <= times[head]) {
-        return dropped && query < times[head] ? NAN : values[head];
+        place->kind = {{ NAME }}_DELAY_FIRST;
+        place->dropped = dropped && query < times[head];
+        place->slot[0] = head;
+        return;
     }
     // The first point after `query` (`partition_point`); at least one is
     // before it.
@@ -1113,39 +1143,37 @@ __device__ double {{ name }}_delay_read(const double *history, int channel, doub
     int upper = low;
     int lower = upper - 1;
     double lower_time = times[{{ NAME }}_AT(lower)];
-    double lower_value = values[{{ NAME }}_AT(lower)];
-    if (discrete || (upper < count && times[{{ NAME }}_AT(upper)] == lower_time)) {
-        return lower_value;
+    int next_slot = upper < count ? {{ NAME }}_AT(upper) : -1;
+    double next_time = upper < count ? times[next_slot] : time;
+    place->slot[0] = {{ NAME }}_AT(lower);
+    place->slot[1] = next_slot;
+    if (upper < count && next_time == lower_time) {
+        place->kind = {{ NAME }}_DELAY_LEFT;
+        return;
     }
-    double next_time = upper < count ? times[{{ NAME }}_AT(upper)] : time;
-    double next_value = upper < count ? values[{{ NAME }}_AT(upper)] : current;
     if (next_time <= lower_time) {
-        return next_value;
+        place->kind = {{ NAME }}_DELAY_NEXT;
+        return;
     }
+    place->kind = {{ NAME }}_DELAY_BETWEEN;
     double stencil_time[4];
-    double stencil_value[4];
     int points = 0;
     if (lower >= 1 && times[{{ NAME }}_AT(lower - 1)] < lower_time) {
-        stencil_time[points] = times[{{ NAME }}_AT(lower - 1)];
-        stencil_value[points++] = values[{{ NAME }}_AT(lower - 1)];
+        place->slot[points] = {{ NAME }}_AT(lower - 1);
+        stencil_time[points++] = times[{{ NAME }}_AT(lower - 1)];
     }
-    stencil_time[points] = lower_time;
-    stencil_value[points++] = lower_value;
-    stencil_time[points] = next_time;
-    stencil_value[points++] = next_value;
+    place->lower = points;
+    place->slot[points] = {{ NAME }}_AT(lower);
+    stencil_time[points++] = lower_time;
+    place->slot[points] = next_slot;
+    stencil_time[points++] = next_time;
     if (upper + 1 < count && times[{{ NAME }}_AT(upper + 1)] > next_time) {
-        stencil_time[points] = times[{{ NAME }}_AT(upper + 1)];
-        stencil_value[points++] = values[{{ NAME }}_AT(upper + 1)];
+        place->slot[points] = {{ NAME }}_AT(upper + 1);
+        stencil_time[points++] = times[{{ NAME }}_AT(upper + 1)];
     }
 #undef {{ NAME }}_AT
-    int finite = points >= 3;
-    for (int i = 0; i < points; ++i) {
-        finite = finite && isfinite(stencil_value[i]);
-    }
-    if (finite) {
-        // Offsets from the lower point, so that a constant run reads back
-        // exactly.
-        double offset = -0.0;
+    place->points = points;
+    if (points >= 3) {
         for (int i = 0; i < points; ++i) {
             double weight = 1.0;
             for (int j = 0; j < points; ++j) {
@@ -1153,16 +1181,57 @@ __device__ double {{ name }}_delay_read(const double *history, int channel, doub
                     weight *= (query - stencil_time[j]) / (stencil_time[i] - stencil_time[j]);
                 }
             }
-            offset += weight * (stencil_value[i] - lower_value);
-        }
-        double value = lower_value + offset;
-        if (isfinite(value)) {
-            return value;
+            place->weight[i] = weight;
         }
     }
     double fraction = (query - lower_time) / (next_time - lower_time);
-    fraction = fraction < 0.0 ? 0.0 : (fraction > 1.0 ? 1.0 : fraction);
-    return lower_value + fraction * (next_value - lower_value);
+    place->fraction = fraction < 0.0 ? 0.0 : (fraction > 1.0 ? 1.0 : fraction);
+}
+
+// The delayed value of channel `channel` (the runtime's `delayed_value`,
+// delay.rs) at the place of its query: the current source `current` for a
+// zero delay; before the history, its first point, or NaN once the ring has
+// dropped the points the query needs; the left point for a discrete source
+// or an event's equal-time pair; otherwise, between the bracketing points (the
+// last one and (time, current) past the history), the cubic or quadratic
+// Lagrange stencil over them and one neighbour on each side across strictly
+// increasing times, or linear interpolation when it has fewer than three
+// finite points.
+__device__ double {{ name }}_delay_read(const double *history, int channel, double delay_time, double current, int discrete, const {{ name }}_delay_place *place)
+{
+    const int capacity = {{ NAME }}_DELAY_CAPACITY;
+    const double *values = history + 2 + (long long)capacity * (long long)(1 + channel);
+    if (place->kind == {{ NAME }}_DELAY_EMPTY || (delay_time == 0.0 && place->past)) {
+        return current;
+    }
+    if (place->kind == {{ NAME }}_DELAY_FIRST) {
+        return place->dropped ? NAN : values[place->slot[0]];
+    }
+    double lower_value = values[place->slot[place->lower]];
+    if (discrete || place->kind == {{ NAME }}_DELAY_LEFT) {
+        return lower_value;
+    }
+    int next_slot = place->slot[place->lower + 1];
+    double next_value = next_slot < 0 ? current : values[next_slot];
+    if (place->kind == {{ NAME }}_DELAY_NEXT) {
+        return next_value;
+    }
+    if (place->points >= 3) {
+        // Offsets from the lower point, so that a constant run reads back
+        // exactly.
+        int finite = 1;
+        double offset = -0.0;
+        for (int i = 0; i < place->points; ++i) {
+            double point = place->slot[i] < 0 ? current : values[place->slot[i]];
+            finite = finite && isfinite(point);
+            offset += place->weight[i] * (point - lower_value);
+        }
+        double value = lower_value + offset;
+        if (finite && isfinite(value)) {
+            return value;
+        }
+    }
+    return lower_value + place->fraction * (next_value - lower_value);
 }
 
 // Whether `{{ name }}_delay_read` reads the current source of a channel at
@@ -1318,12 +1387,34 @@ extern "C" __global__ void {{ name }}_delay_apply_batch(
     }
 {%- endif %}
     {{ name }}_delay_sources(time, view, batch_p, sources);
+    // A channel asking at one of the last four instants placed takes that
+    // place in the history's times: the channels of one delay time ask at
+    // one instant, and those of a few delay times often alternate.
+    double placed[4] = {NAN, NAN, NAN, NAN};
+    {{ name }}_delay_place places[4];
+    int oldest = 0;
     for (int channel = 0; channel < {{ delays.count }}; ++channel) {
         // A delay time outside [0, delayMax], which the runtime refuses, has
         // no value: the lane reads NaN, which its derivatives carry to the host.
         double value = NAN;
         if (isfinite(delay_time[channel]) && delay_time[channel] >= 0.0 && isfinite(delay_max[channel]) && delay_max[channel] >= delay_time[channel]) {
-            value = {{ name }}_delay_read(batch_history, channel, time, delay_time[channel], sources[channel], discrete[channel]);
+            double query = time - delay_time[channel];
+            int place = 0;
+            if (query == placed[0]) {
+                place = 0;
+            } else if (query == placed[1]) {
+                place = 1;
+            } else if (query == placed[2]) {
+                place = 2;
+            } else if (query == placed[3]) {
+                place = 3;
+            } else {
+                place = oldest;
+                oldest = (oldest + 1) % 4;
+                {{ name }}_delay_locate(batch_history, time, query, &places[place]);
+                placed[place] = query;
+            }
+            value = {{ name }}_delay_read(batch_history, channel, delay_time[channel], sources[channel], discrete[channel], &places[place]);
         }
         batch_p[value_parameter[channel]] = value;
     }
