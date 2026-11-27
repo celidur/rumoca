@@ -58,6 +58,19 @@ pub const TORN_BACKTRACK_STEPS: usize = 24;
 /// half its norm in a full Newton step, so the full step stays accepted there.
 pub const TORN_SUFFICIENT_DECREASE: f64 = 0.5;
 
+/// Fraction of its scaled tolerance a converged Newton correction must exceed,
+/// in at least one coordinate, for a certified block to apply it
+/// (`runtime::projection::converged_correction`); a smaller one settles the
+/// block as it stands. A correction at the roundoff level never vanishes
+/// exactly: a block applying it at every visit moves by a unit or two in the
+/// last place each time, and a later block recovering its coordinates from it
+/// changes at every sweep of a simultaneous plan, which then sweeps until its
+/// limit. At the refresh tolerance (1e-10) the floor is 1e-13 of a
+/// coordinate's scale, hundreds of units in the last place, while a change of
+/// the block's inputs by a relative 1e-7 still moves every coordinate whose
+/// sensitivity exceeds a relative 1e-6.
+pub const CONVERGED_CORRECTION_FLOOR: f64 = 1.0e-3;
+
 /// Whether a colored projection Jacobian evaluates each application program
 /// once with one tangent lane per color that calls it
 /// (`rumoca_ir_solve::ColoredTangentPlan`) instead of once per color. Each

@@ -706,6 +706,7 @@ fn policy_value() -> Value {
         torn_iters => policy::TORN_OUTER_MAX_ITERS,
         torn_backtracks => policy::TORN_BACKTRACK_STEPS,
         torn_decrease => float_literal(policy::TORN_SUFFICIENT_DECREASE),
+        correction_floor => float_literal(policy::CONVERGED_CORRECTION_FLOOR),
         chart_regular_multiple => float_literal(policy::CHART_REGULAR_MULTIPLE),
         chart_switch_keep => float_literal(policy::CHART_SWITCH_KEEP),
         chart_switch_improvement => float_literal(policy::CHART_SWITCH_IMPROVEMENT),
