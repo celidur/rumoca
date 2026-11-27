@@ -383,3 +383,61 @@ end BoundParameters;",
     }
     assert!(checked > 0, "BoundParameters has parameter bindings");
 }
+
+/// The device unit's `memcmp` (the device library has none) compares aligned
+/// words, in runs of eight, before bytes, which the kernel's bit-for-bit
+/// comparisons of doubles read: it orders every pair of buffers as the C
+/// library does, aligned or not, whichever byte differs.
+#[test]
+fn the_device_memcmp_orders_buffers_as_the_c_library() {
+    let runs = |tool: &str| Command::new(tool).arg("--version").output().is_ok();
+    if !crate::template_runtime_policy::prerequisites_are_available(
+        "host build of the device memcmp",
+        &[("c++", runs("c++"))],
+    ) {
+        return;
+    }
+    let (compiled, model) = models().into_iter().next().expect("a device test model");
+    let work = tempdir().expect("device memcmp work directory");
+    let harness = work.path().join("memcmp.cpp");
+    let driver = r#"
+#include <cstdio>
+int main() {
+    alignas(8) unsigned char a[160], b[160];
+    int bad = 0, cases = 0;
+    for (size_t offset = 0; offset < 9; ++offset)
+        for (size_t n = 0; n + offset <= 152; ++n)
+            for (int at = -1; at < (int)n; ++at)
+                for (int sign = -1; sign <= 1; sign += 2) {
+                    for (size_t i = 0; i < 160; ++i) a[i] = b[i] = (unsigned char)(7 * i + 3);
+                    if (at >= 0) b[offset + at] = (unsigned char)(a[offset + at] + sign);
+                    int got = rmc_device_memcmp(a + offset, b + offset, n), want = (memcmp)(a + offset, b + offset, n);
+                    bad += (got > 0) != (want > 0) || (got < 0) != (want < 0);
+                    ++cases;
+                }
+    printf("%d %d\n", bad, cases);
+    return 0;
+}
+"#;
+    fs::write(&harness, format!("{}\n{driver}", device_unit(&compiled)))
+        .expect("write the memcmp harness");
+    let binary = work.path().join("memcmp");
+    checked_output(
+        Command::new("c++")
+            .args(["-std=c++17", "-O2", "-Wall", "-Wextra", "-Werror"])
+            .args(["-D__device__=", "-D__host__="])
+            .arg(&harness)
+            .arg("-lm")
+            .arg("-o")
+            .arg(&binary),
+        "compile the device memcmp harness",
+    );
+    let output = checked_output(&mut Command::new(&binary), "run the device memcmp harness");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut counts = stdout.split_whitespace();
+    assert_eq!(counts.next(), Some("0"), "{model}: {stdout}");
+    assert!(
+        counts.next().is_some_and(|cases| cases != "0"),
+        "{model}: {stdout}"
+    );
+}
