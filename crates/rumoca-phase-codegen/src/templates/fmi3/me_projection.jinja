@@ -1290,7 +1290,59 @@ typedef struct {
     return rmc_lu_invertible(e->reduced, k) ? 1 : 0;
 }
 /* TornSystem::solve; -1 error, 0 no solution, 1 solved */
+{%- set unrolled = device and me.blocks|selectattr("elim_solve")|list|length > 0 %}
+{%- if device %}
+/* The elimination's products and sums: a device thread fuses each into one
+   rounding, as NVCC contracts the pooled loops, and so does every unrolled
+   solve below, which NVCC would otherwise contract its own way; a host build
+   of the unit rounds the product and the sum, as the C of a component. */
+#if defined(__CUDA_ARCH__)
+#define RMC_ELIM_SUB(value, factor, x) __fma_rn(-(factor), (x), (value))
+#define RMC_ELIM_ADD(sum, factor, x) __fma_rn((factor), (x), (sum))
+#else
+#define RMC_ELIM_SUB(value, factor, x) ((value) - (factor) * (x))
+#define RMC_ELIM_ADD(sum, factor, x) ((sum) + (factor) * (x))
+#endif
+{%- endif %}
+{%- if unrolled %}
+/* rmc_eliminate_solve of one eliminating block with no promoted step (`k` is
+   its issued tears, so the reduced rows and tears are its layout's), the
+   pooled loops unrolled over its pattern: the same operations in the same
+   order, on values a device thread keeps in registers. */
+{%- for b in me.blocks %}{% if b.elim_solve %}{% set s = b.elim_solve %}{% set k = s.tears|length %}
+{{ q }} int rmc_eliminate_solve_{{ loop.index0 }}(const RmcElimination* e, const double* residual, const double* rscale, const double* vscale, double* delta) {
+    const double* v = e->values; const double* recovery = e->recovery; double work[{{ s.n }}], rhs[{{ s.n }}], reduced_rhs[{{ k + 1 }}];
+    for (size_t i = 0; i < {{ s.n }}; ++i) { work[i] = 0.0; rhs[i] = -residual[i] / rmc_valid_scale(rscale[i]); }
+{%- for step in s.steps %}
+    { double value = rhs[{{ step.row }}];{% for entry in step.entries %} value = RMC_ELIM_SUB(value, v[{{ entry[0] }}], work[{{ entry[1] }}]);{% endfor %} work[{{ step.target }}] = value / {% if step.pivot is not none %}v[{{ step.pivot }}]{% else %}0.0{% endif %}; }
+{%- endfor %}
+{%- for row in s.residuals %}
+    { double value = rhs[{{ row.row }}];{% for entry in row.entries %} value = RMC_ELIM_SUB(value, v[{{ entry[0] }}], work[{{ entry[1] }}]);{% endfor %} reduced_rhs[{{ loop.index0 }}] = value; }
+{%- endfor %}
+    if (!rmc_lu_solve(e->reduced, {{ k }}, e->ipiv, reduced_rhs)) return 0;
+{%- for step in s.steps %}
+    { double correction = -0.0;{% for c in range(k) %} correction = RMC_ELIM_ADD(correction, recovery[{{ step.target * s.capacity + c }}], reduced_rhs[{{ c }}]);{% endfor %} work[{{ step.target }}] += correction; }
+{%- endfor %}
+{%- for tear in s.tears %}
+    work[{{ tear }}] = reduced_rhs[{{ loop.index0 }}];
+{%- endfor %}
+    if (!rmc_all_finite(work, {{ s.n }})) return 0;
+    for (size_t col = 0; col < {{ s.n }}; ++col) delta[col] = work[col] * rmc_valid_scale(vscale[col]);
+    return 1;
+}
+{%- endif %}{% endfor %}
+{%- endif %}
 {{ q }} int rmc_eliminate_solve(ModelInstance* m, const RmcBlock* b, const RmcElimination* e, const double* residual, const double* rscale, const double* vscale, double* delta) {
+{%- if unrolled %}
+    if (e->k == RMC_BS(b, nelim_tear)) {
+        switch (b->id) {
+{%- for b in me.blocks %}{% if b.elim_solve %}
+        case {{ loop.index0 }}: return rmc_eliminate_solve_{{ loop.index0 }}(e, residual, rscale, vscale, delta);
+{%- endif %}{% endfor %}
+        default: break;
+        }
+    }
+{%- endif %}
     const size_t b_n = RMC_BS(b, n); const size_t b_elim_capacity = RMC_BS(b, elim_capacity); const size_t b_nelim = RMC_BS(b, nelim); const size_t* const b_elim_row_pool = RMC_BP(b, elim_row); const size_t* const b_elim_col_pool = RMC_BP(b, elim_col); const size_t* const b_row_ptr_pool = RMC_BP(b, row_ptr); const size_t* const b_col_idx_pool = RMC_BP(b, col_idx);
     RMC_MARK; size_t n = b_n, k = e->k, cap = b_elim_capacity; int result = 1;
     double* work = rmc_dalloc(m, n); double* rhs = rmc_dalloc_raw(m, n); double* reduced_rhs = rmc_dalloc_raw(m, k + 1);
@@ -1300,13 +1352,13 @@ typedef struct {
         if (e->promoted[s]) continue;
         size_t row = b_elim_row_pool[s], target = b_elim_col_pool[s]; double value = rhs[row], pivot = 0.0;
         for (size_t p = b_row_ptr_pool[row]; p < b_row_ptr_pool[row + 1]; ++p) {
-            if (b_col_idx_pool[p] == target) pivot = e->values[p]; else value -= e->values[p] * work[b_col_idx_pool[p]];
+            if (b_col_idx_pool[p] == target) pivot = e->values[p]; else {% if device %}value = RMC_ELIM_SUB(value, e->values[p], work[b_col_idx_pool[p]]){% else %}value -= e->values[p] * work[b_col_idx_pool[p]]{% endif %};
         }
         work[target] = value / pivot;
     }
     for (size_t r = 0; r < k; ++r) {
         size_t source = e->residual[r]; double value = rhs[source];
-        for (size_t p = b_row_ptr_pool[source]; p < b_row_ptr_pool[source + 1]; ++p) value -= e->values[p] * work[b_col_idx_pool[p]];
+        for (size_t p = b_row_ptr_pool[source]; p < b_row_ptr_pool[source + 1]; ++p) {% if device %}value = RMC_ELIM_SUB(value, e->values[p], work[b_col_idx_pool[p]]){% else %}value -= e->values[p] * work[b_col_idx_pool[p]]{% endif %};
         reduced_rhs[r] = value;
     }
     if (!rmc_lu_solve(e->reduced, k, e->ipiv, reduced_rhs)) result = 0;
@@ -1314,7 +1366,7 @@ typedef struct {
         for (size_t s = 0; s < b_nelim; ++s) {
             if (e->promoted[s]) continue;
             size_t target = b_elim_col_pool[s]; double correction = -0.0;
-            for (size_t c = 0; c < k; ++c) correction += e->recovery[target * cap + c] * reduced_rhs[c];
+            for (size_t c = 0; c < k; ++c) {% if device %}correction = RMC_ELIM_ADD(correction, e->recovery[target * cap + c], reduced_rhs[c]){% else %}correction += e->recovery[target * cap + c] * reduced_rhs[c]{% endif %};
             work[target] += correction;
         }
         for (size_t c = 0; c < k; ++c) work[e->tear[c]] = reduced_rhs[c];
