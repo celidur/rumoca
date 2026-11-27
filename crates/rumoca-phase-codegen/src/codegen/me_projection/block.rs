@@ -158,6 +158,49 @@ pub(super) struct BlockRecord {
     /// The elimination solve of an eliminating block with no promoted step,
     /// unrolled for a device unit (`EliminationSolve`).
     elim_solve: Option<EliminationSolve>,
+    /// The origin convergence test of a coupled affine block, unrolled for a
+    /// device unit (`OriginConverged`).
+    origin: Option<OriginConverged>,
+}
+
+/// `rmc_origin_converged` of one coupled affine block, its pools unrolled:
+/// the block's solver coordinates, and per row its target (one past its
+/// coordinate, or `NO_TARGET`) and its entries `(entry, column)` in pattern
+/// order. A device unit renders it as straight-line code with the
+/// operations of the pooled loops in their order.
+#[derive(Serialize)]
+pub(super) struct OriginConverged {
+    y: Vec<usize>,
+    rows: Vec<OriginRow>,
+}
+
+#[derive(Serialize)]
+struct OriginRow {
+    target: usize,
+    entries: Vec<(usize, usize)>,
+}
+
+fn origin_converged(
+    csr: &Csr,
+    problem: &solve::SolveProblem,
+    block: &solve::AlgebraicProjectionBlock,
+) -> Option<OriginConverged> {
+    let rows: Vec<OriginRow> = block
+        .rows
+        .iter()
+        .enumerate()
+        .map(|(local, &row)| OriginRow {
+            target: row_target(problem, row),
+            entries: (csr.row_ptr[local]..csr.row_ptr[local + 1])
+                .map(|entry| (entry, csr.col_idx[entry]))
+                .collect(),
+        })
+        .collect();
+    let entries = rows.iter().map(|row| row.entries.len()).sum::<usize>();
+    (entries <= UNROLLED_ELIMINATION_ENTRIES).then(|| OriginConverged {
+        y: block.y_indices.to_vec(),
+        rows,
+    })
 }
 
 /// `rmc_eliminate_solve` of one eliminating affine block with no promoted
@@ -189,8 +232,8 @@ struct EliminationRow {
     entries: Vec<(usize, usize)>,
 }
 
-/// Entries an unrolled elimination solve may hold: larger blocks keep the
-/// pooled loops, whose code does not grow with the block.
+/// Entries an unrolled elimination solve or origin test may hold: larger
+/// blocks keep the pooled loops, whose code does not grow with the block.
 const UNROLLED_ELIMINATION_ENTRIES: usize = 1024;
 
 fn elimination_solve(
@@ -382,6 +425,9 @@ pub(super) fn block_record(
     if affine {
         record_elimination(table, canonical, block, structure, &csr, &mut record)?;
         record_linearization(sources, table, block, &positions, &mut record);
+        if n > 1 {
+            record.origin = origin_converged(&csr, sources.problem, block);
+        }
     }
     // A coupled affine block is always settled by the affine solve; its rows
     // reach isolation only through the singleton path.
