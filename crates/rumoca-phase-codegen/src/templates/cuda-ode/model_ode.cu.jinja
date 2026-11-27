@@ -1064,6 +1064,8 @@ __device__ __noinline__ void {{ name }}_delay_times(double time, const double *b
 {{ programs(delays.delay_time, out="__times") }}
 }
 
+{%- if delays.distinct_maxima %}
+
 __device__ void {{ name }}_delay_maxima(double time, const double *batch_y, const double *batch_p, double *__maxima)
 {
     (void)time;
@@ -1071,6 +1073,7 @@ __device__ void {{ name }}_delay_maxima(double time, const double *batch_y, cons
     (void)batch_p;
 {{ programs(delays.delay_max, out="__maxima") }}
 }
+{%- endif %}
 
 // The place of a query in the history's times, which the channels asking
 // at that instant share: where it falls and, between two points, the stencil
@@ -1362,7 +1365,9 @@ extern "C" __global__ void {{ name }}_delay_apply_batch(
     static const int value_parameter[{{ delays.count }}] = {{ int_list(delays.value_parameters) }};
     static const int discrete[{{ delays.count }}] = {{ int_list(delays.discrete) }};
     double delay_time[{{ delays.count }}];
+{%- if delays.distinct_maxima %}
     double delay_max[{{ delays.count }}];
+{%- endif %}
     double sources[{{ delays.count }}];
     // Rows that read algebraic slots read them settled; the sources are read
     // only when a channel needs its current value.
@@ -1376,7 +1381,9 @@ extern "C" __global__ void {{ name }}_delay_apply_batch(
     view = {{ name }}_delay_settle(time, batch_y, batch_p, scratch);
 {%- endif %}
     {{ name }}_delay_times(time, view, batch_p, delay_time);
+{%- if delays.distinct_maxima %}
     {{ name }}_delay_maxima(time, view, batch_p, delay_max);
+{%- endif %}
 {%- if delays.settle_sources and not delays.settle_times %}
     int current = 0;
     for (int channel = 0; channel < {{ delays.count }}; ++channel) {
@@ -1396,8 +1403,12 @@ extern "C" __global__ void {{ name }}_delay_apply_batch(
     for (int channel = 0; channel < {{ delays.count }}; ++channel) {
         // A delay time outside [0, delayMax], which the runtime refuses, has
         // no value: the lane reads NaN, which its derivatives carry to the host.
+{%- if not delays.distinct_maxima %}
+        // Every delayMax row is its delay-time row here, so the maximum is
+        // the delay time itself.
+{%- endif %}
         double value = NAN;
-        if (isfinite(delay_time[channel]) && delay_time[channel] >= 0.0 && isfinite(delay_max[channel]) && delay_max[channel] >= delay_time[channel]) {
+        if (isfinite(delay_time[channel]) && delay_time[channel] >= 0.0{% if delays.distinct_maxima %} && isfinite(delay_max[channel]) && delay_max[channel] >= delay_time[channel]{% endif %}) {
             double query = time - delay_time[channel];
             int place = 0;
             if (query == placed[0]) {
