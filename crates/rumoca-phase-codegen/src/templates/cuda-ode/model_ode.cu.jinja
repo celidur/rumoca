@@ -432,6 +432,78 @@ extern "C" __global__ void {{ name }}_project_states_batch(
 // states, parameters and time: the issued exact assignments in checked order,
 // or the staged refresh of the shared projection kernel from the lane's
 // current coordinate. Returns 0, or 1 when the refresh failed.
+{%- set fixed_points = shared and me_refresh.seed_rule != "CommittedAcceptedPoint" %}
+{%- if fixed_points %}
+// A fixed point of the refresh: an input the refresh left unchanged, bit
+// for bit. The refresh reads the time, the coordinate, the parameters, the
+// kernel tolerance and certification mode{% if me_refresh.switching %} and the active chart{% endif %} of the lane (its
+// retained factorizations and linearizations are functions of the bits
+// they are keyed by, and its fallback counts only report), so at an input
+// equal to a recorded fixed point in all of them it computes that point
+// again: it is returned without a refresh. Define
+// {{ NAME }}_NO_FIXED_POINTS to refresh every input.
+// The words are compared and copied in runs of 16 independent loads: one
+// device thread waits for each load in turn otherwise, and a record holds
+// the whole coordinate and parameters.
+__device__ bool {{ name }}_same_bits(const double *a, const double *b, int n)
+{
+    int i = 0;
+    for (; i + 16 <= n; i += 16) {
+        unsigned long long d = 0;
+        for (int k = 0; k < 16; ++k) {
+            unsigned long long x, y;
+            memcpy(&x, a + i + k, sizeof x);
+            memcpy(&y, b + i + k, sizeof y);
+            d |= x ^ y;
+        }
+        if (d != 0) {
+            return false;
+        }
+    }
+    for (; i < n; ++i) {
+        unsigned long long x, y;
+        memcpy(&x, a + i, sizeof x);
+        memcpy(&y, b + i, sizeof y);
+        if (x != y) {
+            return false;
+        }
+    }
+    return true;
+}
+
+__device__ void {{ name }}_copy_words(double *dst, const double *src, int n)
+{
+    int i = 0;
+    for (; i + 16 <= n; i += 16) {
+        unsigned long long w[16];
+        for (int k = 0; k < 16; ++k) {
+            memcpy(&w[k], src + i + k, sizeof w[k]);
+        }
+        for (int k = 0; k < 16; ++k) {
+            memcpy(dst + i + k, &w[k], sizeof w[k]);
+        }
+    }
+    for (; i < n; ++i) {
+        memcpy(dst + i, src + i, sizeof *dst);
+    }
+}
+
+__device__ bool {{ name }}_at_fixed_point(const ModelInstance *m, double time, const double *batch_y, const double *batch_p)
+{
+#ifdef {{ NAME }}_NO_FIXED_POINTS
+    (void)m; (void)time; (void)batch_y; (void)batch_p;
+    return false;
+#else
+    return m->rmc_fixed_valid && m->rmc_fixed_certify == m->rmc_certify
+        && {{ name }}_same_bits(&m->rmc_fixed_time, &time, 1) && {{ name }}_same_bits(&m->rmc_fixed_tol, &m->rmc_tol, 1)
+{%- if me_refresh.switching %}
+        && m->rmc_fixed_chart == m->rmc_chart
+{%- endif %}
+        && {{ name }}_same_bits(m->rmc_fixed_y, batch_y, {{ y_len }}) && {{ name }}_same_bits(m->rmc_fixed_p, batch_p, {{ p_len }});
+#endif
+}
+{%- endif %}
+
 __device__ __noinline__ int {{ name }}_refresh(double time, double *batch_y, const double *batch_p)
 {
     (void)time;
@@ -439,6 +511,11 @@ __device__ __noinline__ int {{ name }}_refresh(double time, double *batch_y, con
     (void)batch_p;
 {%- if shared %}
     ModelInstance *m = {{ name }}_lane_instances + RUMOCA_LANE_INDEX;
+{%- if fixed_points %}
+    if ({{ name }}_at_fixed_point(m, time, batch_y, batch_p)) {
+        return 0;
+    }
+{%- endif %}
     m->time = time;
     // The lane's own arrays: the refresh settles the algebraic slots in
     // place and writes no parameter (a lane's bindings are settled).
@@ -458,6 +535,34 @@ __device__ __noinline__ int {{ name }}_refresh(double time, double *batch_y, con
     return 0;
 {%- endif %}
 }
+
+{%- if fixed_points %}
+// The refresh of an event iteration, which records its input as the lane's
+// fixed point when the refresh leaves it unchanged: the derivative the
+// integrator evaluates at the accepted point after the event update then
+// finds the point settled.
+__device__ int {{ name }}_refresh_recording(double time, double *batch_y, const double *batch_p)
+{
+    ModelInstance *m = {{ name }}_lane_instances + RUMOCA_LANE_INDEX;
+    if ({{ name }}_at_fixed_point(m, time, batch_y, batch_p)) {
+        return 0;
+    }
+    m->rmc_fixed_valid = false;
+    {{ name }}_copy_words(m->rmc_fixed_y, batch_y, {{ y_len }});
+    {{ name }}_copy_words(m->rmc_fixed_p, batch_p, {{ p_len }});
+    int failed = {{ name }}_refresh(time, batch_y, batch_p);
+    if (!failed && {{ name }}_same_bits(m->rmc_fixed_y, batch_y, {{ y_len }})) {
+        m->rmc_fixed_time = time;
+        m->rmc_fixed_tol = m->rmc_tol;
+        m->rmc_fixed_certify = m->rmc_certify;
+{%- if me_refresh.switching %}
+        m->rmc_fixed_chart = m->rmc_chart;
+{%- endif %}
+        m->rmc_fixed_valid = true;
+    }
+    return failed;
+}
+{%- endif %}
 
 // The derivative rows over a settled lane.
 __device__ __noinline__ void {{ name }}_derivative_rows(double time, const double *batch_y, const double *batch_p, double *batch_out)
@@ -726,7 +831,7 @@ __device__ int {{ name }}_event_iterate(double time, double *batch_y, double *ba
     int passes = 0;
     int settled = 0;
     for (; passes < {{ NAME }}_EVENT_MAX_PASSES && !settled; ++passes) {
-        if ({{ name }}_refresh(time, batch_y, batch_p)) {
+        if ({{ name }}_refresh{{ "_recording" if fixed_points else "" }}(time, batch_y, batch_p)) {
             return -1;
         }
         int changed = 0;
@@ -761,7 +866,7 @@ __device__ int {{ name }}_event_iterate(double time, double *batch_y, double *ba
     }
     // A settled pass changed nothing after its own refresh, so the slots are
     // settled already; refresh again only after the last unsettled pass.
-    if (!settled && {{ name }}_refresh(time, batch_y, batch_p)) {
+    if (!settled && {{ name }}_refresh{{ "_recording" if fixed_points else "" }}(time, batch_y, batch_p)) {
         return -1;
     }
 {%- if ev.discrete_count > 0 %}
