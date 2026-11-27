@@ -1081,6 +1081,8 @@ __device__ __noinline__ void {{ name }}_delay_times(double time, const double *b
 {{ programs(delays.delay_time, out="__times") }}
 }
 
+{%- if delays.distinct_maxima %}
+
 __device__ void {{ name }}_delay_maxima(double time, const double *batch_y, const double *batch_p, double *__maxima)
 {
     (void)time;
@@ -1088,6 +1090,7 @@ __device__ void {{ name }}_delay_maxima(double time, const double *batch_y, cons
     (void)batch_p;
 {{ programs(delays.delay_max, out="__maxima") }}
 }
+{%- endif %}
 
 // The place of a query in the history's times, which the channels asking
 // at that instant share: where it falls and, between two points, the stencil
@@ -1389,7 +1392,9 @@ extern "C" __global__ void {{ name }}_delay_apply_batch(
     static const int member[{{ delays.count }}] = {{ int_list(delays.time_members) }};
     static const int group_end[{{ delays.time_group_ends | length }}] = {{ int_list(delays.time_group_ends) }};
     double delay_time[{{ delays.count }}];
+{%- if delays.distinct_maxima %}
     double delay_max[{{ delays.count }}];
+{%- endif %}
     double sources[{{ delays.count }}];
     // Rows that read algebraic slots read them settled; the sources are read
     // only when a channel needs its current value.
@@ -1403,7 +1408,9 @@ extern "C" __global__ void {{ name }}_delay_apply_batch(
     view = {{ name }}_delay_settle(time, batch_y, batch_p, scratch);
 {%- endif %}
     {{ name }}_delay_times(time, view, batch_p, delay_time);
+{%- if delays.distinct_maxima %}
     {{ name }}_delay_maxima(time, view, batch_p, delay_max);
+{%- endif %}
 {%- if delays.settle_sources and not delays.settle_times %}
     int current = 0;
     for (int group = 0, first = 0; group < {{ delays.time_group_ends | length }}; first = group_end[group++]) {
@@ -1424,6 +1431,10 @@ extern "C" __global__ void {{ name }}_delay_apply_batch(
         const double delay = delay_time[member[first]];
         // A delay time outside [0, delayMax], which the runtime refuses, has
         // no value: the lane reads NaN, which its derivatives carry to the host.
+{%- if not delays.distinct_maxima %}
+        // Every delayMax row is its delay-time row here, so the maximum is
+        // the delay time itself.
+{%- endif %}
         const int timed = isfinite(delay) && delay >= 0.0;
         int place = 0;
         if (timed) {
@@ -1446,7 +1457,7 @@ extern "C" __global__ void {{ name }}_delay_apply_batch(
         for (; first < group_end[group]; ++first) {
             const int channel = member[first];
             double value = NAN;
-            if (timed && isfinite(delay_max[channel]) && delay_max[channel] >= delay) {
+            if (timed{% if delays.distinct_maxima %} && isfinite(delay_max[channel]) && delay_max[channel] >= delay{% endif %}) {
                 value = {{ name }}_delay_read(batch_history, channel, delay, sources[channel], discrete[channel], &places[place]);
             }
             batch_p[value_parameter[channel]] = value;

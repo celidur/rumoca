@@ -473,6 +473,11 @@ fn delays_value(
         count => count,
         settle_times => reads_algebraic(&delays.delay_time_rhs) || reads_algebraic(&delays.delay_max_rhs),
         settle_sources => reads_algebraic(&delays.source_rhs),
+        // An omitted `delayMax` lowers to the delay-time row itself: when
+        // every row does, the maxima are the delay times and no lane
+        // evaluates them.
+        distinct_maxima => delays.delay_max_rhs.programs() != delays.delay_time_rhs.programs()
+            || delays.delay_max_rhs.output_indices() != delays.delay_time_rhs.output_indices(),
         source => source,
         delay_time => delay_time,
         time_members => time_groups.concat(),

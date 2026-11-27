@@ -213,3 +213,99 @@ fn cuda_ode_lanes_place_alternating_delay_times_in_the_history() {
         "execute CUDA ODE delay emulation",
     );
 }
+
+/// A delay without `delayMax`, whose maximum is its delay time: p[0] is tau
+/// and p[1] the delayed value.
+const UNBOUNDED: &str = r#"
+model Unbounded
+  parameter Real tau = 0.02;
+  Real x(start = 0, fixed = true);
+  Real d;
+equation
+  der(x) = 1;
+  d = delay(x, tau);
+end Unbounded;
+"#;
+
+/// Reads x = t, recorded at 0, 0.1, 0.2 and 0.3, at 0.3 with a delay time
+/// inside the history and with a negative one.
+const UNBOUNDED_HARNESS: &str = r#"
+int main() {
+    blockIdx.x = 0; blockDim.x = 1; threadIdx.x = 0;
+    double y[UNBOUNDED_Y_LEN], p[UNBOUNDED_P_LEN];
+    static double history[UNBOUNDED_DELAY_HISTORY_STRIDE];
+    int status = -1, x = -1;
+    for (int i = 0; i < UNBOUNDED_Y_LEN; ++i) {
+        if (std::strcmp(Unbounded_y_names[i], "x") == 0) x = i;
+    }
+    Unbounded_load_starts_batch(y, p, UNBOUNDED_Y_LEN, UNBOUNDED_P_LEN, 1);
+    Unbounded_initialize_batch(0.0, y, p, &status, UNBOUNDED_Y_LEN, UNBOUNDED_P_LEN, 1);
+    Unbounded_delay_init_batch(0.0, y, p, history, UNBOUNDED_Y_LEN, UNBOUNDED_P_LEN, UNBOUNDED_DELAY_HISTORY_STRIDE, 1);
+    if (status != 0 || x < 0) { std::printf("the lane does not initialize\n"); return 1; }
+    for (int k = 1; k <= 3; ++k) {
+        y[x] = 0.1 * k;
+        Unbounded_delay_commit_batch(0.1 * k, y, p, history, UNBOUNDED_Y_LEN, UNBOUNDED_P_LEN, UNBOUNDED_DELAY_HISTORY_STRIDE, 1);
+    }
+    p[0] = 0.15;
+    Unbounded_delay_apply_batch(0.3, y, p, history, UNBOUNDED_Y_LEN, UNBOUNDED_P_LEN, UNBOUNDED_DELAY_HISTORY_STRIDE, 1);
+    if (!(std::fabs(p[1] - 0.15) < 1e-15)) { std::printf("a delay inside the history reads %.17g\n", p[1]); return 1; }
+    p[0] = -0.1;
+    Unbounded_delay_apply_batch(0.3, y, p, history, UNBOUNDED_Y_LEN, UNBOUNDED_P_LEN, UNBOUNDED_DELAY_HISTORY_STRIDE, 1);
+    if (!std::isnan(p[1])) { std::printf("a negative delay time reads %.17g\n", p[1]); return 1; }
+    return 0;
+}
+"#;
+
+#[test]
+fn cuda_ode_lanes_evaluate_a_delay_maximum_only_when_one_is_given() {
+    // The maxima of `DelayPlaces` and `Unbounded` are their delay times; a
+    // third argument gives a delay a maximum of its own.
+    let bounded = UNBOUNDED.replace("delay(x, tau)", "delay(x, tau, 1)");
+    for (source, evaluates) in [(PLACES, false), (UNBOUNDED, false), (&*bounded, true)] {
+        let model = if source == PLACES {
+            "DelayPlaces"
+        } else {
+            "Unbounded"
+        };
+        let compiled = Compiler::new()
+            .model(model)
+            .compile_str(source, &format!("{model}.mo"))
+            .expect("the compiler accepts the delay");
+        let (directory, files) = rendered_model_target(&compiled, model, "cuda-ode");
+        let kernel = files
+            .iter()
+            .find(|file| file.path.ends_with("_ode.cu"))
+            .expect("cuda-ode emits its kernel");
+        assert_eq!(
+            kernel.content.contains(&format!("{model}_delay_maxima(")),
+            evaluates,
+            "{model}"
+        );
+        if source != UNBOUNDED {
+            continue;
+        }
+        let path = directory.path().join("unbounded.cpp");
+        let prelude = "#include <cmath>\n#include <cstdio>\n#include <cstring>\n\
+            struct Dim3 { int x; };\nstatic Dim3 blockIdx, blockDim, threadIdx;\n\
+            #define __global__\n#define __host__\n#define __device__\n";
+        fs::write(
+            &path,
+            format!("{prelude}#include {:?}\n{UNBOUNDED_HARNESS}", kernel.path),
+        )
+        .expect("write the delay harness");
+        let executable = directory.path().join("cuda-ode-unbounded");
+        run_checked(
+            Command::new("c++")
+                .args(["-std=c++17", "-Wall", "-Wextra", "-Werror"])
+                .arg(&path)
+                .arg("-o")
+                .arg(&executable)
+                .current_dir(directory.path()),
+            "compile CUDA ODE delay emulation",
+        );
+        run_checked(
+            &mut Command::new(executable),
+            "execute CUDA ODE delay emulation",
+        );
+    }
+}
