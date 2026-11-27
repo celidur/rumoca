@@ -1,5 +1,6 @@
 #[cfg(feature = "fmu-packaging")]
 mod cuda_device_projection;
+mod cuda_ode_fixed_points;
 mod cuda_ode_initialization;
 mod cuda_ode_ladder;
 mod cuda_ode_lane_kernels;
