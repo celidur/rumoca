@@ -2,6 +2,7 @@ mod demanded_gathers;
 mod ordered_tensor_forwarding;
 mod prepared_tensor_snapshots;
 mod scalar_integer_payload;
+mod tensor_static_gradient;
 
 use super::*;
 use crate::prepared::assignment_shape_reads_y_index;
