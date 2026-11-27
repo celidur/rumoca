@@ -307,6 +307,11 @@ impl ProgramTable {
         self.isolators.share_contents = true;
     }
 
+    /// The pool entries `[start, start + count)`.
+    pub(super) fn pooled(&self, start: usize, count: usize) -> &[usize] {
+        &self.pool[start..start + count]
+    }
+
     /// Append `values` to the pool and return their start offset.
     pub(super) fn push(&mut self, values: impl IntoIterator<Item = usize>) -> usize {
         let start = self.pool.len();

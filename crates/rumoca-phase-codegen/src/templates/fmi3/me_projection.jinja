@@ -1958,7 +1958,122 @@ RMC_COLD {{ q }} int rmc_plan_converged(ModelInstance* m, const size_t* entries,
 }
 /* projection.rs: project_algebraics_with_plan_inner for one stage block under
    branch_continuity.rs; 0 settled, 1 not converged, -1 error */
+{%- set scalar_unrolled = device and me.blocks|selectattr("scalar")|list|length > 0 %}
+{%- if scalar_unrolled %}
+/* rmc_project_stage of a one-unknown, one-entry block whose row cannot
+   isolate its unknown and whose Jacobian is one lane call, with its
+   descriptor as constants: the stage loop, rmc_project_block's fallback
+   counts, the declined rmc_project_singleton and rmc_project_dense_scalar
+   (its Jacobian through the lane program, its scales from the variable
+   scales), in the same operations and order; the rare paths (seeding a
+   non-finite residual, the step search, the nudge, the uncertified
+   acceptance) call the descriptor-driven functions. */
+{%- for b in me.blocks %}{% if b.scalar %}{% set c = b.scalar %}{% set id = loop.index0 %}
+{{ q }} int rmc_scalar_dense_{{ id }}(ModelInstance* m, double before_row, RmcUpdate* update) {
+    bool changed = false; int result = 0; double residual = 0.0, jac = 0.0, rscale = 0.0, vscale = 0.0, delta = 0.0;
+    update->changed = false; update->settled = false;
+    residual = before_row;
+    if (!rmc_all_finite(&residual, 1)) {
+        const RmcBlock* b = rmc_block({{ id }});
+        int seeded = rmc_seed_assignments(m, b);
+        if (seeded < 0 || rmc_rows(m, b, &residual) != 0) return -1;
+        changed = seeded == 1;
+        if (!rmc_all_finite(&residual, 1)) { update->changed = changed; return 0; }
+    }
+    if (!m->rmc_certify && rmc_all_zero(&residual, 1)) { update->changed = changed; update->settled = true; return 0; }
+    {
+        double out[{{ c.lane_max_outputs if c.lane_max_outputs > 0 else 1 }}];
+        for (size_t i = 0; i < {{ c.lane_max_outputs if c.lane_max_outputs > 0 else 1 }}; ++i) out[i] = 0.0;
+        jac = 0.0;
+{%- for seed in c.seeds %}
+        m->rmc_lane_seed[{{ seed }}] = 1.0;
+{%- endfor %}
+        int status = rmc_lane_p{{ c.lane_program }}(m, m->rmc_lane_seed, out);
+{%- for seed in c.seeds %}
+        m->rmc_lane_seed[{{ seed }}] = 0.0;
+{%- endfor %}
+        if (status != 0) return -1;
+{%- for placement in c.placements %}
+        jac = out[{{ placement[0] * c.lane_outputs + placement[1] }}];
+{%- endfor %}
+    }
+    {
+        vscale = rmc_model_scale({{ c.y }}, m->y[{{ c.y }}]);
+        double fallback = {% if c.target != 0 %}rmc_model_scale({{ c.target - 1 }}, m->y[{{ c.target - 1 }}]){% else %}vscale{% endif %};
+        double valid = rmc_valid_scale(vscale), scale = 0.0;
+        double contribution = fabs(jac) * valid;
+        if (isfinite(contribution)) scale = rmc_max(scale, contribution);
+        rscale = scale > 0.0 ? scale : fallback;
+    }
+    bool converged = rmc_scaled_converged(m->rmc_tol, &residual, &rscale, 1);
+    if (converged && !m->rmc_certify) { update->changed = changed; update->settled = true; return 0; }
+    double before = rmc_scaled_norm(&residual, &rscale, 1);
+    double scaled = jac * rmc_valid_scale(vscale) / rmc_valid_scale(rscale);
+    double rhs = -residual / rmc_valid_scale(rscale), x = rhs;
+    if (scaled != 0.0) x = x / scaled;
+    else {
+        double sigma2 = 0.0, projection = 0.0;
+        sigma2 += scaled * scaled; projection += scaled * rhs; x = 0.0;
+        if (sqrt(sigma2) > m->rmc_tol) { double coefficient = projection / sigma2; x += coefficient * 1.0; }
+    }
+    delta = x * rmc_valid_scale(vscale);
+    if (converged && rmc_scaled_converged(m->rmc_tol, &delta, &vscale, 1)) {
+        if (rmc_correction_significant(m->rmc_tol, &delta, &vscale, 1)) m->y[{{ c.y }}] += delta;
+        update->changed = changed; update->settled = true;
+    }
+    else {
+        const RmcBlock* b = rmc_block({{ id }});
+        RmcUpdate accepted = { false, false };
+        result = rmc_accept_delta(m, b, &delta, &rscale, &vscale, before, &accepted);
+        if (result == 0) {
+            int nudged = (!accepted.changed && !converged) ? rmc_nudge(m, b, &jac, &vscale) : 0;
+            if (nudged < 0) result = -1;
+            else if (nudged == 1) update->changed = true;
+            else { update->changed = changed || accepted.changed; update->settled = accepted.settled; }
+        }
+    }
+    return result;
+}
+{{ q }} int rmc_scalar_stage_{{ id }}(ModelInstance* m) {
+    for (int iteration = 0; iteration < RMC_REFRESH_ITERS; ++iteration) {
+        if (!isfinite(m->y[{{ c.y }}])) m->y[{{ c.y }}] = 0.0;
+        RmcUpdate update = { false, false };
+        m->rmc_fb_calls[{{ id }}] += 1; m->rmc_fb_active[{{ id }}] = true;
+        int result;
+        {
+            /* The declined singleton assignment: its row's value at y. */
+            double out[{{ me.table.row_max_outputs }}];
+            int status = rmc_row_call({{ c.row_program }}, m, out);
+            if (status != 0) result = -1;
+            else {
+                double before = out[{{ c.row_offset }}];
+                if (!isfinite(before)) { update.changed = false; update.settled = false; result = 0; }
+                else result = rmc_scalar_dense_{{ id }}(m, before, &update);
+            }
+        }
+        m->rmc_fb_active[{{ id }}] = false;
+        if (result != 0) return -1;
+        if (update.settled) return 0;
+        if (!update.changed) break;
+    }
+    if (m->rmc_certify) return 1;
+    if (!isfinite(m->y[{{ c.y }}])) m->y[{{ c.y }}] = 0.0;
+    int accepted = rmc_block_accepted(m, rmc_block({{ id }}));
+    return accepted < 0 ? -1 : (accepted ? 0 : 1);
+}
+{%- endif %}{% endfor %}
+{%- endif %}
 {{ q }} inline int rmc_project_stage(ModelInstance* m, const RmcBlock* b) {
+{%- if scalar_unrolled %}
+#ifndef RMC_DENSE_SCALAR_OFF
+    switch (b->id) {
+{%- for b in me.blocks %}{% if b.scalar %}
+    case {{ loop.index0 }}: return rmc_scalar_stage_{{ loop.index0 }}(m);
+{%- endif %}{% endfor %}
+    default: break;
+    }
+#endif
+{%- endif %}
     const size_t b_n = RMC_BS(b, n); const size_t* const b_y_pool = RMC_BP(b, y);
     for (int iteration = 0; iteration < RMC_REFRESH_ITERS; ++iteration) {
         for (size_t i = 0; i < b_n; ++i) if (!isfinite(m->y[b_y_pool[i]])) m->y[b_y_pool[i]] = 0.0;

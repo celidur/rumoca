@@ -227,6 +227,25 @@ fn a_device_unit_unrolls_the_origin_test_of_an_affine_block() {
     );
 }
 
+/// A device unit unrolls the projection stage of a one-unknown block that
+/// the scalar Newton settles (its row cannot isolate its unknown, one lane
+/// call forms its Jacobian): through it, the lanes of
+/// `a_device_build_refreshes_every_lane_as_the_fmi_component` refresh as
+/// the FMI component, whose C keeps the descriptor-driven stage, bit for bit.
+#[test]
+fn a_device_unit_unrolls_the_scalar_newton_stage_of_a_one_unknown_block() {
+    let mut unrolled = Vec::new();
+    for (compiled, model) in models() {
+        if device_unit(&compiled).contains(": return rmc_scalar_stage_") {
+            unrolled.push(model);
+        }
+    }
+    assert!(
+        unrolled.contains(&"DeviceArrayLoop"),
+        "the one-unknown cubic blocks unroll their stage: {unrolled:?}"
+    );
+}
+
 /// A lowered model reaches the device kernel through the admission of the C
 /// component: one whose initial vector disagrees with its layout is refused
 /// before any unit is rendered, with the component's reason.

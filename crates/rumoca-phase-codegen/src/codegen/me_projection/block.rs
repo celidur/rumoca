@@ -161,6 +161,67 @@ pub(super) struct BlockRecord {
     /// The origin convergence test of a coupled affine block, unrolled for a
     /// device unit (`OriginConverged`).
     origin: Option<OriginConverged>,
+    /// The stage of a one-unknown block the scalar Newton settles, unrolled
+    /// for a device unit (`ScalarStage`).
+    scalar: Option<ScalarStage>,
+}
+
+/// The projection stage of a one-unknown, one-entry block whose row's
+/// isolation of its unknown is unavailable and whose Jacobian is one lane
+/// call: the descriptor fields the stage reads, as constants. A device unit
+/// renders the stage (`rmc_project_stage`, `rmc_project_block`, the
+/// declined `rmc_project_singleton` and `rmc_project_dense_scalar`) as one
+/// function with the same operations in the same order, calling the row's
+/// program through its dispatcher and the lane program directly.
+#[derive(Serialize)]
+pub(super) struct ScalarStage {
+    y: usize,
+    row_program: usize,
+    row_offset: usize,
+    target: usize,
+    lane_program: usize,
+    lane_outputs: usize,
+    lane_max_outputs: usize,
+    seeds: Vec<usize>,
+    /// `(lane, output offset)` of each placement into the one entry.
+    placements: Vec<(usize, usize)>,
+}
+
+fn scalar_stage(table: &ProgramTable, record: &BlockRecord) -> Option<ScalarStage> {
+    let eligible = record.n == 1
+        && record.nnz == 1
+        && !record.singleton_exact
+        && !record.has_tearing
+        && !record.affine
+        && !record.torn
+        && record.nlane_calls == 1;
+    if !eligible {
+        return None;
+    }
+    let starts = table.pooled(record.iso_start, 2);
+    let kind = match starts[1] - starts[0] {
+        0 => table.pooled(record.iso_default, 1)[0],
+        _ => table.pooled(record.iso_entries + 3 * starts[0], 3)[1],
+    };
+    if kind != ISOLATION_UNAVAILABLE {
+        return None;
+    }
+    let call = table.pooled(record.lane_calls, LANE_CALL_FIELDS);
+    let placements = table.pooled(call[4], 3 * call[5]);
+    Some(ScalarStage {
+        y: table.pooled(record.y, 1)[0],
+        row_program: table.pooled(record.row_program, 1)[0],
+        row_offset: table.pooled(record.row_offset, 1)[0],
+        target: table.pooled(record.row_target, 1)[0],
+        lane_program: call[0],
+        lane_outputs: call[6],
+        lane_max_outputs: record.lane_max_outputs,
+        seeds: table.pooled(call[2], call[3]).to_vec(),
+        placements: placements
+            .chunks(3)
+            .map(|placement| (placement[0], placement[1]))
+            .collect(),
+    })
 }
 
 /// `rmc_origin_converged` of one coupled affine block, its pools unrolled:
@@ -441,6 +502,7 @@ pub(super) fn block_record(
         isolation_reachable,
         &mut record,
     )?;
+    record.scalar = scalar_stage(table, &record);
     Ok(record)
 }
 
