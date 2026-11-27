@@ -778,7 +778,8 @@ cone, every register version it reads was written by an invariant operation,
 every register it writes is written once in the program, and it has no
 non-repeatable effect (a random or impure operation); output stores are never
 invariant. The invariant part is the invariant operations in program order,
-and its live-out registers are those a remaining operation reads. The
+and its live-out registers are those a remaining operation reads. A program
+without a live-out register keeps no split. The
 dependent part is the remaining operations in program order, entered with the
 live-out registers preset. A block projection call changes only the block's
 unknowns at fixed parameters, time, and external tables, so every invariant

@@ -31,8 +31,8 @@ pub enum BlockResidualSplitError {
 
 impl BlockResidualSplit {
     /// The split of `program` for the block unknowns `unknowns`, or `None`
-    /// when no operation is invariant or the program's register flow is
-    /// invalid.
+    /// when no operation is invariant, no invariant value reaches the
+    /// dependent part, or the program's register flow is invalid.
     #[must_use]
     pub fn derive(program: &[LinearOp], unknowns: &[usize]) -> Option<Self> {
         let register_count = ScalarProgramRegisterFlow::derive(program)
@@ -50,6 +50,9 @@ impl BlockResidualSplit {
         let invariant: Box<[LinearOp]> = invariant.into_iter().map(|(op, _)| op.clone()).collect();
         let dependent: Box<[LinearOp]> = dependent.into_iter().map(|(op, _)| op.clone()).collect();
         let live_out = live_out_registers(&dependent, &invariant, register_count)?;
+        if live_out.is_empty() {
+            return None;
+        }
         Some(Self {
             invariant,
             live_out: live_out.into_boxed_slice(),

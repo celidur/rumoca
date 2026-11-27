@@ -132,3 +132,18 @@ fn a_program_without_invariant_work_does_not_split() {
     let program = vec![L::LoadY { dst: 0, index: 0 }, L::StoreOutput { src: 0 }];
     assert!(BlockResidualSplit::derive(&program, &[0]).is_none());
 }
+
+#[test]
+fn invariant_work_no_dependent_operation_reads_does_not_split() {
+    let program = vec![
+        L::Const { dst: 0, value: 4.0 },
+        L::Unary {
+            dst: 1,
+            op: UnaryOp::Sqrt,
+            arg: 0,
+        },
+        L::LoadY { dst: 2, index: 0 },
+        L::StoreOutput { src: 2 },
+    ];
+    assert!(BlockResidualSplit::derive(&program, &[0]).is_none());
+}
