@@ -260,6 +260,28 @@ fn parameter_static_y_gradient_inner(row: &[LinearOp]) -> Option<bool> {
                 output = Some(dependency_at(&registers, src)?);
                 None
             }
+            LinearOp::StoreOutputRange {
+                start,
+                count,
+                stride,
+            } => {
+                if output.is_some() {
+                    return Some(false);
+                }
+                let stored = (0..count)
+                    .map(|ordinal| dependency_at(&registers, start + reg_offset(ordinal * stride)?))
+                    .collect::<Option<Vec<_>>>()?;
+                output = Some(joint(stored));
+                None
+            }
+            LinearOp::TensorLoad { .. }
+            | LinearOp::TensorBinary { .. }
+            | LinearOp::MatrixMultiply { .. }
+            | LinearOp::TensorTranspose { .. }
+            | LinearOp::TensorConcatenate { .. } => {
+                tensor_gradient_dependency(op, &mut registers)?;
+                None
+            }
             LinearOp::LoadSeed { .. } | LinearOp::LinearSolveComponent { .. } => {
                 return Some(false);
             }
@@ -274,6 +296,163 @@ fn parameter_static_y_gradient_inner(row: &[LinearOp]) -> Option<bool> {
 
 fn dependency_at(registers: &[GradientDependency], register: u32) -> Option<GradientDependency> {
     registers.get(register as usize).copied()
+}
+
+fn reg_offset(offset: usize) -> Option<Reg> {
+    Reg::try_from(offset).ok()
+}
+
+/// The dependency every element of an aggregate has at least: a parameter
+/// value, a zero gradient, or a parameter-only gradient when each element
+/// has it.
+fn joint(dependencies: impl IntoIterator<Item = GradientDependency>) -> GradientDependency {
+    dependencies
+        .into_iter()
+        .fold(GradientDependency::PARAMETER_VALUE, |acc, element| {
+            GradientDependency {
+                value_parameter_only: acc.value_parameter_only && element.value_parameter_only,
+                gradient_zero: acc.gradient_zero && element.gradient_zero,
+                gradient_parameter_only: acc.gradient_parameter_only
+                    && element.gradient_parameter_only,
+            }
+        })
+}
+
+/// The element dependencies of `count` registers from `start`.
+fn range_at(
+    registers: &[GradientDependency],
+    start: Reg,
+    count: usize,
+) -> Option<Vec<GradientDependency>> {
+    (0..count)
+        .map(|offset| dependency_at(registers, start + reg_offset(offset)?))
+        .collect()
+}
+
+fn write_range(
+    registers: &mut [GradientDependency],
+    start: Reg,
+    values: Vec<GradientDependency>,
+) -> Option<()> {
+    for (offset, value) in values.into_iter().enumerate() {
+        *registers.get_mut((start + reg_offset(offset)?) as usize)? = value;
+    }
+    Some(())
+}
+
+/// The dependencies a primal tensor operation writes (one lane: a program
+/// carrying tangent lanes or seeds is not certified). An elementwise
+/// operation and a matrix product take the scalar rules element by element;
+/// a transpose or a concatenation gives every element the joint of its
+/// sources. `None` refuses the program.
+fn tensor_gradient_dependency(op: &LinearOp, registers: &mut [GradientDependency]) -> Option<()> {
+    let (dst, values) = match *op {
+        LinearOp::TensorLoad {
+            dst_start,
+            input,
+            count,
+            seed_start: None,
+            lanes: 1,
+            ..
+        } => {
+            let element = match input {
+                rumoca_ir_solve::TensorInputKind::Y => GradientDependency::Y_VALUE,
+                rumoca_ir_solve::TensorInputKind::P => GradientDependency::PARAMETER_VALUE,
+            };
+            (dst_start, vec![element; count])
+        }
+        LinearOp::TensorBinary {
+            dst_start,
+            op,
+            lhs_start,
+            rhs_start,
+            count,
+            lhs_stride,
+            rhs_stride,
+            lanes: 1,
+        } => {
+            let values = (0..count)
+                .map(|i| {
+                    let lhs = dependency_at(registers, lhs_start + reg_offset(i * lhs_stride)?)?;
+                    let rhs = dependency_at(registers, rhs_start + reg_offset(i * rhs_stride)?)?;
+                    Some(binary_gradient_dependency(op, lhs, rhs))
+                })
+                .collect::<Option<Vec<_>>>()?;
+            (dst_start, values)
+        }
+        LinearOp::MatrixMultiply {
+            dst_start,
+            lhs_start,
+            rhs_start,
+            rows,
+            inner,
+            columns,
+            lanes: 1,
+        } => {
+            let values = (0..rows * columns)
+                .map(|entry| {
+                    let operands = (lhs_start, rhs_start, inner, columns);
+                    product_entry(registers, operands, entry / columns, entry % columns)
+                })
+                .collect::<Option<Vec<_>>>()?;
+            (dst_start, values)
+        }
+        LinearOp::TensorTranspose {
+            dst_start,
+            src_start,
+            rows,
+            columns,
+            element_width,
+            lanes: 1,
+        } => {
+            let count = rows.checked_mul(columns)?.checked_mul(element_width)?;
+            let all = joint(range_at(registers, src_start, count)?);
+            (dst_start, vec![all; count])
+        }
+        LinearOp::TensorConcatenate {
+            dst_start,
+            ref sources,
+            ref dimensions,
+            lanes: 1,
+            ..
+        } => {
+            let mut all = Vec::new();
+            for source in sources.iter() {
+                let count = element_count(&source.dimensions)?;
+                all.extend(range_at(registers, source.start, count)?);
+            }
+            (dst_start, vec![joint(all); element_count(dimensions)?])
+        }
+        _ => return None,
+    };
+    write_range(registers, dst, values)
+}
+
+/// Entry (`row`, `column`) of a matrix product: the sum over the inner
+/// extent of the products of its operands' elements, under the scalar rules;
+/// an empty sum is a constant.
+fn product_entry(
+    registers: &[GradientDependency],
+    (lhs_start, rhs_start, inner, columns): (Reg, Reg, usize, usize),
+    row: usize,
+    column: usize,
+) -> Option<GradientDependency> {
+    let mut sum: Option<GradientDependency> = None;
+    for k in 0..inner {
+        let lhs = dependency_at(registers, lhs_start + reg_offset(row * inner + k)?)?;
+        let rhs = dependency_at(registers, rhs_start + reg_offset(k * columns + column)?)?;
+        let product = binary_gradient_dependency(BinaryOp::Mul, lhs, rhs);
+        sum = Some(sum.map_or(product, |sum| {
+            binary_gradient_dependency(BinaryOp::Add, sum, product)
+        }));
+    }
+    Some(sum.unwrap_or(GradientDependency::PARAMETER_VALUE))
+}
+
+fn element_count(dimensions: &[u32]) -> Option<usize> {
+    dimensions
+        .iter()
+        .try_fold(1usize, |count, &extent| count.checked_mul(extent as usize))
 }
 
 fn binary_gradient_dependency(
