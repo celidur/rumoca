@@ -190,7 +190,7 @@ static __device__ RMC_NOINLINE int {{ name }}_g{{ g.open }}({{ params }}) {
 {%- if me.kernel or me.assign.plan.programs|length > 0 %} bool rmc_fatal;{% endif -%}
 {%- if me.blocks|length > 0 and me.seed_rule == "CommittedAcceptedPoint" %} double rmc_commit_y[Y_LEN]; double rmc_mark_x[STATE_LEN]; double rmc_mark_t; bool rmc_seeding; bool rmc_mark_pending; bool rmc_mark_resolved;{% endif -%}
 {%- if me.blocks|length > 0 %} double rmc_seed[{{ me.seed_len if me.seed_len > 0 else 1 }}]; size_t rmc_fb_calls[{{ me.blocks|length + 1 }}]; size_t rmc_fb_count[{{ me.blocks|length + 1 }}]; size_t rmc_fb_mark[{{ me.blocks|length + 1 }}]; bool rmc_fb_active[{{ me.blocks|length + 1 }}]; bool rmc_fb_reported[{{ me.blocks|length + 1 }}];{% endif -%}
-{%- if me.lane_max > 0 %} double rmc_lane_seed[{{ (me.seed_len if me.seed_len > 0 else 1) * me.lane_max }}];{% endif -%}
+{%- if me.lane_max > 0 %} double rmc_lane_seed[{{ me.blocks|map(attribute="lane_seed_extent")|max }}];{% endif -%}
 {%- if me.switching %} size_t rmc_chart; size_t rmc_chart_target; bool rmc_chart_pending; double rmc_chart_reference; double rmc_chart_target_reference; bool rmc_chart_log; double rmc_chart_y[Y_LEN];{% endif -%}
 {%- if me.kernel or me.assign.plan.programs|length > 0 %}
 #if defined(RMC_LANE_STATUS)

@@ -133,6 +133,9 @@ pub(super) struct BlockRecord {
     /// the block belongs to; the C table holds its offset in a pool instead.
     #[serde(skip)]
     fold: Option<Vec<u8>>,
+    /// One past the last lane seed position the block's lane programs read
+    /// or its torn tangent writes: the lane seed array the block needs.
+    lane_seed_extent: usize,
 }
 
 pub(super) fn refuse(canonical: usize, reason: &str) -> CodegenError {
@@ -525,6 +528,7 @@ fn record_lane_calls(
         let lanes = call.colors.len();
         let program = std::sync::Arc::clone(&plan.programs()[call.program]);
         check_seed_loads(canonical, program.ops(), sources.seed_len, lanes)?;
+        record.lane_seed_extent = record.lane_seed_extent.max(seed_extent(program.ops()));
         let outputs = program.lane_outputs();
         let seeds = lane_seed_positions(program.ops(), &call.colors, application);
         let function = table.lanes.intern(program, span);
@@ -587,6 +591,26 @@ fn lane_seed_positions(
                 .contains(&(position / lanes))
         })
         .collect()
+}
+
+/// One past the last lane seed position a tangent-lane program reads: a
+/// `LoadSeed` index is a position, a tensor load's range covers the positions
+/// of its seeds' lanes.
+pub(super) fn seed_extent(operations: &[solve::LinearOp]) -> usize {
+    operations
+        .iter()
+        .map(|operation| match operation {
+            solve::LinearOp::LoadSeed { index, .. } => index + 1,
+            solve::LinearOp::TensorLoad {
+                seed_start: Some(start),
+                count,
+                lanes: width,
+                ..
+            } => (start + count) * width.saturating_sub(1),
+            _ => 0,
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 /// Refuse a program reading a seed outside `seed_len` seeds of `lanes`
@@ -706,6 +730,16 @@ fn record_torn_tangent(
         record.tangent_directional = true;
         tangent_directions(sources, table, canonical, &plan, record)?
     } else {
+        // `rmc_torn_tangent` seeds each tear's lane and writes every causal
+        // target's tangent into the lanes of its solver-Y slot.
+        let written = tearing
+            .tear_y_indices
+            .iter()
+            .copied()
+            .chain(plan.steps().iter().map(|step| step.target))
+            .max()
+            .map_or(0, |slot| (slot + 1) * lanes);
+        record.lane_seed_extent = record.lane_seed_extent.max(written);
         tangent_lanes(sources, table, canonical, &plan, record)?
     };
     let steps = plan.steps().iter().flat_map(|step| {
@@ -743,6 +777,7 @@ fn tangent_lanes(
     let mut functions = BTreeMap::new();
     for (index, program) in plan.programs().iter().enumerate() {
         check_seed_loads(canonical, program.ops(), sources.seed_len, lanes)?;
+        record.lane_seed_extent = record.lane_seed_extent.max(seed_extent(program.ops()));
         let outputs = program.lane_outputs();
         record.lane_max_outputs = record.lane_max_outputs.max(lanes * outputs);
         let function = table
