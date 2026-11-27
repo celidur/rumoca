@@ -32,6 +32,7 @@
 use nalgebra::DMatrix;
 use rumoca_ir_solve as solve;
 
+use super::converged_correction::Correction;
 use super::scaling::{
     ScaledNewtonSystem, jacobian_row_scales, model_variable_scale, scaled_correction_converged,
     scaled_newton_delta, scaled_residual_converged, scaled_residual_norm,
@@ -100,6 +101,9 @@ pub(super) fn project_torn_algebraic_block<M: ImplicitProjectionModel>(
 
     let mut step_scales: Option<Vec<f64>> = None;
     for _ in 0..TORN_OUTER_MAX_ITERS {
+        // A converged correction marks no change (`converged_correction`), so
+        // the block changed only if it had moved before the step that applies it.
+        let moved = snapshot.changed(tearing, y);
         // After an exact Newton step, the step's own row scales license the
         // residual check at the new point: it settles an uncertified refresh
         // without forming the Jacobian again. Certification still checks the
@@ -128,6 +132,12 @@ pub(super) fn project_torn_algebraic_block<M: ImplicitProjectionModel>(
                 let changed = snapshot.changed(tearing, y);
                 return Ok(Some(ProjectionBlockUpdate {
                     changed,
+                    settled: true,
+                }));
+            }
+            TornStep::Corrected => {
+                return Ok(Some(ProjectionBlockUpdate {
+                    changed: moved,
                     settled: true,
                 }));
             }
@@ -167,6 +177,10 @@ fn settles_on_step_scales(
 enum TornStep {
     /// The reduced residual meets tolerance; the block is solved.
     Settled,
+    /// Under certification, the reduced residual and every correction meet
+    /// tolerance; `y` holds the point of the undamped correction, applied as a
+    /// dense block applies its converged correction (`converged_correction`).
+    Corrected,
     /// An exact Newton step was accepted; carries the reduced residual at the
     /// new point and the row scales of the Jacobian the step solved.
     Advanced(Vec<f64>, Vec<f64>),
@@ -177,7 +191,8 @@ enum TornStep {
 /// Advance the reduced Newton by one iteration from the current point in `y`.
 ///
 /// On `Advanced` `y` holds the accepted point; on `Settled` it holds the
-/// converged point; on `Decline` it is restored to the point held on entry.
+/// converged point; on `Corrected` the converged point moved by its
+/// correction; on `Decline` it is restored to the point held on entry.
 // SPEC_0021: Exception - one reduced Newton iteration threads model, storage, tearing, residual, scales, and tolerance together.
 #[allow(clippy::too_many_arguments)]
 fn advance_torn_newton<M: ImplicitProjectionModel>(
@@ -236,20 +251,29 @@ fn advance_torn_newton<M: ImplicitProjectionModel>(
     // Small tear corrections can still produce large recovered-coordinate
     // changes. Certification checks the undamped step through the complete
     // causal sweep as well as the tear coordinates.
-    if converged
-        && (!certify_coordinates
-            || (scaled_correction_converged(delta.as_slice(), variable_scales, tol)
-                && recovered_correction_converged(
-                    model,
-                    &base,
-                    tearing,
-                    &jacobian.recovered,
-                    delta.as_slice(),
-                    tol,
-                )
-                && causal_correction_converged(model, y, (p, t), tearing, &step)?))
-    {
+    if converged && !certify_coordinates {
         return Ok(TornStep::Settled);
+    }
+    // A significant converged correction is applied (`converged_correction`).
+    let correction = Correction::new(delta.as_slice(), variable_scales, tol);
+    let keep = correction.significant();
+    if converged
+        && correction.converged()
+        && recovered_correction_converged(
+            model,
+            &base,
+            tearing,
+            &jacobian.recovered,
+            delta.as_slice(),
+            tol,
+        )
+        && causal_correction_converged(model, y, (p, t), tearing, &step, keep)?
+    {
+        return Ok(if keep {
+            TornStep::Corrected
+        } else {
+            TornStep::Settled
+        });
     }
     match line_search(model, y, p, t, tearing, step)? {
         Some(next) => Ok(TornStep::Advanced(next, row_scales)),
@@ -518,15 +542,26 @@ fn recovered_correction_converged<M: ImplicitProjectionModel>(
 }
 
 /// Whether the undamped step moves every causal target within tolerance. The
-/// trial runs in `y`, which holds the step's base on entry and on return.
+/// trial runs in `y`, which holds the step's base on entry; it keeps the
+/// step's point when the step converges and `keep` asks for it, and holds the
+/// base otherwise.
 fn causal_correction_converged<M: ImplicitProjectionModel>(
     model: &M,
     y: &mut [f64],
     (p, t): (&[f64], f64),
     tearing: &solve::BlockTearing,
     step: &LineSearchStep<'_>,
+    keep: bool,
 ) -> Result<bool, RuntimeSolveError> {
     if tearing.causal_steps.is_empty() {
+        if !keep {
+            return Ok(true);
+        }
+        for (tear, (&index, &direction)) in
+            tearing.tear_y_indices.iter().zip(step.delta).enumerate()
+        {
+            y[index] = step.base.tear(tear) + direction;
+        }
         return Ok(true);
     }
     let accepted = line_search_step(model, y, p, t, tearing, step)?.is_some();
@@ -540,7 +575,9 @@ fn causal_correction_converged<M: ImplicitProjectionModel>(
                 let scale = model_variable_scale(model, causal.y_index, base);
                 scaled_correction_converged(&[y[causal.y_index] - base], &[scale], step.tol)
             });
-    step.base.restore(tearing, y);
+    if !(converged && keep) {
+        step.base.restore(tearing, y);
+    }
     Ok(converged)
 }
 
