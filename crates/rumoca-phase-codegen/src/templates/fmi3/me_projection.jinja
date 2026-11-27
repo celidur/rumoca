@@ -2360,10 +2360,16 @@ fail:
         {% for target in chunk %}{{ "true" if target.Y is defined else "false" }},{% endfor %}
 {%- endfor %}
     };
+{%- if device %}
+    /* A device thread's stack is reserved for every resident thread: the
+       lane's instance holds these values instead. */
+    double* before = m->rmc_bind_before;
+{%- else %}
     double before[{{ targets|length }}];
+{%- endif %}
     for (size_t k = 0; k < {{ targets|length }}; ++k) before[k] = in_y[k] ? m->y[targets[k]] : m->p[targets[k]];
 {%- if device %}
-    double binding_output[{{ targets|length }}];
+    double* binding_output = m->rmc_bind_output;
     if (rmc_binding_runs(m, initializing, binding_output) != 0) return -1;
 {%- else %}
 {%- for execution in fmi.binding_execution %}
@@ -3686,7 +3692,8 @@ typedef enum { {{ prefix }}OK, {{ prefix }}Warning, {{ prefix }}Discard, {{ pref
 #define RMC_LANE_STATUS 1
 #endif
 {{- lane_status_type(me) }}
-typedef struct { bool parameters_dirty; bool rmc_nonfinite; bool assertion_failed; double time; double y[Y_LEN]; double p[P_LEN];{{ workspace_fields(me, device=true) }} } ModelInstance;
+{%- set bindings = solve.initialization.update_targets|length %}
+typedef struct { bool parameters_dirty; bool rmc_nonfinite; bool assertion_failed; double time; double y[Y_LEN]; double p[P_LEN];{% if bindings > 0 %} double rmc_bind_before[{{ bindings }}]; double rmc_bind_output[{{ bindings }}];{% endif %}{{ workspace_fields(me, device=true) }} } ModelInstance;
 #define RMC_INFO(m, category, message) ((void)(m), (void)(category), (void)(message))
 /* The unit is a library: a lane kernel calls only the entries it needs, so
    every device function carries the unused attribute (RMC_UNUSED, which the
