@@ -1,7 +1,8 @@
 //! cuda-ode delays: the channels of one delay-time row are read together at
 //! the place of their instant in the history's times, with the stencil over
-//! them, and rows of a few delay times take the places of the last instants
-//! placed.
+//! them, rows of a few delay times take the places of the last instants
+//! placed, and a lane keeps the values it read from the history alone until
+//! the next point.
 
 use super::{rendered_model_target, run_checked};
 use rumoca::Compiler;
@@ -294,6 +295,116 @@ fn cuda_ode_lanes_evaluate_a_delay_maximum_only_when_one_is_given() {
         )
         .expect("write the delay harness");
         let executable = directory.path().join("cuda-ode-unbounded");
+        run_checked(
+            Command::new("c++")
+                .args(["-std=c++17", "-Wall", "-Wextra", "-Werror"])
+                .arg(&path)
+                .arg("-o")
+                .arg(&executable)
+                .current_dir(directory.path()),
+            "compile CUDA ODE delay emulation",
+        );
+        run_checked(
+            &mut Command::new(executable),
+            "execute CUDA ODE delay emulation",
+        );
+    }
+}
+
+/// Launches `Unbounded` again at one instant, where a lane writes the values
+/// it kept, against a lane that kept nothing: after another trial point,
+/// another delay time, a new point, and a delay short enough to read the
+/// trial point. x is t cubed, which three and four points read differently.
+const KEPT_HARNESS: &str = r#"
+static int x = -1;
+static double cube(double t) { return t * t * t; }
+static void start(double *y, double *p, double *history) {
+    int status = -1;
+    Unbounded_load_starts_batch(y, p, UNBOUNDED_Y_LEN, UNBOUNDED_P_LEN, 1);
+    Unbounded_initialize_batch(0.0, y, p, &status, UNBOUNDED_Y_LEN, UNBOUNDED_P_LEN, 1);
+    Unbounded_delay_init_batch(0.0, y, p, history, UNBOUNDED_Y_LEN, UNBOUNDED_P_LEN, UNBOUNDED_DELAY_HISTORY_STRIDE, 1);
+}
+static void accept(double time, double *y, double *p, double *history) {
+    y[x] = cube(time);
+    Unbounded_delay_commit_batch(time, y, p, history, UNBOUNDED_Y_LEN, UNBOUNDED_P_LEN, UNBOUNDED_DELAY_HISTORY_STRIDE, 1);
+}
+static double apply(double tau, double current, double *y, double *p, double *history) {
+    p[0] = tau; p[1] = 7.0; y[x] = current;
+    Unbounded_delay_apply_batch(0.35, y, p, history, UNBOUNDED_Y_LEN, UNBOUNDED_P_LEN, UNBOUNDED_DELAY_HISTORY_STRIDE, 1);
+    return p[1];
+}
+// What a lane that kept nothing applies after `points` points.
+static double fresh(const double *times, int points, double tau, double current) {
+    double y[UNBOUNDED_Y_LEN], p[UNBOUNDED_P_LEN];
+    static double history[UNBOUNDED_DELAY_HISTORY_STRIDE];
+    start(y, p, history);
+    for (int k = 1; k < points; ++k) accept(times[k], y, p, history);
+    return apply(tau, current, y, p, history);
+}
+static int differs(const char *what, double got, double want) {
+    if (std::memcmp(&got, &want, sizeof got) == 0) return 0;
+    std::printf("%s: %.17g/%.17g\n", what, got, want);
+    return 1;
+}
+
+int main() {
+    blockIdx.x = 0; blockDim.x = 1; threadIdx.x = 0;
+    static const double times[5] = {0.0, 0.1, 0.2, 0.3, 0.32};
+    double y[UNBOUNDED_Y_LEN], p[UNBOUNDED_P_LEN];
+    static double history[UNBOUNDED_DELAY_HISTORY_STRIDE];
+    for (int i = 0; i < UNBOUNDED_Y_LEN; ++i) {
+        if (std::strcmp(Unbounded_y_names[i], "x") == 0) x = i;
+    }
+    if (x < 0) { std::printf("missing x\n"); return 1; }
+    start(y, p, history);
+    for (int k = 1; k < 4; ++k) accept(times[k], y, p, history);
+    const double first = apply(0.12, cube(0.35), y, p, history);
+    int failed = differs("first launch", first, fresh(times, 4, 0.12, cube(0.35)));
+    failed |= differs("another trial point", apply(0.12, 99.0, y, p, history), first);
+    const double other = apply(0.17, 99.0, y, p, history);
+    failed |= differs("another delay time", other, fresh(times, 4, 0.17, 99.0));
+    failed |= differs("the first delay time again", apply(0.12, 99.0, y, p, history), first);
+    accept(times[4], y, p, history);
+    const double later = apply(0.12, 99.0, y, p, history);
+    failed |= differs("a new point", later, fresh(times, 5, 0.12, 99.0));
+    const double near = apply(0.01, 1.0, y, p, history);
+    failed |= differs("a trial point read", near, fresh(times, 5, 0.01, 1.0));
+    const double moved = apply(0.01, 2.0, y, p, history);
+    failed |= differs("a trial point read again", moved, fresh(times, 5, 0.01, 2.0));
+    if (failed) return 1;
+    if (other == first || later == first || moved == near) {
+        std::printf("the launches read alike: %.17g %.17g %.17g %.17g %.17g\n", first, other, later, near, moved);
+        return 1;
+    }
+    return 0;
+}
+"#;
+
+#[test]
+fn cuda_ode_lanes_keep_delayed_values_until_the_next_point() {
+    // Without a maximum and with one, which the lane keeps beside the delay
+    // time.
+    let bounded = UNBOUNDED.replace("delay(x, tau)", "delay(x, tau, 1)");
+    for source in [UNBOUNDED, &*bounded] {
+        let compiled = Compiler::new()
+            .model("Unbounded")
+            .compile_str(source, "Unbounded.mo")
+            .expect("the compiler accepts the delay");
+        let (directory, files) = rendered_model_target(&compiled, "Unbounded", "cuda-ode");
+        let kernel = files
+            .iter()
+            .find(|file| file.path.ends_with("_ode.cu"))
+            .expect("cuda-ode emits its kernel");
+        let path = directory.path().join("kept.cpp");
+        let prelude = "#include <cmath>\n#include <cstdio>\n#include <cstring>\n\
+            struct Dim3 { int x; };\nstatic Dim3 blockIdx, blockDim, threadIdx;\n\
+            #define __global__\n#define __host__\n#define __device__\n";
+        fs::write(
+            &path,
+            format!("{prelude}#include {:?}\n{KEPT_HARNESS}", kernel.path),
+        )
+        .expect("write the delay harness");
+        let executable = directory.path().join("cuda-ode-kept");
         run_checked(
             Command::new("c++")
                 .args(["-std=c++17", "-Wall", "-Wextra", "-Werror"])

@@ -55,7 +55,8 @@ and integration (including event location and stopping at time events).
   and `<model>_delay_commit_batch` (after each accepted step). A lane reads
   its history as the runtime does (`delayed_value`), and reads NaN for a
   delay time outside `[0, delayMax]` or a time older than the points its
-  ring kept.
+  ring kept. It keeps the values it read from the history alone and writes
+  them again at the same time and delay times, until the next point.
 - Initialization: `<model>_load_starts_batch` writes the compiled start values,
   `<model>_initialize_batch` runs the parameter and start bindings and the
   initial event. Initial equations solved for states or `fixed = false`

@@ -1058,11 +1058,18 @@ extern "C" __global__ void {{ name }}_initialize_batch(
 // The capacity must cover the longest delay at the smallest step; override it
 // with -D{{ NAME }}_DELAY_CAPACITY=n. `history[0]` holds the number of points,
 // plus one once the ring has dropped its oldest point, and `history[1]` the
-// slot of the oldest one.
+// slot of the oldest one. After the ring, the lane keeps the last values it
+// applied from the history alone: the time, the delay time of each row{% if delays.distinct_maxima %}, the
+// maximum of each channel{% endif %} and the values, which stand until the next point.
 #ifndef {{ NAME }}_DELAY_CAPACITY
 #define {{ NAME }}_DELAY_CAPACITY 1024
 #endif
-#define {{ NAME }}_DELAY_HISTORY_STRIDE (2 + {{ NAME }}_DELAY_CAPACITY * (1 + {{ NAME }}_DELAYS))
+#define {{ NAME }}_DELAY_RING (2 + {{ NAME }}_DELAY_CAPACITY * (1 + {{ NAME }}_DELAYS))
+{%- if delays.count > 0 %}
+#define {{ NAME }}_DELAY_HISTORY_STRIDE ({{ NAME }}_DELAY_RING + {{ 1 + (delays.time_group_ends | length) + delays.count * (2 if delays.distinct_maxima else 1) }})
+{%- else %}
+#define {{ NAME }}_DELAY_HISTORY_STRIDE {{ NAME }}_DELAY_RING
+{%- endif %}
 {%- if delays.count > 0 %}
 
 __device__ __noinline__ void {{ name }}_delay_sources(double time, const double *batch_y, const double *batch_p, double *__sources)
@@ -1107,6 +1114,8 @@ typedef struct {
     int kind;
     // The last point is at or before the time of the read.
     int past;
+    // A read may take the current source: no point, or none after `query`.
+    int open;
     // FIRST: before a first point the ring dropped points before.
     int dropped;
     // The stencil's points, the lower one at `lower` and the next one after
@@ -1134,6 +1143,7 @@ __device__ void {{ name }}_delay_locate(const double *history, double time, doub
 #define {{ NAME }}_AT(i) (head + (i) >= capacity ? head + (i) - capacity : head + (i))
     place->kind = {{ NAME }}_DELAY_EMPTY;
     place->past = 0;
+    place->open = count <= 0;
     place->dropped = 0;
     place->points = 0;
     place->lower = 0;
@@ -1167,6 +1177,7 @@ __device__ void {{ name }}_delay_locate(const double *history, double time, doub
     double next_time = upper < count ? times[next_slot] : time;
     place->slot[0] = {{ NAME }}_AT(lower);
     place->slot[1] = next_slot;
+    place->open = next_slot < 0;
     if (upper < count && next_time == lower_time) {
         place->kind = {{ NAME }}_DELAY_LEFT;
         return;
@@ -1308,6 +1319,8 @@ __device__ void {{ name }}_delay_append(double *history, double time, const doub
     for (int channel = 0; channel < {{ delays.count }}; ++channel) {
         history[2 + (long long)capacity * (long long)(1 + channel) + slot] = sources[channel];
     }
+    // The values the lane kept were read before this point.
+    history[{{ NAME }}_DELAY_RING] = NAN;
     history[0] = (double)(count + 1 + dropped);
     history[1] = (double)head;
 }
@@ -1362,12 +1375,14 @@ extern "C" __global__ void {{ name }}_delay_init_batch(
 }
 
 // Write every delayed value at `time` into its parameter slot, or NaN for a
-// delay time outside [0, delayMax].
+// delay time outside [0, delayMax]. Values read from the history alone are
+// kept in it: a launch at the same time and delay times before the next
+// point, such as the evaluations of one step, writes them again.
 extern "C" __global__ void {{ name }}_delay_apply_batch(
     double time,
     const double *y,
     double *p,
-    const double *history,
+    double *history,
     int y_stride,
     int p_stride,
     int history_stride,
@@ -1379,7 +1394,7 @@ extern "C" __global__ void {{ name }}_delay_apply_batch(
     }
     const double *batch_y = y + ((long long)batch * (long long)y_stride);
     double *batch_p = p + ((long long)batch * (long long)p_stride);
-    const double *batch_history = history + ((long long)batch * (long long)history_stride);
+    double *batch_history = history + ((long long)batch * (long long)history_stride);
     (void)time;
     (void)batch_y;
     (void)batch_p;
@@ -1411,6 +1426,25 @@ extern "C" __global__ void {{ name }}_delay_apply_batch(
 {%- if delays.distinct_maxima %}
     {{ name }}_delay_maxima(time, view, batch_p, delay_max);
 {%- endif %}
+    // The kept time, then the delay time of each group{% if delays.distinct_maxima %}, the maximum of each
+    // channel{% endif %} and the value of each channel.
+    double *kept = batch_history + {{ NAME }}_DELAY_RING;
+    double *kept_value = kept + {{ 1 + (delays.time_group_ends | length) }};
+    int same = kept[0] == time;
+    for (int group = 0, first = 0; same && group < {{ delays.time_group_ends | length }}; first = group_end[group++]) {
+        same = kept[1 + group] == delay_time[member[first]];
+    }
+{%- if delays.distinct_maxima %}
+    for (int channel = 0; same && channel < {{ delays.count }}; ++channel) {
+        same = kept_value[{{ delays.count }} + channel] == delay_max[channel];
+    }
+{%- endif %}
+    if (same) {
+        for (int channel = 0; channel < {{ delays.count }}; ++channel) {
+            batch_p[value_parameter[channel]] = kept_value[channel];
+        }
+        return;
+    }
 {%- if delays.settle_sources and not delays.settle_times %}
     int current = 0;
     for (int group = 0, first = 0; group < {{ delays.time_group_ends | length }}; first = group_end[group++]) {
@@ -1427,6 +1461,8 @@ extern "C" __global__ void {{ name }}_delay_apply_batch(
     double placed[4] = {NAN, NAN, NAN, NAN};
     {{ name }}_delay_place places[4];
     int oldest = 0;
+    // A channel read the current source, which the next launch may change.
+    int open = 0;
     for (int group = 0, first = 0; group < {{ delays.time_group_ends | length }}; ++group) {
         const double delay = delay_time[member[first]];
         // A delay time outside [0, delayMax], which the runtime refuses, has
@@ -1453,7 +1489,9 @@ extern "C" __global__ void {{ name }}_delay_apply_batch(
                 {{ name }}_delay_locate(batch_history, time, query, &places[place]);
                 placed[place] = query;
             }
+            open |= delay == 0.0 || places[place].open;
         }
+        kept[1 + group] = delay;
         for (; first < group_end[group]; ++first) {
             const int channel = member[first];
             double value = NAN;
@@ -1461,8 +1499,13 @@ extern "C" __global__ void {{ name }}_delay_apply_batch(
                 value = {{ name }}_delay_read(batch_history, channel, delay, sources[channel], discrete[channel], &places[place]);
             }
             batch_p[value_parameter[channel]] = value;
+            kept_value[channel] = value;
+{%- if delays.distinct_maxima %}
+            kept_value[{{ delays.count }} + channel] = delay_max[channel];
+{%- endif %}
         }
     }
+    kept[0] = open ? NAN : time;
 {%- endif %}
 }
 
