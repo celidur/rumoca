@@ -129,6 +129,22 @@ pub(super) struct BlockRecord {
     keep: bool,
     keep_d: usize,
     keep_s: usize,
+    /// Whether a retaining coupled affine block reuses its origin
+    /// linearization (Jacobian, both scales, row magnitudes and derived
+    /// flags) while the parameter slots of its rows' certificates (SPEC_0043
+    /// parameter-static gradient; every row certified) keep their bits, as
+    /// `runtime::projection::affine` reuses it: the slots, the rows whose
+    /// fallback scale reads a coordinate outside the block with that
+    /// coordinate, and where the linearization's magnitudes and parameter
+    /// bits (doubles) and derived flags and validity (sizes) follow the
+    /// retained factorization.
+    lin: bool,
+    nlin_params: usize,
+    lin_params: usize,
+    nlin_fallback: usize,
+    lin_fallback: usize,
+    lin_d: usize,
+    lin_s: usize,
     /// The block's ES016 fold message, read from the problem of the chart
     /// the block belongs to; the C table holds its offset in a pool instead.
     #[serde(skip)]
@@ -136,6 +152,9 @@ pub(super) struct BlockRecord {
     /// One past the last lane seed position the block's lane programs read
     /// or its torn tangent writes: the lane seed array the block needs.
     lane_seed_extent: usize,
+    /// Whether every row of a coupled affine block carries the certificate.
+    #[serde(skip)]
+    lin_certified: bool,
 }
 
 pub(super) fn refuse(canonical: usize, reason: &str) -> CodegenError {
@@ -274,6 +293,7 @@ pub(super) fn block_record(
     record_torn(sources, table, canonical, block, &mut record)?;
     if affine {
         record_elimination(table, canonical, block, structure, &csr, &mut record)?;
+        record_linearization(sources, table, block, &positions, &mut record);
     }
     // A coupled affine block is always settled by the affine solve; its rows
     // reach isolation only through the singleton path.
@@ -288,6 +308,45 @@ pub(super) fn block_record(
         &mut record,
     )?;
     Ok(record)
+}
+
+/// The certified parameter slots of a coupled affine block whose rows all
+/// carry the parameter-static gradient certificate, and its rows whose
+/// fallback scale reads a solver-Y coordinate outside the block, as
+/// `(row, coordinate)` pairs; nothing for any other block.
+fn record_linearization(
+    sources: &BlockSources<'_>,
+    table: &mut ProgramTable,
+    block: &solve::AlgebraicProjectionBlock,
+    positions: &[(usize, usize)],
+    record: &mut BlockRecord,
+) {
+    if record.n < 2 {
+        return;
+    }
+    let mut params = std::collections::BTreeSet::new();
+    for &(program, _) in positions {
+        let Some(slots) = sources.implicit.parameter_static_y_gradient_params(program) else {
+            return;
+        };
+        params.extend(slots.iter().copied());
+    }
+    let fallback: Vec<usize> = block
+        .rows
+        .iter()
+        .enumerate()
+        .filter_map(|(local, &row)| match row_target(sources.problem, row) {
+            NO_TARGET => None,
+            target if block.y_indices.contains(&(target - 1)) => None,
+            target => Some([local, target - 1]),
+        })
+        .flatten()
+        .collect();
+    record.lin_certified = true;
+    record.nlin_params = params.len();
+    record.lin_params = table.push(params);
+    record.nlin_fallback = fallback.len() / 2;
+    record.lin_fallback = table.push(fallback);
 }
 
 fn row_target(problem: &solve::SolveProblem, row: usize) -> usize {
@@ -1069,12 +1128,27 @@ impl BlockRecord {
             return None;
         }
         let elimination = self.elimination.then_some((self.elim_capacity, self.nelim));
-        retained_storage(self.n, self.nnz, elimination)
+        let (doubles, sizes) = retained_storage(self.n, self.nnz, elimination)?;
+        if !self.lin_certified {
+            return Some((doubles, sizes));
+        }
+        // The linearization follows the factorization: row magnitudes and
+        // parameter bits, then derived flags and its validity.
+        Some((
+            doubles.checked_add(self.n)?.checked_add(self.nlin_params)?,
+            sizes.checked_add(self.n)?.checked_add(1)?,
+        ))
     }
 
     /// Place the retained storage at these offsets.
     pub(super) fn keep_at(&mut self, (doubles, sizes): Retained) {
         (self.keep, self.keep_d, self.keep_s) = (true, doubles, sizes);
+        if self.lin_certified {
+            let elimination = self.elimination.then_some((self.elim_capacity, self.nelim));
+            if let Some((d, s)) = retained_storage(self.n, self.nnz, elimination) {
+                (self.lin, self.lin_d, self.lin_s) = (true, d, s);
+            }
+        }
     }
 
     /// The block's ES016 fold message, if it has one.

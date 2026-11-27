@@ -136,7 +136,7 @@ fn model_c(model: &str, source: &str, target: &str) -> String {
 }
 
 /// `RmcBlockDesc` field names in their C initializer order.
-const FIELDS: [&str; 59] = [
+const FIELDS: [&str; 66] = [
     "id",
     "canonical",
     "n",
@@ -196,6 +196,13 @@ const FIELDS: [&str; 59] = [
     "keep",
     "keep_d",
     "keep_s",
+    "lin",
+    "nlin_params",
+    "lin_params",
+    "nlin_fallback",
+    "lin_fallback",
+    "lin_d",
+    "lin_s",
 ];
 
 const ISOLATION_KINDS: std::ops::RangeInclusive<usize> = 0..=2;
