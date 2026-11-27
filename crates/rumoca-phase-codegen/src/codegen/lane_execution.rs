@@ -307,12 +307,23 @@ fn events_value(
     require_lane_events(problem)?;
     let events = &problem.events;
     let discrete = &problem.discrete;
-    let (roots, root_count) = dense_rows_value(&events.root_conditions, pure_calls, "events")?;
+    let (roots, root_count) = lane_roots_value(&events.root_conditions, pure_calls)?;
     let mut event_roots = Vec::new();
     for (root, target) in events.root_relation_memory_targets.iter().enumerate() {
-        // A root without a relation memory is a plain crossing the event
-        // iteration never re-encodes; no lane kernel reports it.
+        // A root without a relation memory is a crossing the event iteration
+        // never re-encodes. That of a function assertion, which observes the
+        // call, needs none: the lane checks the assertion in the call itself
+        // and fails at the first point that violates it. No lane kernel
+        // reports any other.
         let Some(target) = target else {
+            let roots = &events.root_conditions;
+            if roots
+                .program_index_for_output(root)
+                .and_then(|program| roots.program(program))
+                .is_some_and(observes_call)
+            {
+                continue;
+            }
             return Err(refuse("events", "a root has no relation memory"));
         };
         let solve::ScalarSlot::P { index, .. } = target else {
@@ -367,6 +378,42 @@ fn events_value(
         terminal_flag => problem.solve_layout.terminal_event_parameter_index,
         homotopy_lambda => problem.solve_layout.initial_homotopy_parameter_index,
     })
+}
+
+/// Whether a root program is that of a function assertion: it observes the
+/// call that checks the assertion (only an assertion observation may).
+fn observes_call(program: &[solve::LinearOp]) -> bool {
+    program
+        .iter()
+        .any(|op| matches!(op, solve::LinearOp::PureCallObservation { .. }))
+}
+
+/// The root programs a lane evaluates, and the dense root count: those of
+/// function assertions, which no relation memory reads, are left out.
+fn lane_roots_value(
+    block: &solve::ScalarProgramBlock,
+    pure_calls: Option<&solve::SolvePureCallTable>,
+) -> Result<(Value, usize), CodegenError> {
+    let indices = block.output_indices();
+    let mut programs = Vec::new();
+    let mut spans = Vec::new();
+    let mut outputs = Vec::new();
+    for (index, program) in block.programs().iter().enumerate() {
+        if observes_call(program) {
+            continue;
+        }
+        let (Some(ordinals), Some(span)) = (
+            block.program_output_ordinals(index),
+            block.program_span(index),
+        ) else {
+            return Err(refuse("events", "a root program has no outputs"));
+        };
+        programs.push(program.clone());
+        spans.push(span);
+        outputs.extend_from_slice(&indices[ordinals]);
+    }
+    let value = scalar_block_value(programs, spans, outputs, pure_calls, "events")?;
+    Ok((value, block.stored_output_count()))
 }
 
 fn delays_value(

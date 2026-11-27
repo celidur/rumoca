@@ -375,13 +375,12 @@ end Guarded;
 }
 
 #[test]
-fn cuda_ode_refuses_a_function_assertion_it_would_not_locate() {
-    // The assertion inside `tripled` owns a root without a relation memory,
-    // which the host would never be asked to locate.
-    let compiled = Compiler::new()
-        .model("Tripled")
-        .compile_str(
-            r#"
+fn cuda_ode_lane_fails_where_a_function_assertion_fails() {
+    // The assertion inside `tripled` owns a root without a relation memory:
+    // the event iteration does not re-encode it, and the lane checks it in the
+    // call, whose failure leaves the derivative NaN.
+    run_lane_harness(
+        r#"
 model Tripled
   function tripled
     input Real u;
@@ -398,14 +397,27 @@ equation
   der(x) = tripled(x);
 end Tripled;
 "#,
-            "Tripled.mo",
-        )
-        .expect("the compiler accepts the model");
-    let error = rumoca::render_target_files(&compiled, "Tripled", "cuda-ode", None)
-        .expect_err("a lane does not locate function assertions");
-    assert!(
-        format!("{error:#}").contains("a root has no relation memory"),
-        "unexpected refusal: {error:#}"
+        "Tripled",
+        r#"
+int main() {
+    blockIdx.x = 0;
+    blockDim.x = 1;
+    threadIdx.x = 0;
+    double y[TRIPLED_Y_LEN + 1] = {0.0};
+    double p[TRIPLED_P_LEN + 1] = {0.0};
+    double der[TRIPLED_STATE_COUNT + 1] = {0.0};
+    int status = -1;
+    Tripled_load_starts_batch(y, p, TRIPLED_Y_LEN, TRIPLED_P_LEN, 1);
+    Tripled_initialize_batch(0.0, y, p, &status, TRIPLED_Y_LEN, TRIPLED_P_LEN, 1);
+    CHECK(status == 0, "the initial event settles");
+    Tripled_rhs_batch(0.0, y, p, der, &status, TRIPLED_Y_LEN, TRIPLED_P_LEN, TRIPLED_STATE_COUNT, 1);
+    CHECK(status == 0 && der[0] == 3.0, "the assertion holds at x = 1");
+    y[0] = -1.0;
+    Tripled_rhs_batch(0.0, y, p, der, &status, TRIPLED_Y_LEN, TRIPLED_P_LEN, TRIPLED_STATE_COUNT, 1);
+    CHECK(status == 1 && std::isnan(der[0]), "the failed assertion fails the lane");
+    return 0;
+}
+"#,
     );
 }
 

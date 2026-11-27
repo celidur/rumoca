@@ -59,6 +59,8 @@ use rumoca_sim::{lower_solve_artifacts, lower_solve_package, lower_solve_problem
 
 use crate::error::CompilerError;
 
+mod solve_model;
+
 #[cfg(test)]
 mod tuple_calls_tests;
 
@@ -147,37 +149,6 @@ fn build_solve_template_renderer(dae_model: &Dae) -> Result<SolveTemplateRendere
         package.pure_calls,
         dae_model,
     )
-    .map_err(CompilerError::TemplateError)
-}
-
-/// A renderer over the complete lowered model: the same checked problem a
-/// solve target renders, plus the model's start values (`solve_model`).
-fn build_solve_model_template_renderer(
-    dae_model: &Dae,
-) -> Result<SolveTemplateRenderer, CompilerError> {
-    let lowered = rumoca_sim::lower_correlated_for_simulation_with_overrides(
-        dae_model,
-        &rumoca_sim::SimOptions::default(),
-    )
-    .map_err(|err| CompilerError::TemplateError(CodegenError::template(err.to_string())))?;
-    let prepared = lowered.prepared_dae();
-    let model = Arc::new(lowered.model().clone());
-    // A refresh made of exact assignments and an initialization made of
-    // bindings need no projection kernel; one that retains a projection stage,
-    // initialization residual rows or a state manifold is rendered with the ME refresh view,
-    // from which the target compiles the shared kernel per lane.
-    let initial_rows = model
-        .problem
-        .initialization
-        .residual()
-        .len()
-        .is_ok_and(|rows| rows > 0);
-    let manifold = !model.problem.continuous.manifold_projection_plan.is_empty();
-    if rumoca_phase_codegen::lane_refresh_admissible(&model.problem) && !initial_rows && !manifold {
-        SolveTemplateRenderer::new_owned_model_with_dae(model, prepared)
-    } else {
-        SolveTemplateRenderer::new_owned_model_with_me_projection(model, prepared)
-    }
     .map_err(CompilerError::TemplateError)
 }
 
@@ -293,7 +264,7 @@ impl CompilationResult {
         model_name: &str,
     ) -> Result<String, CompilerError> {
         self.solve_model_template_renderer
-            .get_or_init(|| build_solve_model_template_renderer(&self.dae))
+            .get_or_init(|| solve_model::build_solve_model_template_renderer(&self.dae))
             .as_ref()
             .map_err(Clone::clone)?
             .render_with_name(template, model_name)
