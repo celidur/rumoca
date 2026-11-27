@@ -636,6 +636,7 @@ typedef struct RmcBlockDescS {
     size_t lane_max; size_t nsplit; size_t split; size_t row_split; size_t inv_len;
     size_t tangent_lanes; bool tangent_directional; size_t ntangent_steps; size_t tangent_steps;
     size_t tangent_residuals; bool keep; size_t keep_d; size_t keep_s;
+    bool lin; size_t nlin_params; size_t lin_params; size_t nlin_fallback; size_t lin_fallback; size_t lin_d; size_t lin_s;
 } RmcBlockDesc;
 {{ q }} const size_t rmc_pool[{{ me.table.pool|length }}] = {
 {%- for chunk in me.table.pool|batch(24) %}
@@ -645,7 +646,7 @@ typedef struct RmcBlockDescS {
 #define RMC_P(offset) (rmc_pool + (offset))
 {{ q }} const RmcBlockDesc rmc_block_desc[{{ me.blocks|length }}] = {
 {%- for b in me.blocks %}
-    { {{ loop.index0 }}, {{ b.canonical }}, {{ b.n }}, {{ b.y }}, {{ b.row_target }}, {{ b.row_program }}, {{ b.row_offset }}, {{ b.max_outputs }}, {{ "true" if b.affine else "false" }}, {{ "true" if b.singleton_exact else "false" }}, {{ "true" if b.has_tearing else "false" }}, {{ b.row_ptr }}, {{ b.col_idx }}, {{ b.nnz }}, {{ b.ncolors }}, {{ b.colors }}, {{ b.color_seeds }}, {{ b.color_calls }}, {{ b.placements }}, {{ b.jvp_max_outputs }}, {{ "true" if b.torn else "false" }}, {{ b.k }}, {{ b.tear_col }}, {{ b.residual_row }}, {{ b.ncausal }}, {{ b.ncruns }}, {{ b.cruns }}, {{ b.causal_target }}, {{ b.causal_col }}, {{ "true" if b.elimination else "false" }}, {{ b.nelim }}, {{ b.elim_row }}, {{ b.elim_col }}, {{ b.nelim_tear }}, {{ b.elim_residual }}, {{ b.elim_tear }}, {{ b.nguards }}, {{ b.guards }}, {{ b.guard_step }}, {{ b.elim_capacity }}, {{ b.iso_default }}, {{ b.iso_start }}, {{ b.iso_entries }}, {{ b.nlane_calls }}, {{ b.lane_calls }}, {{ b.lane_max_outputs }}, {{ b.lane_max }}, {{ b.nsplit }}, {{ b.split }}, {{ b.row_split }}, {{ b.inv_len }}, {{ b.tangent_lanes }}, {{ "true" if b.tangent_directional else "false" }}, {{ b.ntangent_steps }}, {{ b.tangent_steps }}, {{ b.tangent_residuals }}, {{ "true" if b.keep else "false" }}, {{ b.keep_d }}, {{ b.keep_s }} },
+    { {{ loop.index0 }}, {{ b.canonical }}, {{ b.n }}, {{ b.y }}, {{ b.row_target }}, {{ b.row_program }}, {{ b.row_offset }}, {{ b.max_outputs }}, {{ "true" if b.affine else "false" }}, {{ "true" if b.singleton_exact else "false" }}, {{ "true" if b.has_tearing else "false" }}, {{ b.row_ptr }}, {{ b.col_idx }}, {{ b.nnz }}, {{ b.ncolors }}, {{ b.colors }}, {{ b.color_seeds }}, {{ b.color_calls }}, {{ b.placements }}, {{ b.jvp_max_outputs }}, {{ "true" if b.torn else "false" }}, {{ b.k }}, {{ b.tear_col }}, {{ b.residual_row }}, {{ b.ncausal }}, {{ b.ncruns }}, {{ b.cruns }}, {{ b.causal_target }}, {{ b.causal_col }}, {{ "true" if b.elimination else "false" }}, {{ b.nelim }}, {{ b.elim_row }}, {{ b.elim_col }}, {{ b.nelim_tear }}, {{ b.elim_residual }}, {{ b.elim_tear }}, {{ b.nguards }}, {{ b.guards }}, {{ b.guard_step }}, {{ b.elim_capacity }}, {{ b.iso_default }}, {{ b.iso_start }}, {{ b.iso_entries }}, {{ b.nlane_calls }}, {{ b.lane_calls }}, {{ b.lane_max_outputs }}, {{ b.lane_max }}, {{ b.nsplit }}, {{ b.split }}, {{ b.row_split }}, {{ b.inv_len }}, {{ b.tangent_lanes }}, {{ "true" if b.tangent_directional else "false" }}, {{ b.ntangent_steps }}, {{ b.tangent_steps }}, {{ b.tangent_residuals }}, {{ "true" if b.keep else "false" }}, {{ b.keep_d }}, {{ b.keep_s }}, {{ "true" if b.lin else "false" }}, {{ b.nlin_params }}, {{ b.lin_params }}, {{ b.nlin_fallback }}, {{ b.lin_fallback }}, {{ b.lin_d }}, {{ b.lin_s }} },
 {%- endfor %}
 };
 {{ q }} inline const RmcBlock* rmc_block(size_t id) { return &rmc_block_desc[id]; }
@@ -1359,6 +1360,41 @@ typedef struct {
     memcpy(key, jac, nnz * sizeof(double)); memcpy(key + nnz, rscale, n * sizeof(double)); memcpy(key + nnz + n, vscale, n * sizeof(double));
     flags[RMC_KEEP_KEY] = 1; flags[RMC_KEEP_DENSE] = 0; flags[RMC_KEEP_ELIM] = 0; flags[RMC_KEEP_ELIM_K] = 0;
 }
+/* affine.rs: AffineLinearization, the origin linearization a coupled affine
+   block whose rows all carry the parameter-static gradient certificate
+   (SPEC_0043) keeps: its Jacobian and both scales are the retained key, its
+   row magnitudes and derived flags follow the factorization with the bits of
+   the certificate's parameter slots and a flag a formation sets to 1 (a
+   reset unbinds the key, which a reuse requires as well). */
+{{ q }} void rmc_lin_store(ModelInstance* m, const RmcBlock* b, const double* magnitudes, const size_t* derived) {
+    const size_t n = RMC_BS(b, n); const size_t* params = RMC_BP(b, lin_params);
+    double* d = rmc_keep_doubles(m, b) + RMC_BS(b, lin_d); size_t* z = rmc_keep_sizes(m, b) + RMC_BS(b, lin_s);
+    memcpy(d, magnitudes, n * sizeof(double)); memcpy(z, derived, n * sizeof(size_t));
+    for (size_t k = 0; k < RMC_BS(b, nlin_params); ++k) memcpy(d + n + k, &m->p[params[k]], sizeof(double));
+    z[n] = 1;
+}
+/* AffineLinearization::at_origin and refresh: the retained linearization
+   serves this call when the key is bound and the certificate's parameter
+   slots keep their bits; every fallback row scale that reads a coordinate
+   outside the block is formed again, and a changed one rebinds the key so
+   the factors form again. Whether it serves. */
+{{ q }} inline bool rmc_same_bits(double a, double b) { unsigned long long x, y; memcpy(&x, &a, sizeof x); memcpy(&y, &b, sizeof y); return x == y; }
+{{ q }} bool rmc_lin_reuse(ModelInstance* m, const RmcBlock* b) {
+    const size_t n = RMC_BS(b, n), nnz = RMC_BS(b, nnz); const size_t* params = RMC_BP(b, lin_params); const size_t* fallback = RMC_BP(b, lin_fallback);
+    double* key = rmc_keep_doubles(m, b); size_t* flags = rmc_keep_sizes(m, b);
+    const double* d = key + RMC_BS(b, lin_d); const size_t* z = flags + RMC_BS(b, lin_s);
+    if (!flags[RMC_KEEP_KEY] || z[n] == 0) return false;
+    for (size_t k = 0; k < RMC_BS(b, nlin_params); ++k) if (!rmc_same_bits(d[n + k], m->p[params[k]])) return false;
+    bool changed = false; double* rscale = key + nnz;
+    for (size_t f = 0; f < RMC_BS(b, nlin_fallback); ++f) {
+        size_t row = fallback[2 * f], index = fallback[2 * f + 1];
+        if (z[row]) continue;
+        double scale = rmc_model_scale(index, m->y[index]);
+        if (!rmc_same_bits(scale, rscale[row])) { rscale[row] = scale; changed = true; }
+    }
+    if (changed) { flags[RMC_KEEP_DENSE] = 0; flags[RMC_KEEP_ELIM] = 0; flags[RMC_KEEP_ELIM_K] = 0; }
+    return true;
+}
 /* The retained elimination's buffers in `e`; its state when prepared, else -1. */
 {{ q }} int rmc_keep_elimination(ModelInstance* m, const RmcBlock* b, RmcElimination* e) {
     const size_t n = RMC_BS(b, n), nnz = RMC_BS(b, nnz), cap = RMC_BS(b, elim_capacity), nelim = RMC_BS(b, nelim);
@@ -1540,15 +1576,25 @@ typedef struct {
     const double* inv = rmc_block_invariants(m, b);
     if (m->rmc_fatal) { RMC_RELEASE; return -1; }
     for (size_t i = 0; i < n; ++i) m->y[b_y_pool[i]] = 0.0;
-    result = rmc_jacobian(m, b, jac);
-    if (result == 0) result = rmc_block_scales(m, b, jac, rscale, vscale);
-    if (result == 0) {
-        rmc_row_magnitudes(b, jac, vscale, magnitudes, derived);
-        bool keep = RMC_BS(b, keep){% if me.keep.doubles > 0 and not device %} && m->rmc_keep_d != NULL{% endif %};
+    bool keep = RMC_BS(b, keep){% if me.keep.doubles > 0 and not device %} && m->rmc_keep_d != NULL{% endif %};
+    const double* s_jac = jac; const double* s_rscale = rscale; const double* s_vscale = vscale; const double* s_magnitudes = magnitudes; const size_t* s_derived = derived;
 {%- if me.keep.doubles > 0 %}
-        if (keep) rmc_keep_bind(m, b, jac, rscale, vscale);
+    if (keep && RMC_BS(b, lin) && rmc_lin_reuse(m, b)) {
+        const double* key = rmc_keep_doubles(m, b);
+        s_jac = key; s_rscale = key + b_nnz; s_vscale = key + b_nnz + n;
+        s_magnitudes = key + RMC_BS(b, lin_d); s_derived = rmc_keep_sizes(m, b) + RMC_BS(b, lin_s);
+    } else
 {%- endif %}
-        RmcAffineSystem system = { b, jac, rscale, vscale, magnitudes, derived, inv, true, false, { -1, 0, NULL, NULL, NULL, NULL, NULL, NULL, NULL }, false, { 0, NULL, NULL, NULL, NULL, NULL, NULL }, keep };
+    {
+        result = rmc_jacobian(m, b, jac);
+        if (result == 0) result = rmc_block_scales(m, b, jac, rscale, vscale);
+        if (result == 0) rmc_row_magnitudes(b, jac, vscale, magnitudes, derived);
+{%- if me.keep.doubles > 0 %}
+        if (result == 0 && keep) { rmc_keep_bind(m, b, jac, rscale, vscale); if (RMC_BS(b, lin)) rmc_lin_store(m, b, magnitudes, derived); }
+{%- endif %}
+    }
+    if (result == 0) {
+        RmcAffineSystem system = { b, s_jac, s_rscale, s_vscale, s_magnitudes, s_derived, inv, true, false, { -1, 0, NULL, NULL, NULL, NULL, NULL, NULL, NULL }, false, { 0, NULL, NULL, NULL, NULL, NULL, NULL }, keep };
         result = rmc_affine_project(m, &system);
         if (result == 0 && system.used_torn) {
             system.prefer_torn = false;
