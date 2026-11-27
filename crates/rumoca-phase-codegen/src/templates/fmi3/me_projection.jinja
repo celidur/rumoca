@@ -1715,8 +1715,61 @@ RMC_COLD {{ q }} int rmc_nudge(ModelInstance* m, const RmcBlock* b, const double
    a certified one applies the correction it computed when it exceeds its
    floor, without marking a change, once both the residual and that
    correction meet tolerance. -1 error */
+#ifndef RMC_DENSE_SCALAR_OFF
+/* rmc_project_dense for one unknown and one Jacobian entry: the same calls
+   and predicates over one value each, and the one-shot scaled Newton delta
+   reduced to its 1x1 operations in their order (the scaled entry, the LU
+   pivot test and division of rmc_lu_solve, and the one-column SVD fallback
+   of rmc_svd_solve), with no arena frame. -1 error */
+{{ q }} int rmc_project_dense_scalar(ModelInstance* m, const RmcBlock* b, const RmcKnownRow* known, RmcUpdate* update) {
+    bool changed = false; int result = 0; double residual = 0.0, jac = 0.0, rscale = 0.0, vscale = 0.0, delta = 0.0;
+    update->changed = false; update->settled = false;
+    if (known->known) residual = known->value;
+    else if (rmc_rows(m, b, &residual) != 0) return -1;
+    if (!rmc_all_finite(&residual, 1)) {
+        int seeded = rmc_seed_assignments(m, b);
+        if (seeded < 0 || rmc_rows(m, b, &residual) != 0) return -1;
+        changed = seeded == 1;
+        if (!rmc_all_finite(&residual, 1)) { update->changed = changed; return 0; }
+    }
+    if (!m->rmc_certify && rmc_all_zero(&residual, 1)) { update->changed = changed; update->settled = true; return 0; }
+    if (rmc_jacobian(m, b, &jac) != 0 || rmc_block_scales(m, b, &jac, &rscale, &vscale) != 0) return -1;
+    bool converged = rmc_scaled_converged(m->rmc_tol, &residual, &rscale, 1);
+    if (converged && !m->rmc_certify) { update->changed = changed; update->settled = true; return 0; }
+    double before = rmc_scaled_norm(&residual, &rscale, 1);
+    /* rmc_scaled_newton_delta: rmc_dense_factor, rmc_dense_solve */
+    double scaled = jac * rmc_valid_scale(vscale) / rmc_valid_scale(rscale);
+    double rhs = -residual / rmc_valid_scale(rscale), x = rhs;
+    if (scaled != 0.0) x = x / scaled;
+    else {
+        double sigma2 = 0.0, projection = 0.0;
+        sigma2 += scaled * scaled; projection += scaled * rhs; x = 0.0;
+        if (sqrt(sigma2) > m->rmc_tol) { double coefficient = projection / sigma2; x += coefficient * 1.0; }
+    }
+    delta = x * rmc_valid_scale(vscale);
+    if (converged && rmc_scaled_converged(m->rmc_tol, &delta, &vscale, 1)) {
+        /* converged_correction.rs: Correction::apply; the correction marks no change */
+        if (rmc_correction_significant(m->rmc_tol, &delta, &vscale, 1)) m->y[RMC_BP(b, y)[0]] += delta;
+        update->changed = changed; update->settled = true;
+    }
+    else {
+        RmcUpdate accepted = { false, false };
+        result = rmc_accept_delta(m, b, &delta, &rscale, &vscale, before, &accepted);
+        if (result == 0) {
+            int nudged = (!accepted.changed && !converged) ? rmc_nudge(m, b, &jac, &vscale) : 0;
+            if (nudged < 0) result = -1;
+            else if (nudged == 1) update->changed = true;
+            else { update->changed = changed || accepted.changed; update->settled = accepted.settled; }
+        }
+    }
+    return result;
+}
+#endif
 {{ q }} int rmc_project_dense(ModelInstance* m, const RmcBlock* b, const RmcKnownRow* known, RmcUpdate* update) {
     const size_t b_n = RMC_BS(b, n); const size_t b_nnz = RMC_BS(b, nnz); const size_t* const b_row_ptr_pool = RMC_BP(b, row_ptr); const size_t* const b_col_idx_pool = RMC_BP(b, col_idx);
+#ifndef RMC_DENSE_SCALAR_OFF
+    if (b_n == 1 && b_nnz == 1) return rmc_project_dense_scalar(m, b, known, update);
+#endif
     RMC_MARK; size_t n = b_n; bool changed = false; int result = 0;
     double* residual = rmc_dalloc(m, n); double* rscale = rmc_dalloc(m, n); double* vscale = rmc_dalloc(m, n); double* delta = rmc_dalloc(m, n);
     double* jac = rmc_dalloc(m, b_nnz + 1); double* dense = rmc_dalloc(m, n * n);
