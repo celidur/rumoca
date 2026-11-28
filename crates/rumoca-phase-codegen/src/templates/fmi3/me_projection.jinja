@@ -2027,9 +2027,12 @@ RMC_COLD {{ q }} int rmc_plan_converged(ModelInstance* m, const size_t* entries,
    (its Jacobian through the lane program, its scales from the variable
    scales), in the same operations and order; the rare paths (seeding a
    non-finite residual, the step search, the nudge, the uncertified
-   acceptance) call the descriptor-driven functions. */
+   acceptance) call the descriptor-driven functions. Where the entry is the
+   row's derivative along its unknown, one program (rmc_dual_p<k>) gives the
+   row's value and that derivative, so a function the row calls runs once
+   for both; where that program fails, the row and lane programs decide. */
 {%- for b in me.blocks %}{% if b.scalar %}{% set c = b.scalar %}{% set id = loop.index0 %}
-{{ q }} int rmc_scalar_dense_{{ id }}(ModelInstance* m, double before_row, RmcUpdate* update) {
+{{ q }} int rmc_scalar_dense_{{ id }}(ModelInstance* m, double before_row, {% if c.dual is not none %}const double* slope, {% endif %}RmcUpdate* update) {
     bool changed = false; int result = 0; double residual = 0.0, jac = 0.0, rscale = 0.0, vscale = 0.0, delta = 0.0;
     update->changed = false; update->settled = false;
     residual = before_row;
@@ -2039,8 +2042,15 @@ RMC_COLD {{ q }} int rmc_plan_converged(ModelInstance* m, const size_t* entries,
         if (seeded < 0 || rmc_rows(m, b, &residual) != 0) return -1;
         changed = seeded == 1;
         if (!rmc_all_finite(&residual, 1)) { update->changed = changed; return 0; }
+{%- if c.dual is not none %}
+        slope = NULL;
+{%- endif %}
     }
     if (!m->rmc_certify && rmc_all_zero(&residual, 1)) { update->changed = changed; update->settled = true; return 0; }
+{%- if c.dual is not none %}
+    if (slope) jac = *slope;
+    else
+{%- endif %}
     {
         double out[{{ c.lane_max_outputs if c.lane_max_outputs > 0 else 1 }}];
         for (size_t i = 0; i < {{ c.lane_max_outputs if c.lane_max_outputs > 0 else 1 }}; ++i) out[i] = 0.0;
@@ -2102,14 +2112,22 @@ RMC_COLD {{ q }} int rmc_plan_converged(ModelInstance* m, const size_t* entries,
         int result;
         {
             /* The declined singleton assignment: its row's value at y. */
-            double out[{{ me.table.row_max_outputs }}];
-            int status = rmc_row_call({{ c.row_program }}, m, out);
-            if (status != 0) result = -1;
-            else {
-                double before = out[{{ c.row_offset }}];
-                if (!isfinite(before)) { update.changed = false; update.settled = false; result = 0; }
-                else result = rmc_scalar_dense_{{ id }}(m, before, &update);
+            double out[{{ me.table.row_max_outputs }}]; double before = 0.0; int status;
+{%- if c.dual is not none %}
+            double dual[{{ 2 * me.table.row_max_outputs }}]; const double* slope = NULL;
+            m->rmc_seed[{{ c.y }}] = 1.0;
+            status = rmc_dual_p{{ c.dual }}(m, m->rmc_seed, dual);
+            m->rmc_seed[{{ c.y }}] = 0.0;
+            if (status == 0) { before = dual[{{ 2 * c.row_offset }}]; slope = &dual[{{ 2 * c.row_offset + 1 }}]; }
+            else
+{%- endif %}
+            {
+                status = rmc_row_call({{ c.row_program }}, m, out);
+                if (status == 0) before = out[{{ c.row_offset }}];
             }
+            if (status != 0) result = -1;
+            else if (!isfinite(before)) { update.changed = false; update.settled = false; result = 0; }
+            else result = rmc_scalar_dense_{{ id }}(m, before, {% if c.dual is not none %}slope, {% endif %}&update);
         }
         m->rmc_fb_active[{{ id }}] = false;
         if (result != 0) return -1;
@@ -3903,6 +3921,11 @@ RMC_API extern const size_t rmc_iso_slot[{{ me.table.isolator_slot|length }}];
 {%- endfor %}
 {%- if me.table.lanes.programs|length > 0 %}
 {{ dispatcher(api, "lane", me.table.lanes.programs|length, "size_t program, ModelInstance* m, const double* seed, double* out", "m, seed, out", device) }}
+{%- endif %}
+{%- if device %}
+{%- for program in me.table.duals.programs %}
+{{ program_function("rmc_dual_p" ~ loop.index0, program, "ModelInstance* m, const double* seed, double* o", true, true, device=device) }}
+{%- endfor %}
 {%- endif %}
 {%- endif %}
 {%- endmacro %}
