@@ -76,6 +76,12 @@ impl<K: Ord> FunctionFamily<K> {
         solve::ScalarProgramBlock::program_output_count(&self.programs[id].0)
     }
 
+    /// The operations and span of function `id`.
+    pub(super) fn program(&self, id: usize) -> (&[solve::LinearOp], Span) {
+        let (operations, span) = &self.programs[id];
+        (operations, *span)
+    }
+
     /// The emitted plan: every program stores its outputs at local positions.
     pub(super) fn into_plan(self) -> Result<Value, CodegenError> {
         let mut targets = Vec::new();
@@ -273,6 +279,9 @@ pub(super) struct ProgramTable {
     pub(super) rows: FunctionFamily<(usize, usize, usize)>,
     /// Forward Jacobian programs keyed by (application source, program).
     pub(super) jvp: FunctionFamily<(usize, usize)>,
+    /// Residual rows with their solver-Y JVP, keyed by row function: each
+    /// stores every output's value followed by its directional derivative.
+    pub(super) duals: FunctionFamily<usize>,
     /// Multi-lane forward Jacobian programs, one per colored application
     /// program ([`solve::ColoredTangentPlan`]).
     pub(super) lanes: LaneFamily,
@@ -301,6 +310,7 @@ impl ProgramTable {
     pub(super) fn share_contents(&mut self) {
         self.rows.share_contents();
         self.jvp.share_contents();
+        self.duals.share_contents();
         self.inv.share_contents();
         self.dep.share_contents();
         self.causal.share_contents();
@@ -358,6 +368,7 @@ impl ProgramTable {
             rows => rows,
             row_sharing => row_sharing,
             jvp => self.jvp.into_plan()?,
+            duals => self.duals.into_plan()?,
             lanes => self.lanes.into_plan()?,
             inv => self.inv.into_plan()?,
             dep => self.dep.into_plan()?,

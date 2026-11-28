@@ -244,9 +244,49 @@ pub(super) struct ScalarStage {
     seeds: Vec<usize>,
     /// `(lane, output offset)` of each placement into the one entry.
     placements: Vec<(usize, usize)>,
+    /// The function that evaluates the row with its solver-Y JVP
+    /// (`row_value_jvp`), when the block's Jacobian is the row's derivative
+    /// along its unknown alone: one evaluation then gives the residual and
+    /// the entry the row and lane programs give.
+    dual: Option<usize>,
 }
 
-fn scalar_stage(table: &ProgramTable, record: &BlockRecord) -> Option<ScalarStage> {
+/// The function of row function `row` with its solver-Y JVP
+/// (`lower_scalar_program_value_jvp`): the derivative operations of the
+/// row's JVP program over the values they read, so a typed pure call runs
+/// once for the value and the derivative. `None` when the row stores an
+/// output through an aggregate store, or its derivative does not lower into
+/// the seed lanes.
+fn row_value_jvp(
+    table: &mut ProgramTable,
+    canonical: usize,
+    row: usize,
+    seed_len: usize,
+) -> Option<usize> {
+    let (primal, span) = table.rows.program(row);
+    let outputs = solve::ScalarProgramBlock::program_output_count(primal);
+    let stores = primal
+        .iter()
+        .filter(|operation| matches!(operation, solve::LinearOp::StoreOutput { .. }))
+        .count();
+    if stores != outputs {
+        return None;
+    }
+    let dual = rumoca_eval_solve::ad::lower_scalar_program_value_jvp(primal).ok()?;
+    if solve::ScalarProgramBlock::program_output_count(&dual) != 2 * outputs
+        || check_seed_loads(canonical, &dual, seed_len, 1).is_err()
+    {
+        return None;
+    }
+    table.duals.intern(row, || Ok((dual, span))).ok()
+}
+
+fn scalar_stage(
+    table: &mut ProgramTable,
+    canonical: usize,
+    seed_len: usize,
+    record: &BlockRecord,
+) -> Option<ScalarStage> {
     let eligible = record.n == 1
         && record.nnz == 1
         && !record.singleton_exact
@@ -265,21 +305,31 @@ fn scalar_stage(table: &ProgramTable, record: &BlockRecord) -> Option<ScalarStag
     if kind != ISOLATION_UNAVAILABLE {
         return None;
     }
-    let call = table.pooled(record.lane_calls, LANE_CALL_FIELDS);
-    let placements = table.pooled(call[4], 3 * call[5]);
+    let call = table.pooled(record.lane_calls, LANE_CALL_FIELDS).to_vec();
+    let placements: Vec<(usize, usize)> = table
+        .pooled(call[4], 3 * call[5])
+        .chunks(3)
+        .map(|placement| (placement[0], placement[1]))
+        .collect();
+    let y = table.pooled(record.y, 1)[0];
+    let row_program = table.pooled(record.row_program, 1)[0];
+    let seeds = table.pooled(call[2], call[3]).to_vec();
+    // One lane seeded at the unknown alone, placed once: the entry is the
+    // row's derivative along its unknown.
+    let dual = (call[1] == 1 && seeds == [y] && placements.len() == 1)
+        .then(|| row_value_jvp(table, canonical, row_program, seed_len))
+        .flatten();
     Some(ScalarStage {
-        y: table.pooled(record.y, 1)[0],
-        row_program: table.pooled(record.row_program, 1)[0],
+        y,
+        row_program,
         row_offset: table.pooled(record.row_offset, 1)[0],
         target: table.pooled(record.row_target, 1)[0],
         lane_program: call[0],
         lane_outputs: call[6],
         lane_max_outputs: record.lane_max_outputs,
-        seeds: table.pooled(call[2], call[3]).to_vec(),
-        placements: placements
-            .chunks(3)
-            .map(|placement| (placement[0], placement[1]))
-            .collect(),
+        seeds,
+        placements,
+        dual,
     })
 }
 
@@ -561,7 +611,7 @@ pub(super) fn block_record(
         isolation_reachable,
         &mut record,
     )?;
-    record.scalar = scalar_stage(table, &record);
+    record.scalar = scalar_stage(table, canonical, sources.seed_len, &record);
     record.split_rows = split_residual(table, &record);
     Ok(record)
 }

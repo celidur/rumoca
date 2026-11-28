@@ -246,6 +246,25 @@ fn a_device_unit_unrolls_the_scalar_newton_stage_of_a_one_unknown_block() {
     );
 }
 
+/// The unrolled stage of a one-unknown block whose Jacobian entry is its
+/// row's derivative along its unknown reads the row's value and that
+/// derivative from one program: through it, the lanes of
+/// `a_device_build_refreshes_every_lane_as_the_fmi_component` refresh as the
+/// FMI component, whose C runs the row and lane programs, bit for bit.
+#[test]
+fn a_device_unit_evaluates_a_one_unknown_row_with_its_derivative_once() {
+    let mut joined = Vec::new();
+    for (compiled, model) in models() {
+        if device_unit(&compiled).contains(" = rmc_dual_p") {
+            joined.push(model);
+        }
+    }
+    assert!(
+        joined.contains(&"DeviceArrayLoop") && joined.contains(&"DeviceFunctionLoop"),
+        "the cubic blocks and the loop through a function evaluate their row once: {joined:?}"
+    );
+}
+
 /// A device unit unrolls the split residual pass of a coupled affine block
 /// (its invariant parts once per call, then the dependent part of each
 /// residual program) with those programs called directly: through it, the lanes of

@@ -632,6 +632,22 @@ pub fn lower_scalar_program_block_ad(
     )
 }
 
+/// One scalar row with its forward-mode JVP over solver-y seeds: each output
+/// of `primal` becomes its value followed by its directional derivative. The
+/// derivative operations are those of [`lower_scalar_program_block_ad`], and
+/// the values are the ones those operations read, so a typed pure call whose
+/// inputs carry a tangent runs its directional relation once for both.
+pub fn lower_scalar_program_value_jvp(
+    primal: &[LinearOp],
+) -> Result<Vec<LinearOp>, SolveDerivationError> {
+    let mut builder = AdBuilder::new_with_optional_span(SeedMode::SolverYOnly, None);
+    builder.store_output_mode = StoreOutputMode::Dual;
+    for op in primal {
+        builder.lower_op(op.clone())?;
+    }
+    Ok(builder.ops)
+}
+
 /// The forward-mode JVP of `block` over `[solver-y | parameter]` seeds whose
 /// parameter seeds start at `p_seed_offset`, row-aligned with `block`.
 pub fn lower_scalar_program_block_full_jvp(
