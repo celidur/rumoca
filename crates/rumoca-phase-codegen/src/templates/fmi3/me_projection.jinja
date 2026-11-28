@@ -701,6 +701,35 @@ RMC_COLD {{ q }} void rmc_fb_note(ModelInstance* m, size_t site) {
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
 #endif
+{%- set split_unrolled = device and me.blocks|selectattr("split_rows")|list|length > 0 %}
+{%- if split_unrolled %}
+/* rmc_rows_split of one coupled affine block over the invariant values of
+   its call, the pooled loop unrolled over its rows: each residual program
+   is evaluated once, its dependent part called directly, in the order the
+   rows first reach it, where the loop evaluates it again for rows that are
+   not consecutive (a program reads nothing the pass writes, so every row
+   takes the value the loop gives it). Out of line, as the dispatcher it
+   stands for: the residual it writes is the one the loop stores. */
+{%- for b in me.blocks %}{% if b.split_rows %}
+{{ q }} RMC_NOINLINE int rmc_rows_split_{{ loop.index0 }}(ModelInstance* m, const double* inv, double* residual) {
+    double out[{{ me.table.row_max_outputs }}]; int status;
+{%- for run in b.split_rows.programs %}
+{%- if run.dependent != 0 %}
+    status = rmc_dep_p{{ run.dependent - 1 }}(m, inv, out);
+    if (status == RMC_FATAL) return RMC_FATAL;
+    if (status != 0) status = rmc_row_call({{ run.program }}, m, out);
+{%- else %}
+    status = rmc_row_call({{ run.program }}, m, out);
+{%- endif %}
+    if (status != 0) return RMC_FAILURE(status);
+{%- for row in run.rows %}
+    residual[{{ row[0] }}] = out[{{ row[1] }}];
+{%- endfor %}
+{%- endfor %}
+    return 0;
+}
+{%- endif %}{% endfor %}
+{%- endif %}
 {{ q }} int rmc_rows_split(ModelInstance* m, const RmcBlock* b, const double* inv, double* residual) {
     /* A one-row block (every singleton) runs one program: no range is held
        across its call. */
@@ -714,6 +743,16 @@ RMC_COLD {{ q }} void rmc_fb_note(ModelInstance* m, size_t site) {
         residual[0] = out[RMC_BP(b, row_offset)[0]];
         return 0;
     }
+{%- if split_unrolled %}
+    if (inv) {
+        switch (b->id) {
+{%- for b in me.blocks %}{% if b.split_rows %}
+        case {{ loop.index0 }}: return rmc_rows_split_{{ loop.index0 }}(m, inv, residual);
+{%- endif %}{% endfor %}
+        default: break;
+        }
+    }
+{%- endif %}
     const size_t b_n = RMC_BS(b, n); const size_t* const b_row_program_pool = RMC_BP(b, row_program); const size_t* const b_row_split_pool = RMC_BP(b, row_split); const size_t* const b_row_offset_pool = RMC_BP(b, row_offset);
     /* Consecutive rows of one multi-output program read one evaluation. */
     double out[{{ me.table.row_max_outputs }}]; size_t last = SIZE_MAX;
@@ -738,11 +777,32 @@ RMC_COLD {{ q }} void rmc_fb_note(ModelInstance* m, size_t site) {
    no split, an invariant part fails, or the arena has no room for the
    invariant values. Each disables the split for this call and reports
    nothing: the rows run their unsplit programs, which raise any error. */
+{%- if split_unrolled %}
+/* The invariant parts of one coupled affine block into its live-out values,
+   the pooled loop unrolled over its splits, each called directly; nonzero
+   when one fails. Out of line, as the dispatcher it stands for. */
+{%- for b in me.blocks %}{% if b.split_rows %}
+{{ q }} RMC_NOINLINE int rmc_block_invariants_{{ loop.index0 }}(ModelInstance* m, double* inv) {
+{%- for split in b.split_rows.invariants %}
+    if (rmc_inv_p{{ split[0] }}(m, inv + {{ split[1] }}) != 0) return -1;
+{%- endfor %}
+    return 0;
+}
+{%- endif %}{% endfor %}
+{%- endif %}
 {{ q }} const double* rmc_block_invariants(ModelInstance* m, const RmcBlock* b) {
     const size_t b_nsplit = RMC_BS(b, nsplit); const size_t b_inv_len = RMC_BS(b, inv_len); const size_t* const b_split_pool = RMC_BP(b, split);
     if (b_nsplit == 0) return NULL;
     double* inv = rmc_dalloc_raw(m, b_inv_len + 1);
     if (!inv) return NULL;
+{%- if split_unrolled %}
+    switch (b->id) {
+{%- for b in me.blocks %}{% if b.split_rows %}
+    case {{ loop.index0 }}: return rmc_block_invariants_{{ loop.index0 }}(m, inv) != 0 ? NULL : inv;
+{%- endif %}{% endfor %}
+    default: break;
+    }
+{%- endif %}
     for (size_t s = 0; s < b_nsplit; ++s)
         if (rmc_inv_call(b_split_pool[2 * s], m, inv + b_split_pool[2 * s + 1]) != 0) return NULL;
     return inv;
