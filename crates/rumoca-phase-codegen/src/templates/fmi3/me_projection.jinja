@@ -2537,17 +2537,127 @@ RMC_COLD {{ api }} int rmc_bad_program(ModelInstance* m, size_t program) {
 {%- endif %}
 {%- set blocks = me.blocks|length > 0 %}
 {%- set assigns = me.assign.plan.programs|length > 0 %}
-{%- if me.derivative.steps|length > 0 or me.algebraic.steps|length > 0 or me.switching %}
-/* The coordinate copies of the refresh and of the chart decisions. A device
-   `memcpy` of an unknown alignment may move single bytes, so a device
-   compiler copies one double per access; a host compiler keeps `memcpy`,
-   which its library moves in vector words. Either copies the same values. */
-{{ q }} inline void rmc_copy_doubles(double* dst, const double* src, size_t count) {
-#if defined(__CUDACC__)
-    for (size_t i = 0; i < count; ++i) dst[i] = src[i];
+{%- if device %}
+/* Word streams of one lane: a copy, and a comparison of 64-bit patterns
+   (NaN payloads and signed zeros included), between arrays that do not
+   overlap. One device thread waits for each access in turn unless the
+   accesses are independent and wide, and a 16-byte access costs its price
+   only in the global space: a generic one costs more than two word
+   accesses. So when both arrays are global, a device moves 16-byte global
+   pairs, eight in flight: one word first when the source (the first array)
+   lies 8 bytes past a 16-byte boundary, then pairs, then the last word; the
+   destination (the second array) takes pairs when it shares the source's
+   alignment, single words otherwise, each case its own loop. An array
+   outside the global space takes the word loop, and a host build of the
+   unit copies with `memcpy` and compares word by word. Every access moves
+   bits; none goes through a floating-point operation. Out of line, so the
+   streams' registers do not weigh on their callers. */
+{%- raw %}
+#if defined(__CUDA_ARCH__)
+static __device__ __forceinline__ void rmc_global_pair_load(const double* p, unsigned long long* lo, unsigned long long* hi) {
+    asm volatile("ld.global.v2.u64 {%0, %1}, [%2];" : "=l"(*lo), "=l"(*hi) : "l"(__cvta_generic_to_global(p)) : "memory");
+}
+static __device__ __forceinline__ void rmc_global_pair_store(double* p, unsigned long long lo, unsigned long long hi) {
+    asm volatile("st.global.v2.u64 [%0], {%1, %2};" :: "l"(__cvta_generic_to_global(p)), "l"(lo), "l"(hi) : "memory");
+}
+static __device__ __forceinline__ unsigned long long rmc_global_word_load(const double* p) {
+    unsigned long long w;
+    asm volatile("ld.global.u64 %0, [%1];" : "=l"(w) : "l"(__cvta_generic_to_global(p)) : "memory");
+    return w;
+}
+static __device__ __forceinline__ void rmc_global_word_store(double* p, unsigned long long w) {
+    asm volatile("st.global.u64 [%0], %1;" :: "l"(__cvta_generic_to_global(p)), "l"(w) : "memory");
+}
+#define RMC_PAIRED(p) ((((uintptr_t)(const void*)(p)) & 15u) == 0)
+#endif
+{%- endraw %}
+{{ q }} RMC_NOINLINE void rmc_copy_words(double* dst, const double* src, size_t count) {
+#if defined(__CUDA_ARCH__)
+    if (!__isGlobal(dst) || !__isGlobal(src)) {
+        for (size_t i = 0; i < count; ++i) dst[i] = src[i];
+        return;
+    }
+    size_t i = 0; unsigned long long lo[8], hi[8];
+    if (count > 0 && !RMC_PAIRED(src)) { rmc_global_word_store(dst, rmc_global_word_load(src)); i = 1; }
+    if (RMC_PAIRED(dst + i)) {
+        for (; i + 16 <= count; i += 16) {
+            for (int k = 0; k < 8; ++k) rmc_global_pair_load(src + i + 2 * k, &lo[k], &hi[k]);
+            for (int k = 0; k < 8; ++k) rmc_global_pair_store(dst + i + 2 * k, lo[k], hi[k]);
+        }
+        for (; i + 2 <= count; i += 2) { rmc_global_pair_load(src + i, &lo[0], &hi[0]); rmc_global_pair_store(dst + i, lo[0], hi[0]); }
+    } else {
+        for (; i + 16 <= count; i += 16) {
+            for (int k = 0; k < 8; ++k) rmc_global_pair_load(src + i + 2 * k, &lo[k], &hi[k]);
+            for (int k = 0; k < 8; ++k) { rmc_global_word_store(dst + i + 2 * k, lo[k]); rmc_global_word_store(dst + i + 2 * k + 1, hi[k]); }
+        }
+        for (; i + 2 <= count; i += 2) { rmc_global_pair_load(src + i, &lo[0], &hi[0]); rmc_global_word_store(dst + i, lo[0]); rmc_global_word_store(dst + i + 1, hi[0]); }
+    }
+    if (i < count) rmc_global_word_store(dst + i, rmc_global_word_load(src + i));
 #else
     memcpy(dst, src, count * sizeof(double));
 #endif
+}
+{{ q }} RMC_NOINLINE bool rmc_same_words(const double* a, const double* b, size_t count) {
+#if defined(__CUDA_ARCH__)
+    if (!__isGlobal(a) || !__isGlobal(b)) {
+        for (size_t i = 0; i < count; ++i) {
+            unsigned long long x, y;
+            memcpy(&x, a + i, sizeof x); memcpy(&y, b + i, sizeof y);
+            if (x != y) return false;
+        }
+        return true;
+    }
+    size_t i = 0; unsigned long long x[8], xh[8], y[8], yh[8], d;
+    if (count > 0 && !RMC_PAIRED(a)) { if (rmc_global_word_load(a) != rmc_global_word_load(b)) return false; i = 1; }
+    if (RMC_PAIRED(b + i)) {
+        for (; i + 16 <= count; i += 16) {
+            for (int k = 0; k < 8; ++k) rmc_global_pair_load(a + i + 2 * k, &x[k], &xh[k]);
+            for (int k = 0; k < 8; ++k) rmc_global_pair_load(b + i + 2 * k, &y[k], &yh[k]);
+            d = 0;
+            for (int k = 0; k < 8; ++k) d |= (x[k] ^ y[k]) | (xh[k] ^ yh[k]);
+            if (d != 0) return false;
+        }
+        for (; i + 2 <= count; i += 2) {
+            rmc_global_pair_load(a + i, &x[0], &xh[0]); rmc_global_pair_load(b + i, &y[0], &yh[0]);
+            if ((x[0] ^ y[0]) | (xh[0] ^ yh[0])) return false;
+        }
+    } else {
+        for (; i + 16 <= count; i += 16) {
+            for (int k = 0; k < 8; ++k) rmc_global_pair_load(a + i + 2 * k, &x[k], &xh[k]);
+            for (int k = 0; k < 8; ++k) { y[k] = rmc_global_word_load(b + i + 2 * k); yh[k] = rmc_global_word_load(b + i + 2 * k + 1); }
+            d = 0;
+            for (int k = 0; k < 8; ++k) d |= (x[k] ^ y[k]) | (xh[k] ^ yh[k]);
+            if (d != 0) return false;
+        }
+        for (; i + 2 <= count; i += 2) {
+            rmc_global_pair_load(a + i, &x[0], &xh[0]);
+            y[0] = rmc_global_word_load(b + i); yh[0] = rmc_global_word_load(b + i + 1);
+            if ((x[0] ^ y[0]) | (xh[0] ^ yh[0])) return false;
+        }
+    }
+    if (i < count && rmc_global_word_load(a + i) != rmc_global_word_load(b + i)) return false;
+    return true;
+#else
+    for (size_t i = 0; i < count; ++i) {
+        unsigned long long x, y;
+        memcpy(&x, a + i, sizeof x); memcpy(&y, b + i, sizeof y);
+        if (x != y) return false;
+    }
+    return true;
+#endif
+}
+{%- endif %}
+{%- if me.derivative.steps|length > 0 or me.algebraic.steps|length > 0 or me.switching %}
+/* The coordinate copies of the refresh and of the chart decisions: a
+   device unit's word stream (`rmc_copy_words`); the C of an FMI component
+   keeps `memcpy`, which its library moves in vector words. Either copies the
+   same bits. */
+{{ q }} inline void rmc_copy_doubles(double* dst, const double* src, size_t count) {
+{%- if device %}
+    rmc_copy_words(dst, src, count);
+{%- else %}
+    memcpy(dst, src, count * sizeof(double));
+{%- endif %}
 }
 {%- endif %}
 {%- if me.derivative.steps|length > 0 or me.algebraic.steps|length > 0 %}

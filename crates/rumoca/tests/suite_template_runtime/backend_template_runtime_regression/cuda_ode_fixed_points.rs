@@ -103,27 +103,44 @@ int main() {
 }
 "#;
 
-/// Copies and compares records of every length up to 40 words (runs of 16
-/// and the words after the last run), a word differing at each position in
-/// turn, in either bit pattern of a value that compares equal.
+/// Copies and compares records of every length up to 40 words, the source
+/// and the destination each 16-byte aligned or 8 bytes past it (the cases of
+/// a device's global pairs: runs of eight, the pairs after the last run, the
+/// word before the first pair and after the last; a host build moves words):
+/// the copy writes exactly the record's words, a NaN payload included, and
+/// the comparison finds a word differing at each position in turn, in either
+/// bit pattern of a value that compares equal.
 const WORDS: &str = r#"
 int main() {
-    static double a[40], b[40];
+    alignas(16) static double a[44], b[44];
+    unsigned long long payload = 0x7ff4000000000123ull;
+    for (int sa = 0; sa < 2; ++sa)
+    for (int sb = 0; sb < 2; ++sb)
     for (int n = 0; n <= 40; ++n) {
-        for (int i = 0; i < 40; ++i) { a[i] = 0.0; b[i] = 1.0 + i; }
-        @_copy_words(a, b, n);
-        for (int i = 0; i < 40; ++i) {
-            if (a[i] != (i < n ? 1.0 + i : 0.0)) { std::printf("copy %d word %d\n", n, i); return 1; }
+        double *x = a + sa, *y = b + sb;
+        for (int i = 0; i < 44; ++i) { a[i] = -7.0; b[i] = 1.0 + i; }
+        if (n > 0) std::memcpy(&b[sb + n - 1], &payload, sizeof payload);
+        @_copy_words(x, y, n);
+        for (int i = 0; i < 44; ++i) {
+            bool inside = i >= sa && i < sa + n;
+            unsigned long long got, want;
+            std::memcpy(&got, &a[i], sizeof got); std::memcpy(&want, inside ? &b[i - sa + sb] : &a[i], sizeof want);
+            if (got != want || (!inside && a[i] != -7.0)) {
+                std::printf("copy %d %d %d word %d\n", sa, sb, n, i); return 1;
+            }
         }
-        if (!@_same_bits(a, b, n)) { std::printf("same %d\n", n); return 1; }
+        if (!@_same_bits(x, y, n)) { std::printf("same %d %d %d\n", sa, sb, n); return 1; }
         for (int k = 0; k < n; ++k) {
-            double kept = a[k];
-            a[k] = std::nextafter(kept, 1e300);
-            if (@_same_bits(a, b, n)) { std::printf("differs %d at %d\n", n, k); return 1; }
-            a[k] = kept;
+            unsigned long long kept, flipped;
+            std::memcpy(&kept, &x[k], sizeof kept); flipped = kept ^ 1ull;
+            std::memcpy(&x[k], &flipped, sizeof flipped);
+            if (@_same_bits(x, y, n)) { std::printf("differs %d %d %d at %d\n", sa, sb, n, k); return 1; }
+            std::memcpy(&x[k], &kept, sizeof kept);
         }
-        a[0] = -0.0; b[0] = 0.0;
-        if (n > 0 && @_same_bits(a, b, n)) { std::printf("signed zero %d\n", n); return 1; }
+        if (n > 0) {
+            x[0] = -0.0; y[0] = 0.0;
+            if (@_same_bits(x, y, n)) { std::printf("signed zero %d %d %d\n", sa, sb, n); return 1; }
+        }
     }
     return 0;
 }
