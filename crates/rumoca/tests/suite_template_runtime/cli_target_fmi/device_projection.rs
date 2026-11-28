@@ -289,6 +289,37 @@ fn a_device_unit_unrolls_the_split_residual_pass_of_an_affine_block() {
     );
 }
 
+/// A device unit copies the coordinate of its refresh and compares its words
+/// in 16-byte global pairs (`rmc_copy_words`, `rmc_same_words`: inline
+/// `ld.global.v2.u64` and `st.global.v2.u64` once both arrays are global, the
+/// word loop otherwise, `memcpy` and a word loop on a host build): through
+/// them, the lanes of `a_device_build_refreshes_every_lane_as_the_fmi_component`
+/// refresh as the FMI component, whose C keeps `memcpy`, bit for bit; the
+/// cuda-ode fixed-point test copies and compares through the same streams at
+/// either alignment.
+#[test]
+fn a_device_unit_copies_its_coordinate_in_global_pairs() {
+    let mut paired = Vec::new();
+    for (compiled, model) in models() {
+        let unit = device_unit(&compiled);
+        if !unit.contains("inline void rmc_copy_doubles(") {
+            continue;
+        }
+        assert!(
+            unit.contains("size_t count) {\n    rmc_copy_words(dst, src, count);\n}")
+                && unit.contains("asm volatile(\"ld.global.v2.u64 {%0, %1}, [%2];\"")
+                && unit.contains("asm volatile(\"st.global.v2.u64 [%0], {%1, %2};\"")
+                && unit.contains("if (!__isGlobal(dst) || !__isGlobal(src)) {"),
+            "{model}: the refresh copies its coordinate in global pairs"
+        );
+        paired.push(model);
+    }
+    assert!(
+        paired.contains(&"DeviceAffineSplit") && paired.contains(&"SplitCircleChart"),
+        "the refreshing units copy their coordinate in global pairs: {paired:?}"
+    );
+}
+
 /// A lowered model reaches the device kernel through the admission of the C
 /// component: one whose initial vector disagrees with its layout is refused
 /// before any unit is rendered, with the component's reason.
