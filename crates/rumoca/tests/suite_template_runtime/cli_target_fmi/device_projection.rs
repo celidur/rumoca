@@ -246,6 +246,30 @@ fn a_device_unit_unrolls_the_scalar_newton_stage_of_a_one_unknown_block() {
     );
 }
 
+/// A device unit unrolls the split residual pass of a coupled affine block
+/// (its invariant parts once per call, then the dependent part of each
+/// residual program) with those programs called directly: through it, the lanes of
+/// `a_device_build_refreshes_every_lane_as_the_fmi_component` refresh as the
+/// FMI component, whose C keeps the pooled loops, bit for bit.
+#[test]
+fn a_device_unit_unrolls_the_split_residual_pass_of_an_affine_block() {
+    let mut unrolled = Vec::new();
+    for (compiled, model) in models() {
+        let unit = device_unit(&compiled);
+        if unit.contains(": return rmc_rows_split_") {
+            assert!(
+                unit.contains(": return rmc_block_invariants_"),
+                "{model}: a block that unrolls its pass unrolls its invariant parts"
+            );
+            unrolled.push(model);
+        }
+    }
+    assert!(
+        unrolled.contains(&"DeviceAffineSplit"),
+        "the affine block with a residual split unrolls its pass: {unrolled:?}"
+    );
+}
+
 /// A lowered model reaches the device kernel through the admission of the C
 /// component: one whose initial vector disagrees with its layout is refused
 /// before any unit is rendered, with the component's reason.

@@ -164,6 +164,65 @@ pub(super) struct BlockRecord {
     /// The stage of a one-unknown block the scalar Newton settles, unrolled
     /// for a device unit (`ScalarStage`).
     scalar: Option<ScalarStage>,
+    /// The split residual pass of a coupled affine block, unrolled for a
+    /// device unit (`SplitResidual`).
+    split_rows: Option<SplitResidual>,
+}
+
+/// `rmc_block_invariants` and the split `rmc_rows_split` of one coupled
+/// affine block, their pools unrolled: the block's splits as `(invariant
+/// function, live-out offset)`, and its residual pass as one evaluation per
+/// residual program, in the order the rows first reach each. The pooled
+/// loop evaluates a program again when its rows are not consecutive; a
+/// program reads nothing a pass writes, so one evaluation gives every row
+/// of the program the value the loop gives it. A device unit renders each
+/// as straight-line code, the invariant and dependent functions called
+/// directly.
+#[derive(Serialize)]
+pub(super) struct SplitResidual {
+    invariants: Vec<(usize, usize)>,
+    programs: Vec<ResidualProgram>,
+}
+
+/// The rows of one residual program: the program, its dependent function
+/// plus one (zero for a program without a split), and `(row, output
+/// offset)` per row.
+#[derive(Serialize)]
+struct ResidualProgram {
+    program: usize,
+    dependent: usize,
+    rows: Vec<(usize, usize)>,
+}
+
+fn split_residual(table: &ProgramTable, record: &BlockRecord) -> Option<SplitResidual> {
+    if record.nsplit == 0 || record.n > UNROLLED_ELIMINATION_ENTRIES {
+        return None;
+    }
+    let programs = table.pooled(record.row_program, record.n);
+    let offsets = table.pooled(record.row_offset, record.n);
+    let dependents = table.pooled(record.row_split, record.n);
+    let mut evaluations: Vec<ResidualProgram> = Vec::new();
+    for row in 0..record.n {
+        match evaluations
+            .iter_mut()
+            .find(|evaluation| evaluation.program == programs[row])
+        {
+            Some(evaluation) => evaluation.rows.push((row, offsets[row])),
+            None => evaluations.push(ResidualProgram {
+                program: programs[row],
+                dependent: dependents[row],
+                rows: vec![(row, offsets[row])],
+            }),
+        }
+    }
+    Some(SplitResidual {
+        invariants: table
+            .pooled(record.split, 2 * record.nsplit)
+            .chunks(2)
+            .map(|split| (split[0], split[1]))
+            .collect(),
+        programs: evaluations,
+    })
 }
 
 /// The projection stage of a one-unknown, one-entry block whose row's
@@ -503,6 +562,7 @@ pub(super) fn block_record(
         &mut record,
     )?;
     record.scalar = scalar_stage(table, &record);
+    record.split_rows = split_residual(table, &record);
     Ok(record)
 }
 
